@@ -24,10 +24,12 @@ def run_incremental(ws: Workspace, cfg: dict[str, Any], verbose: bool = True, da
     ff = feedforward or cfg.get("feedforward", {}).get("model", "pi3x")
     graph = step("build_graph", **_graph_step(ws)).artifact
     db = step("match", graph_id=graph, detector=rc["detector"], matcher="flexglue", num_keypoints=rc["num_keypoints"], resize=rc["resize"]).artifact
+    scores = step("score_pairs", db_id=db, method="flexglue_covis").artifact   # for the scene split (and the optional filter)
     if threshold is not None:
-        scores = step("score_pairs", db_id=db, method="flexglue_covis").artifact
         db = step("filter_edges", db_id=db, scores_id=scores, threshold=float(threshold)).artifact
-    m = step("grow_model", db_id=db, feedforward=ff, seed_size=seed_size, group_size=group_size, min_support=min_support, hard=hard, vlm=vlm, multi_model=multi_model)
+        scores = step("score_pairs", db_id=db, method="flexglue_covis").artifact
+    m = step("grow_model", db_id=db, feedforward=ff, seed_size=seed_size, group_size=group_size, min_support=min_support, hard=hard, vlm=vlm,
+             multi_model=multi_model, scores_id=scores)
     e = step("examine", model_id=m.artifact).summary
     best = m.artifact
     grow = m.summary.get("grow", {})

@@ -85,6 +85,18 @@ def omega_inputs(images_dir: Path, names: list[str], size: int):
     return x, transforms
 
 
+def open_rgb(path, max_side: int):
+    """Open an image for a feedforward model: JPEG draft mode decodes directly at the largest power-of-two
+    reduction that keeps max_side, which is most of the cost on 20-megapixel photos. Returns (image, original size)."""
+    from PIL import Image
+
+    im = Image.open(path)
+    orig = im.size
+    if im.format == "JPEG":
+        im.draft("RGB", (max_side, max_side))
+    return im.convert("RGB"), orig
+
+
 def load_pi3x(repo: str, device: str):
     """Pi3X (yyfz233/Pi3X from the Hugging Face cache); the pi3 package is imported from GLUEMAP's checkout."""
     if repo not in sys.path:
@@ -104,11 +116,13 @@ def pi3_inputs(images_dir: Path, names: list[str], pixel_limit: int = 255000):
     import torchvision.transforms.functional as TF
     from PIL import Image
 
-    ims = []
+    ims, origs = [], []
+    side = int(math.sqrt(pixel_limit) * 2)
     for n in names:
-        with Image.open(images_dir / n) as im:
-            ims.append(im.convert("RGB"))
-    aspects = sorted(im.size[0] / im.size[1] for im in ims)
+        im, orig = open_rgb(images_dir / n, side)
+        ims.append(im)
+        origs.append(orig)
+    aspects = sorted(w / h for w, h in origs)
     a = aspects[len(aspects) // 2]
     k, m = max(1, round(math.sqrt(pixel_limit * a) / 14)), max(1, round(math.sqrt(pixel_limit / a) / 14))
     while (k * 14) * (m * 14) > pixel_limit:
@@ -118,8 +132,7 @@ def pi3_inputs(images_dir: Path, names: list[str], pixel_limit: int = 255000):
             m -= 1
     TW, TH = k * 14, m * 14
     tensors, transforms = [], []
-    for im in ims:
-        w, h = im.size
+    for im, (w, h) in zip(ims, origs):
         s = min(TW / w, TH / h)
         nw, nh = max(1, round(w * s)), max(1, round(h * s))
         canvas = Image.new("RGB", (TW, TH), (255, 255, 255))
@@ -197,7 +210,14 @@ def main() -> None:
         model = load_omega(spec["repos"]["vggt_omega"], spec["repos"]["vggt_omega_checkpoint"], device)
     else:
         raise ValueError(f"unknown feedforward model {which}")
-    load_seconds = time.time() - t0
+    serve_one(spec, model, which, device, load_seconds=time.time() - t0)
+
+
+def serve_one(spec, model, which: str, device: str, load_seconds: float = 0.0) -> None:
+    """Run one spec with a loaded model and write its result (shared by the one-shot CLI and the persistent worker)."""
+    import torch
+
+    size = int(spec.get("size", 518 if which == "vggt" else 512))
     images_dir = Path(spec["images_dir"])
     ppi = int(spec.get("points_per_image", 0))
     rng = np.random.default_rng(0)

@@ -122,6 +122,23 @@ class Advisor:
         v = self.ask("render_verdict", parts, q, context)
         return str(v.get("answer", "unsure")).strip().lower() if isinstance(v, dict) else "unsure"
 
+    def render_verdicts(self, figures: list[str], context: dict[str, Any] | None = None) -> list[str]:
+        """One call for several images of a round: 'aligned' / 'misaligned' / 'unsure' per figure, in order."""
+        parts = [(self.FIGURE, [])] + [(f"Figure {k + 1}:", [f]) for k, f in enumerate(figures)]
+        q = ('For each figure, is the model aligned with the photo? Answer {"verdicts": [{"figure": 1, "answer": "aligned" | "misaligned" | "unsure", '
+             '"reason": "<a few words>"}, ...]} with one entry per figure, in order.')
+        v = self.ask("render_verdicts", parts, q, context)
+        out = ["unsure"] * len(figures)
+        if isinstance(v, dict) and isinstance(v.get("verdicts"), list):
+            for e in v["verdicts"]:
+                try:
+                    k = int(e.get("figure")) - 1
+                    if 0 <= k < len(out):
+                        out[k] = str(e.get("answer", "unsure")).strip().lower()
+                except (TypeError, ValueError, AttributeError):
+                    pass
+        return out
+
     def render_choose(self, figure_a: str, figure_b: str, context: dict[str, Any] | None = None) -> str:
         """'a' / 'b' / 'neither' / 'unsure': which of two candidate placements renders consistently with the photo."""
         parts = [(self.FIGURE + " Figure A (first candidate placement):", [figure_a]), ("Figure B (second candidate placement):", [figure_b])]

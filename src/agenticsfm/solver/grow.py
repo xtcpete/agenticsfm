@@ -55,6 +55,25 @@ FEEDFORWARD_ENV = {"vggt": "vggt", "vggt_omega": "vggt", "pi3x": "pi3x"}
 MAX_IMAGE_ID = 2147483647  # COLMAP pair id = image_id1 * MAX_IMAGE_ID + image_id2
 
 
+class Timer:
+    """Wall time per phase, for the solver's profile (logged in the summary)."""
+
+    def __init__(self):
+        self.t: dict[str, float] = {}
+
+    def __call__(self, name: str):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            t0 = time.time()
+            try:
+                yield
+            finally:
+                self.t[name] = self.t.get(name, 0.0) + time.time() - t0
+        return _cm()
+
+
 def rot_angle(R: np.ndarray) -> float:
     return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
 
@@ -67,6 +86,11 @@ class GrowConfig:
     group_size: int = 8          # PnP registrations per round before verification
     min_support: float = 0.5     # inlier-weighted share of consistent matches an image needs (strong pairs only)
     support_low: float = 0.25    # between support_low and min_support, render-and-compare gives the second opinion
+    persistent_ff: bool = True   # keep the feedforward model loaded in a worker per GPU (2.8 s per call instead of 20 to 60)
+    support_pairs: int = 12      # match support from each image's strongest pairs only
+    round_gate: bool = True      # the VLM between rounds: suspects of each round (borderline admits and rejects) judged on their figures
+    gate_admit_support: float = 0.65   # an admitted image below this support (or with no strong pair) is a suspect
+    gate_max: int = 6            # suspects per round shown to the VLM (one batched call)
     fold_frac: float = 0.05      # share of strong pairs inconsistent with the poses above which the model is treated as folded
     repair_act: bool = False     # re-place the minority block of a detected fold (v1.6 misfired on old_computer: detect and log only until the re-placement is reliable)
     seed_fold_frac: float = 0.1
@@ -144,6 +168,7 @@ class Solver:
         self.ff_calls = 0
         self.ff_seconds = 0.0
         self.log: list[dict[str, Any]] = []
+        self.timer = Timer()
         self.rac = RenderCompare(self.rec, ws.images_dir)
         if advisor is not None:
             self.advisor = advisor
@@ -198,6 +223,10 @@ class Solver:
         return max(frac_epi, frac_rot)
 
     def support(self, image_ids: list[int]) -> dict[int, float]:
+        with self.timer("support"):
+            return self._support(image_ids)
+
+    def _support(self, image_ids: list[int]) -> dict[int, float]:
         """Per image: inlier-weighted consistency over its strong pairs with registered images (NaN: no strong pair)."""
         reg = self.reg()
         out: dict[int, float] = {}
@@ -205,9 +234,8 @@ class Solver:
             if i not in reg:
                 continue
             num = den = 0.0
-            for j, n in self.W.get(i, {}).items():
-                if n < self.gc.strong_pair or j not in reg:
-                    continue
+            strong = sorted(((n, j) for j, n in self.W.get(i, {}).items() if n >= self.gc.strong_pair and j in reg), reverse=True)
+            for n, j in strong[: self.gc.support_pairs]:
                 frac = self.pair_consistency(i, j)
                 num += n * frac
                 den += n
@@ -218,9 +246,8 @@ class Solver:
         """One backend invocation (one model load) for several groups; registers dense depth with render-and-compare."""
         model = self.gc.feedforward
         t0 = time.time()
-        res = run_backend(self.cfg, "feedforward", FEEDFORWARD_ENV[model],
-                          {"images_dir": str(self.ws.images_dir), "groups": groups, "model": model, "points_per_image": 0, "save_depth": save_depth},
-                          self.workdir / f"ff_{tag}", gpu=self.gpu)
+        with self.timer("feedforward"):
+            res = self._ff_call(groups, tag, save_depth, model)
         self.ff_calls += 1
         self.ff_seconds += time.time() - t0
         if save_depth:
@@ -228,6 +255,15 @@ class Solver:
                 if g.get("depth_path"):
                     self.rac.add_depth(g["depth_path"])
         return res["groups"]
+
+    def _ff_call(self, groups, tag, save_depth, model):
+        spec = {"images_dir": str(self.ws.images_dir), "groups": groups, "model": model, "points_per_image": 0, "save_depth": save_depth,
+                "repos": self.cfg.get("repos", {})}
+        if self.gc.persistent_ff:
+            from agenticsfm.solver.ffclient import run_feedforward
+
+            return run_feedforward(self.cfg, FEEDFORWARD_ENV[model], model, spec, self.workdir / f"ff_{tag}", self.gpu)
+        return run_backend(self.cfg, "feedforward", FEEDFORWARD_ENV[model], spec, self.workdir / f"ff_{tag}", gpu=self.gpu)
 
     def feedforward(self, names: list[str], tag: str, save_depth: bool = False) -> dict[str, dict[str, Any]]:
         """Run the feedforward model on one group. Returns per image: cam_from_world (3x4, frame of the group's
@@ -450,6 +486,10 @@ class Solver:
         raise RuntimeError(f"no seed cluster held together: {json.dumps(attempts, default=str)[:800]}")
 
     def global_refine(self, final: bool = False) -> None:
+        with self.timer("global_ba"):
+            self._global_refine(final)
+
+    def _global_refine(self, final: bool = False) -> None:
         held = {i: self.pose_of(i) for i in self.held if i in self.reg()}
         self.mapper.iterative_global_refinement(5 if final else 3, 0.0005, self.mo, self.ba, self.tri, True)
         self.mapper.filter_frames(self.mo)
@@ -476,28 +516,62 @@ class Solver:
         newly, failed = [], []
         for i in group:
             self.tries[i] += 1
-            if not self.mapper.register_next_image(self.mo, i):
+            with self.timer("pnp"):
+                ok = self.mapper.register_next_image(self.mo, i)
+            if not ok:
                 failed.append(i)
                 continue
-            self.mapper.triangulate_image(self.tri, i)
-            self.mapper.iterative_local_refinement(2, 0.001, self.mo, self.ba, self.tri, i)
+            with self.timer("triangulate"):
+                self.mapper.triangulate_image(self.tri, i)
+            with self.timer("local_ba"):
+                self.mapper.iterative_local_refinement(2, 0.001, self.mo, self.ba, self.tri, i)
             newly.append(i)
         sup = self.support(newly)
-        border = [i for i in newly if sup.get(i, float("nan")) == sup.get(i, float("nan")) and self.gc.support_low <= sup[i] < self.gc.min_support]
+        nan = lambda i: sup.get(i, float("nan")) != sup.get(i, float("nan"))  # noqa: E731
+        border = [i for i in newly if not nan(i) and self.gc.support_low <= sup[i] < self.gc.min_support]          # would be rejected
+        weak_in = [i for i in newly if nan(i) or self.gc.min_support <= sup[i] < self.gc.gate_admit_support]   # admitted on thin evidence
+        use_vlm = self.gc.round_gate and self.advisor is not None and self.advisor.enabled
+        suspects = border + (weak_in if use_vlm else [])
         second: dict[int, dict[str, Any]] = {}
-        if border:
+        vlm: dict[int, str] = {}
+        if suspects:
             try:
-                self.ensure_depth([(i, *self.pose_of(i)) for i in border], f"round{k}depth")
-                for i in border:
-                    second[i] = self.judge_pose(i, *self.pose_of(i), "pnp")
+                self.ensure_depth([(i, *self.pose_of(i)) for i in suspects], f"round{k}depth")
+                for i in suspects:
+                    second[i] = self.judge_pose(i, *self.pose_of(i), "pnp", figure=use_vlm)
             except Exception as e:  # the second opinion is optional
                 self.say(f"render second opinion failed: {e}")
-        kept, rejected = [], []
+            if use_vlm:
+                # the VLM looks only where the two numbers do not already agree: borderline rejects the render does not
+                # clearly confirm, and thin admits the render does not clearly confirm
+                ask = [i for i in suspects if i in second and second[i].get("figure") and second[i]["verdict"] != "consistent"][: self.gc.gate_max]
+                if ask:
+                    answers = self.advisor.render_verdicts([second[i]["figure"] for i in ask],
+                                                           {"round": k, "images": [self.names[i] for i in ask],
+                                                            "support": [None if nan(i) else round(sup[i], 3) for i in ask],
+                                                            "render": [{kk: second[i].get(kk) for kk in ("score", "margin", "verdict")} for i in ask]})
+                    vlm = dict(zip(ask, answers))
+        kept, rejected, readmitted, removed = [], [], [], []
+        decide = self.gc.vlm == "decide"
         for i in newly:
             s = sup.get(i, float("nan"))
             j = second.get(i)
-            render_ok = j is not None and (j["verdict"] == "consistent" or (j["verdict"] == "ambiguous" and (j.get("score") or 0) >= 0.5))
-            if s == s and s < self.gc.min_support and not render_ok:
+            rv = j["verdict"] if j is not None else None
+            v = vlm.get(i)
+            if i in border:
+                # rejected by match support unless the render confirms, or the render is not against it and the VLM sees it aligned
+                ok = rv == "consistent" or (rv == "ambiguous" and (j.get("score") or 0) >= 0.5) or \
+                    (decide and v == "aligned" and rv != "inconsistent")
+                if ok and rv != "consistent":
+                    readmitted.append(i)
+            elif s == s and s < self.gc.min_support:
+                ok = False
+            elif i in weak_in and decide and v == "misaligned" and rv == "inconsistent":
+                ok = False                       # admitted on thin match evidence, and both the render and the VLM say it is misplaced
+                removed.append(i)
+            else:
+                ok = True
+            if not ok:
                 self.deregister(i)
                 self.status[i] = "deferred"
                 rejected.append(i)
@@ -509,8 +583,11 @@ class Solver:
         row = {"round": k, "kind": "pnp", "candidates": len(cand), "registered": [self.names[i] for i in kept],
                "rejected": {self.names[i]: round(sup[i], 3) for i in rejected}, "pnp_failed": [self.names[i] for i in failed],
                "render_second_opinion": {self.names[i]: {kk: j.get(kk) for kk in ("score", "margin", "verdict")} for i, j in second.items()},
+               "vlm_gate": {self.names[i]: v for i, v in vlm.items()}, "readmitted": [self.names[i] for i in readmitted],
+               "removed": [self.names[i] for i in removed],
                "support": {self.names[i]: (None if sup.get(i) != sup.get(i) else round(sup[i], 3)) for i in newly}, **self.model_stats()}
-        self.say(f"round {k}: +{len(kept)} (rejected {len(rejected)}, pnp failed {len(failed)}) -> "
+        self.say(f"round {k}: +{len(kept)} (rejected {len(rejected)}, pnp failed {len(failed)}"
+                 + (f", VLM on {len(vlm)}: readmitted {len(readmitted)}, removed {len(removed)}" if vlm else "") + ") -> "
                  f"{self.rec.num_reg_images()}/{len(self.names)} registered, {row['num_points']} pts, reproj {row['reproj']}")
         return row
 
@@ -518,6 +595,10 @@ class Solver:
         return self.nearest_registered(-R.T @ t, R[2], k, exclude)
 
     def judge_pose(self, i: int, R: np.ndarray, t: np.ndarray, tag: str, figure: bool = False) -> dict[str, Any]:
+        with self.timer("render_compare"):
+            return self._judge_pose(i, R, t, tag, figure)
+
+    def _judge_pose(self, i: int, R: np.ndarray, t: np.ndarray, tag: str, figure: bool = False) -> dict[str, Any]:
         """Render-and-compare verdict of a candidate pose; the three-panel figure for the advisor when asked."""
         import pycolmap
 
@@ -1014,6 +1095,8 @@ class Solver:
                    "status_counts": {s: sum(1 for v in self.status.values() if v == s) for s in sorted(set(self.status.values()))},
                    "feedforward_calls": self.ff_calls, "feedforward_seconds": round(self.ff_seconds, 1),
                    "vlm_calls": self.advisor.calls if self.advisor else 0, "vlm_seconds": round(self.advisor.seconds, 1) if self.advisor else 0.0,
-                   "wall": round(time.time() - t0, 1), "config": asdict(self.gc)}
+                   "wall": round(time.time() - t0, 1),
+                   "profile": {k: round(v, 1) for k, v in sorted(self.timer.t.items(), key=lambda kv: -kv[1])},
+                   "config": asdict(self.gc)}
         (out_dir.parent / "grow_log.json").write_text(json.dumps({"summary": summary, "log": self.log}, indent=1, default=str))
         return summary
