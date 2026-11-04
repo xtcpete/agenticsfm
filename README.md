@@ -271,6 +271,49 @@ What the audits say:
 - **Pi3X as examiner.** 1.9 s for 12 images; the model load (13 s per backend call) is now most of the solver's
   time (M07: 4 to 7 calls). A persistent worker is the next engineering step.
 
+### 2026-11-04: the broad runs (v1.3 on 31 scenes, v1.4 on WRIVA dev) and what they changed
+
+ETH3D, all 25 scenes, v1.3 against the baselines (`colmap_auc` @1 / 3 / 5; every image registered in every scene):
+
+| | fixed pipeline | scripted (COLMAP) | open solver v1.3 |
+|---|---|---|---|
+| 13 dev scenes | 60.4 / 83.5 / 89.5 | 66.7 / 87.1 / 91.9 | 66.1 / 86.8 / 91.8 |
+| 12 test scenes | 63.5 / 85.7 / 91.2 | 70.5 / 89.3 / 93.5 | 65.2 / 84.3 / 88.6 |
+| all 25 | 61.9 / 84.6 / 90.3 | 68.5 / 88.2 / 92.7 | 65.7 / 85.6 / 90.2 |
+
+Parity on dev; the test loss is four scenes, and GT says what they are. **old_computer** (30.9 vs 56.8 at 1 deg)
+is a fold: 17 of 54 cameras sit at 180 degrees. Four of the twelve seed images were already mirrored by Pi3X, and
+the PnP rounds extended the block with match support of 0.5 to 0.9, because the lookalike matches are wrong and
+self-consistent. The render-and-compare audit rated 13 of the 17 consistent: it compares a camera with its
+nearest neighbours, and a mirrored block is consistent with itself. The signal that sees it is the one a person
+uses on pairs: the strong pairs between the two blocks disagree with the poses. **lounge** (41.6 vs 66.5, 10
+images) is diffuse precision (median error 0.27 vs 0.14 degrees), as are terrains and botanical_garden.
+
+WRIVA dev (`auc_all` @3 / 10):
+
+| scene | fixed | scripted | v0 | v1.3 | v1.4 |
+|---|---|---|---|---|---|
+| A08 (150) | 17.8 / 44.3 | 17.8 / 44.3 | 18.4 / 44.2 | 17.2 / 43.1 | 17.2 / 42.6 |
+| M07 (50) | 23.2 / 76.4 | 36.8 / 81.0 | 38.8 / 81.7 | 38.5 / 81.6 | 39.8 / 82.0 |
+| BLH0001 (39) | 18.4 / 49.6 | 21.2 / 49.0 | 24.6 / 49.5 | 25.0 / 50.7 (36 img) | 21.8 / 46.1 (32 img) |
+| PTZ s00 (198) | 19.4 / 61.1 | 20.3 / 61.6 | – | 16.8 / 56.1 (194) | 15.1 / 49.8 (179) |
+| PTZ s01 (182) | 19.5 / 61.4 | 19.9 / 61.5 | – | 16.8 / 55.3 (176) | 15.3 / 51.6 (178) |
+| PTZ s02 (174) | 18.8 / 60.8 | 19.2 / 60.9 | – | 14.8 / 52.3 (171) | 15.6 / 53.0 (164) |
+| mean | 19.5 / 58.9 | 22.5 / 59.7 | | 21.5 / 56.5 | 20.8 / 54.2 |
+
+The PTZ scenes are the loss, and GT explains it twice over. In v1.3 the hard stage accepted placements that
+agreed within 8 to 10 degrees and advisor picks over inconsistent renderings: a dozen cameras per scene 5 to 17
+degrees off. v1.4's gates (5-degree agreement, no pick over an inconsistent render, real links required) stop
+that, and the registered count drops instead: on PTZ s00, 21 images were rejected by match support at 0.24 to
+0.43 in the PnP rounds and never readmitted, although COLMAP places all of them. The hard stage cannot give
+them the precision the PnP path would have. The PTZ runs also take 35 to 60 minutes each, almost all of it Pi3X
+model loads (13 s per call) and VLM calls in the hard rounds.
+
+v1.5, running as this is written: the seed is split into its largest self-consistent block when its strong pairs
+disagree; a fold repair after growth deregisters the minority block of the consistent-pair graph and re-places
+it as hard images with anchors from the majority block in view; and an image with support between 0.25 and 0.5
+gets render-and-compare as a second opinion before it is rejected.
+
 ## Running the harness
 
 ```bash

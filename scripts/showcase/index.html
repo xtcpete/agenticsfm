@@ -377,12 +377,13 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
       if (r.kind === 'vlm') {
         var ans = (r.answer && typeof r.answer === 'object') ? r.answer : {};
         var figs = [];
-        Object.keys(r.images || {}).forEach(function (label) { (r.images[label] || []).forEach(function (im) { figs.push({ src: im.src, name: label.replace(/:.*$/, '') + ' · ' + im.name, w: 0, h: 0 }); }); });
+        var named = []; Object.keys(r.images || {}).forEach(function (label) { (r.images[label] || []).forEach(function (im) { if (im.src) figs.push({ src: im.src, name: label.replace(/:.*$/, '') + ' · ' + im.name, w: 0, h: 0 }); else named.push(im.name); }); });
         row = h('div', { class: 'round vlm' }, [h('div', { class: 'lab' }, ['VLM', h('small', { text: r.question + (r.model ? ' · ' + r.model : '') })]),
           h('div', { class: 'body' }, [h('span', { class: 'tag ' + (['a', 'b', 'same', 'aligned'].indexOf(String(ans.answer).toLowerCase()) >= 0 ? 'ok' : (String(ans.answer).toLowerCase() === 'unsure' ? '' : 'warn')), text: 'answer: ' + ans.answer + (ans.confidence != null ? ' (' + ans.confidence + ')' : '') }),
             ' ', h('span', { class: 'muted', text: (r.context && r.context.image ? r.context.image + ' · ' : '') + (r.seconds || '') + ' s' }),
             ans.reason ? h('div', { class: 'says', style: 'font-size:13px;margin:4px 0', text: ans.reason }) : null,
             r.reasoning ? h('details', { class: 'thinking' }, [h('summary', { text: 'Thinking · ' + r.reasoning.length + ' chars' }), h('div', { class: 'body', text: r.reasoning })]) : null,
+            named.length ? h('div', { class: 'tags' }, tags(named, '')) : null,
             figs.length ? h('div', { class: 'thumbs' }, figs.map(function (im) { return h('div', {}, [h('button', { type: 'button', onclick: function () { openImage(im); } }, [h('img', { src: im.src, alt: im.name, loading: 'lazy' })]), h('div', { class: 'cap', text: im.name })]); })) : null])]);
         box.appendChild(row); return;
       }
@@ -396,6 +397,9 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
         });
         row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, ['Hard ' + r.round, h('small', { text: 'Pi3X × 2 anchor sets' + (r.model ? ' · ' + r.model : '') })]),
           h('div', { class: 'body' }, ['+' + (r.registered || []).length + ' of ' + (r.batch || []).length + (r.error ? ' · ' + r.error : '') + ' · ' + (r.num_registered || '') + ' in model'].concat(items))]);
+      } else if (r.kind === 'repair') {
+        row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Repair', h('small', { text: 'fold check' })]),
+          h('div', { class: 'body' }, ['inconsistent strong pairs ' + r.inconsistent_frac + ' · consistent blocks ' + JSON.stringify(r.components || []) + ' · ' + (r.action || ''), (r.suspects || []).length ? h('div', { class: 'tags' }, tags(r.suspects, 'warn')) : null])]);
       } else if (r.kind === 'audit') {
         var flagged = r.flagged || r.dropped || [];
         row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Audit', h('small', { text: 'render and compare' })]),

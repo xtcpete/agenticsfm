@@ -66,6 +66,9 @@ class GrowConfig:
     seed_attempts: int = 3       # seed centres to try before giving up
     group_size: int = 8          # PnP registrations per round before verification
     min_support: float = 0.5     # inlier-weighted share of consistent matches an image needs (strong pairs only)
+    support_low: float = 0.25    # between support_low and min_support, render-and-compare gives the second opinion
+    fold_frac: float = 0.05      # share of strong pairs inconsistent with the poses above which the model is treated as folded
+    seed_fold_frac: float = 0.1
     strong_pair: int = 50        # inliers for a pair to count in the support
     epipolar_px: float = 4.0
     max_tries: int = 2           # PnP attempts per image in our loop (COLMAP's own cap is 3)
@@ -181,15 +184,17 @@ class Solver:
         rel = im1.cam_from_world() * im0.cam_from_world().inverse()
         R, t = rel.rotation.matrix(), rel.translation
         tn = np.linalg.norm(t)
-        if tn < 1e-9:
-            x0r = np.c_[x0, np.ones(len(x0))] @ R.T
-            err = np.linalg.norm(x0r[:, :2] / x0r[:, 2:3] - x1, axis=1)
-        else:
-            t = t / tn
-            E = np.array([[0, -t[2], t[1]], [t[2], 0, -t[0]], [-t[1], t[0], 0]]) @ R
-            err = sampson(E, x0, x1)
         f = 0.5 * (cam0.mean_focal_length() + cam1.mean_focal_length())
-        return float((err * f < self.gc.epipolar_px).mean())
+        # pure-rotation transfer: exact for a pan-tilt-zoom pair (same centre), where the epipolar test is degenerate
+        x0r = np.c_[x0, np.ones(len(x0))] @ R.T
+        err_rot = np.linalg.norm(x0r[:, :2] / np.where(np.abs(x0r[:, 2:3]) < 1e-9, 1e-9, x0r[:, 2:3]) - x1, axis=1)
+        frac_rot = float((err_rot * f < self.gc.epipolar_px).mean())
+        if tn < 1e-9:
+            return frac_rot
+        t = t / tn
+        E = np.array([[0, -t[2], t[1]], [t[2], 0, -t[0]], [-t[1], t[0], 0]]) @ R
+        frac_epi = float((sampson(E, x0, x1) * f < self.gc.epipolar_px).mean())
+        return max(frac_epi, frac_rot)
 
     def support(self, image_ids: list[int]) -> dict[int, float]:
         """Per image: inlier-weighted consistency over its strong pairs with registered images (NaN: no strong pair)."""
@@ -410,10 +415,22 @@ class Solver:
             self.mapper.filter_frames(self.mo)
             sup = self.support(group)
             good = [i for i in group if i in self.reg() and not (sup.get(i, float("nan")) < self.gc.min_support)]
+            rows = self.strong_pair_rows(set(good))
+            split = None
+            if rows and sum(1 for r in rows if r[3] < 0.2) / len(rows) > self.gc.seed_fold_frac:
+                comps = self.consistent_components(rows, set(good))
+                if len(comps) > 1 and len(comps[0]) >= 3:
+                    split = [len(c) for c in comps]
+                    good = list(comps[0])        # the largest self-consistent block seeds; the rest is deferred and re-placed later
+                else:
+                    sp = self.signed_split(rows, sorted(good))
+                    if sp and len(sp[0]) >= 3:
+                        split = [len(sp[0]), len(sp[1]), sp[2]]
+                        good = list(sp[0])
             bad = [i for i in group if i not in good]
             att = {"centre": self.names[centre], "group": names, "focal": {self.names[i]: round(ff[self.names[i]]["f"], 1) for i in group},
                    "support": {self.names[i]: (None if sup.get(i) != sup.get(i) else round(sup.get(i, float("nan")), 3)) for i in group},
-                   "kept": [self.names[i] for i in good], **self.model_stats()}
+                   "kept": [self.names[i] for i in good], "split": split, **self.model_stats()}
             attempts.append(att)
             self.say(f"seed {k}: centre {self.names[centre]}, {len(good)}/{len(group)} supported, {att['num_points']} points, reproj {att['reproj']}")
             if len(good) >= max(3, math.ceil(0.5 * len(group))):
@@ -465,10 +482,21 @@ class Solver:
             self.mapper.iterative_local_refinement(2, 0.001, self.mo, self.ba, self.tri, i)
             newly.append(i)
         sup = self.support(newly)
+        border = [i for i in newly if sup.get(i, float("nan")) == sup.get(i, float("nan")) and self.gc.support_low <= sup[i] < self.gc.min_support]
+        second: dict[int, dict[str, Any]] = {}
+        if border:
+            try:
+                self.ensure_depth([(i, *self.pose_of(i)) for i in border], f"round{k}depth")
+                for i in border:
+                    second[i] = self.judge_pose(i, *self.pose_of(i), "pnp")
+            except Exception as e:  # the second opinion is optional
+                self.say(f"render second opinion failed: {e}")
         kept, rejected = [], []
         for i in newly:
             s = sup.get(i, float("nan"))
-            if s == s and s < self.gc.min_support:
+            j = second.get(i)
+            render_ok = j is not None and (j["verdict"] == "consistent" or (j["verdict"] == "ambiguous" and (j.get("score") or 0) >= 0.5))
+            if s == s and s < self.gc.min_support and not render_ok:
                 self.deregister(i)
                 self.status[i] = "deferred"
                 rejected.append(i)
@@ -479,6 +507,7 @@ class Solver:
             self.global_refine()
         row = {"round": k, "kind": "pnp", "candidates": len(cand), "registered": [self.names[i] for i in kept],
                "rejected": {self.names[i]: round(sup[i], 3) for i in rejected}, "pnp_failed": [self.names[i] for i in failed],
+               "render_second_opinion": {self.names[i]: {kk: j.get(kk) for kk in ("score", "margin", "verdict")} for i, j in second.items()},
                "support": {self.names[i]: (None if sup.get(i) != sup.get(i) else round(sup[i], 3)) for i in newly}, **self.model_stats()}
         self.say(f"round {k}: +{len(kept)} (rejected {len(rejected)}, pnp failed {len(failed)}) -> "
                  f"{self.rec.num_reg_images()}/{len(self.names)} registered, {row['num_points']} pts, reproj {row['reproj']}")
@@ -730,6 +759,121 @@ class Solver:
         self.say(f"audit: {counts}; dropped {row['dropped']}")
         return row
 
+    def strong_pair_rows(self, among: set[int] | None = None) -> list[tuple[int, int, int, float]]:
+        """(i, j, inliers, consistency) for strong pairs between registered images (optionally within ``among``)."""
+        reg = self.reg() if among is None else (self.reg() & among)
+        rows = []
+        for (i, j), m in self.pairs.items():
+            if i in reg and j in reg and len(m) >= self.gc.strong_pair:
+                rows.append((i, j, len(m), self.pair_consistency(i, j)))
+        return rows
+
+    def consistent_components(self, rows, nodes: set[int]) -> list[list[int]]:
+        """Connected components of the graph of strong pairs that agree with the poses (consistency >= 0.5)."""
+        adj: dict[int, set[int]] = {n: set() for n in nodes}
+        for i, j, n, f in rows:
+            if f >= 0.5:
+                adj[i].add(j)
+                adj[j].add(i)
+        seen, comps = set(), []
+        for s0 in nodes:
+            if s0 in seen:
+                continue
+            comp, todo = [], [s0]
+            seen.add(s0)
+            while todo:
+                u = todo.pop()
+                comp.append(u)
+                for v in adj[u]:
+                    if v not in seen:
+                        seen.add(v)
+                        todo.append(v)
+            comps.append(comp)
+        return sorted(comps, key=len, reverse=True)
+
+    def signed_split(self, rows, nodes: list[int]) -> tuple[list[int], list[int], dict[str, float]] | None:
+        """Two-way partition of the registered images that keeps strong consistent pairs together and separates
+        strong inconsistent pairs (signed spectral clustering). Returns (majority, minority, cut statistics), or None
+        when the split does not explain the inconsistency."""
+        if len(nodes) < 6 or len(nodes) > 600:
+            return None
+        idx = {n: a for a, n in enumerate(nodes)}
+        A = np.zeros((len(nodes), len(nodes)))
+        for i, j, n, f in rows:
+            if i not in idx or j not in idx:
+                continue
+            w = n if f >= 0.5 else (-n if f < 0.2 else 0.0)
+            A[idx[i], idx[j]] += w
+            A[idx[j], idx[i]] += w
+        L = np.diag(np.abs(A).sum(1)) - A
+        vals, vecs = np.linalg.eigh(L)
+        v = vecs[:, 0]
+        side = v >= np.median(v) if np.all(v >= 0) or np.all(v <= 0) else v >= 0
+        a = [nodes[x] for x in range(len(nodes)) if side[x]]
+        b = [nodes[x] for x in range(len(nodes)) if not side[x]]
+        if len(a) < 2 or len(b) < 2:
+            return None
+        sa = set(a)
+        neg_cut = neg_all = pos_cut = pos_all = 0.0
+        for i, j, n, f in rows:
+            if i not in idx or j not in idx:
+                continue
+            across = (i in sa) != (j in sa)
+            if f < 0.2:
+                neg_all += n
+                neg_cut += n if across else 0
+            elif f >= 0.5:
+                pos_all += n
+                pos_cut += n if across else 0
+        stats = {"neg_cut_frac": round(neg_cut / max(neg_all, 1e-9), 3), "pos_cut_frac": round(pos_cut / max(pos_all, 1e-9), 3)}
+        if stats["neg_cut_frac"] < 0.6 or stats["pos_cut_frac"] > 0.4:
+            return None
+        maj, mino = (a, b) if len(a) >= len(b) else (b, a)
+        return maj, mino, stats
+
+    def repair_fold(self, k: int) -> list[dict[str, Any]]:
+        """A fold (two self-consistent blocks whose mutual strong pairs disagree with the poses, as on repeated or
+        mirrored structure): deregister the smaller block and place its images again as hard images, with anchors
+        from the larger block in view."""
+        rows = self.strong_pair_rows()
+        if not rows:
+            return []
+        bad = sum(1 for r in rows if r[3] < 0.2)
+        frac = bad / len(rows)
+        if frac <= self.gc.fold_frac:
+            return []
+        comps = self.consistent_components(rows, self.reg())
+        suspects = [i for c in comps[1:] for i in c]
+        stats = {}
+        if not suspects or len(comps[0]) < 3:
+            sp = self.signed_split(rows, sorted(self.reg()))
+            if sp:
+                suspects, stats = sp[1], sp[2]
+        row = {"round": k, "kind": "repair", "strong_pairs": len(rows), "inconsistent_frac": round(frac, 3), "components": [len(c) for c in comps[:6]],
+               "signed_split": stats, "suspects": [self.names[i] for i in suspects]}
+        if not suspects or len(suspects) > 0.5 * len(self.reg()):
+            row["action"] = "none: no minority block to re-place"
+            self.say(f"repair: inconsistent strong pairs {frac:.3f}, components {row['components']}, no action")
+            return [row]
+        for i in suspects:
+            self.deregister(i)
+            self.status[i] = "deferred"
+            self.hard_tried[i] = 0
+        self.global_refine()
+        row["action"] = f"re-placing {len(suspects)} images of the minority block(s)"
+        self.say(f"repair: inconsistent strong pairs {frac:.3f}, components {row['components']}: re-placing {len(suspects)} images")
+        out = [row]
+        cands = list(suspects)
+        kk = k
+        while cands:
+            kk += 1
+            r = self.place_hard(kk, candidates=cands[: self.gc.hard_batch])
+            if r is None:
+                break
+            out.append(r)
+            cands = cands[self.gc.hard_batch:]
+        return out
+
     # -- the loop ----------------------------------------------------------------------------
     def build(self) -> dict[str, Any]:
         """Seed, grow, place hard images, final refinement. Returns the seed record."""
@@ -748,6 +892,8 @@ class Solver:
             if stall >= 6:
                 break
         self.rounds = k
+        for r in self.repair_fold(k):
+            self.log.append(r)
         self.global_refine(final=True)
         if self.held or self.hard_placed:
             self.log.append({"round": k, "kind": "held", "images": self.rerefine_held()})

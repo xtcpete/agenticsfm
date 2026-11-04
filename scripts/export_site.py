@@ -216,8 +216,8 @@ for gid, gtitle, run, dataset, controller in plan:
                     for row in grow_log["log"]:
                         if row.get("kind") == "seed":
                             for n in row["attempts"][row["chosen"]]["kept"]: order.setdefault(n, 0)
-                        else:
-                            for n in row.get("registered", []) or []: order.setdefault(n, row["round"])
+                        elif isinstance(row.get("registered"), list):
+                            for n in row["registered"]: order.setdefault(n, row.get("round", 0))
                     # vlm rows: copy the figures / photos they were shown into the site
                     for row in grow_log["log"]:
                         if row.get("kind") == "vlm":
@@ -225,7 +225,9 @@ for gid, gtitle, run, dataset, controller in plan:
                             for label, names_ in (row.get("images") or {}).items():
                                 out_names = []
                                 for nm in names_:
-                                    src = Path(nm) if Path(nm).is_absolute() else store / "images" / nm
+                                    if not Path(nm).is_absolute():          # scene photos: name only; the figures (absolute paths) are copied
+                                        out_names.append({"src": None, "name": nm}); continue
+                                    src = Path(nm)
                                     if src.is_file():
                                         img_counter[0] += 1
                                         rel = f"img/{ep_id}/{img_counter[0]:03d}.jpg"
