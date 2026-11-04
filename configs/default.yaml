@@ -1,0 +1,95 @@
+# Agentic SfM: default configuration.
+
+# Benchmark datasets (src/agenticsfm/datasets). GT is read by scripts/evaluate.py only; the harness
+# never sees it.
+datasets:
+  wriva:
+    root: /home/gochen/pointglue/data/wriva       # <scene>/{images, sparse/0}; GT poses identical to
+                                                  # ~/gluemap_mod/datasets/wriva/<scene>/sparse_triangulated/0
+    dev_sites: [A08, M07, BLH0001]                # 6 scenes, 793 images; the other 28 scenes are test
+    recipe: {detector: aliked, num_keypoints: 4096, resize: 1024, thresholds: [0.6, 0.4, 0.3]}   # pointglue's WRIVA protocol
+    # GT poses + points triangulated from GLUEMAP's matches (benchmark-layer analysis only: edge oracle)
+    gt_triangulated: /home/gochen/gluemap/datasets/wriva/{scene}/sparse_triangulated/0
+  eth3d:                                        # FlexGlue's SfM benchmark: 25 DSLR scenes, 898 undistorted images, PINHOLE GT
+    root: /raid/home/gochen/cvpr_2027/agenticsfm/data/eth3d/dslr
+    out: outputs/data/eth3d
+    train_scenes: [courtyard, delivery_area, electro, facade, kicker, meadow, office, pipes, playground, relief, relief_2, terrace, terrains]
+    # FlexGlue paper: SuperPoint 4096 keypoints, FlexGlue sparse, covisibility 0.9. Detection at 1600 px instead of the
+    # paper's 1024 (dev: 60.4 vs 54.4 colmap_auc@1); the thresholds start at the paper's 0.9.
+    recipe: {detector: superpoint, num_keypoints: 4096, resize: 1600, thresholds: [0.9, 0.6, 0.4]}
+  lamar:                                        # scalability: thousands of phone images per location (no doppelganger focus)
+    root: /home/gochen/gluemap/datasets/lamar
+    out: outputs/data/lamar
+    scenes:
+      CAB_s1: {location: CAB, sessions: [ios_2021-06-02_14.21.49_000], split: dev, world_to_cam: false}   # 448 images, smoke test
+      CAB_ios: {location: CAB, split: dev, world_to_cam: false}                        # all 6,587 phone images
+    recipe: {detector: aliked, num_keypoints: 4096, resize: 1024, thresholds: [0.6, 0.4, 0.3]}
+
+# Reference evaluators, imported by path so the metrics are exactly theirs.
+evaluation:
+  gluemap_evaluate: /home/gochen/gluemap/benchmark/evaluate.py          # GLUEMAP @ 866e25d
+  colmap_benchmark: /raid/home/gochen/pointglue/baselines/repos/colmap_main/benchmark/reconstruction  # COLMAP @ b5e7830
+  thresholds: [1, 3, 5, 10, 30]     # degrees; GLUEMAP's WRIVA runs report 3/5/10/30
+  min_proj_center_dist: 0.02        # m; below this GT baseline only rotation counts (WRIVA GT is metric)
+
+# Pre-existing WRIVA reconstructions, scored with `evaluate.py --baselines` as reference points.
+# The harness does not depend on them. Their intermediate files (retrieval pairs, two-view scores,
+# matches, COLMAP databases) can seed the artifact cache for WRIVA experiments.
+baselines:
+  gluemap:
+    root: /home/gochen/gluemap_mod/results/wriva
+    runs:                           # run name -> model dir (or dir of sub-models) relative to <root>
+      gluemap_nodg: "{scene}/no_disambiguation/gluemap_aba_nodg"
+      gluemap_dgpp: "{scene}/dgpp/gluemap_aba"
+      gluemap_xdg: "{scene}/dg/gluemap_aba"
+  # hloc -> COLMAP incremental mapping on pointglue's cached matches (pointglue/experiments/wriva_sfm.md).
+  # Each scene dir also holds features.h5 / matches.h5 / database.db, reusable as tool inputs.
+  colmap:
+    root: /raid/home/gochen/pointglue/baselines/results/wriva_sfm
+    runs:
+      colmap_dadlomag: "dad_loma_g/{scene}/sparse"
+      colmap_dadlomag_xdg: "dad_loma_g/{scene}/sparse_xdg_0.600"
+      colmap_alikedfg: "aliked_flexglue/{scene}/sparse"
+      colmap_alikedfg_xdg: "aliked_flexglue/{scene}/sparse_xdg_0.600"
+      colmap_alikedfg_covis: "aliked_flexglue/{scene}/sparse_covis_0.600"   # FlexGlue's own covisibility
+
+vlm:
+  base_url: http://localhost:8000/v1
+  api_key: EMPTY
+  model: Qwen/Qwen3.8-27B
+  max_tokens: 16384                 # per turn, includes thinking
+  request:                          # model-card sampling for thinking mode
+    temperature: 1.0
+    top_p: 0.95
+    extra_body:
+      top_k: 20
+      chat_template_kwargs: {enable_thinking: true, reasoning_effort: medium}
+
+compute:
+  vlm_gpus: [0, 1, 2, 3]            # vLLM, TP=4 (bf16 weights ~55 GB)
+  tool_gpus: [4, 5, 6, 7]           # one tool worker per GPU
+
+# Where artifacts and runs go (relative to the repo root).
+paths:
+  cache: outputs/cache             # <scene_id>/<kind>/<artifact_id>: content-addressed, shared across runs
+  runs: outputs/runs               # <run>/<scene>/{trace.jsonl, artifacts.json, final/}
+
+# Backends run as subprocesses under the interpreter of their env (incompatible torch stacks).
+envs:
+  agenticsfm: /home/gochen/miniconda3/envs/agenticsfm/bin/python   # harness, hloc import, pycolmap 4.2.1 + GLOMAP
+  pointglue: /home/gochen/miniconda3/envs/pointglue/bin/python     # detectors, LightGlue, FlexGlue, LoMa, NetVLAD (torch 2.5)
+  xdg: /home/gochen/miniconda3/envs/xdg/bin/python                 # XDG classifier (torch 2.7)
+  gluemap: /home/gochen/miniconda3/envs/gluemap/bin/python         # GLUEMAP (torch 2.4), M3
+  vggt: /home/gochen/miniconda3/envs/agentic-dg/bin/python         # VGGT via FastVGGT (torch 2.7); the vggt env has no vggt package
+
+# External code the backends import.
+repos:
+  pointglue: /raid/home/gochen/pointglue                            # benchmarks/relpose: detector + matcher adapters
+  hloc: /raid/home/gochen/pointglue/baselines/repos/hloc            # NetVLAD retrieval (pointglue env)
+  xdg: /raid/home/gochen/pointglue/baselines/repos/xdg              # released checkpoint resolved by XDG itself
+  vggt: /home/gochen/agentic_dg/third_party/FastVGGT               # VGGT-1B (facebook/VGGT_tracker_fixed weights in the HF cache)
+  vggt_omega: /raid/home/gochen/cvpr_2027/third_party/vggt-omega    # VGGT-Omega (facebookresearch/vggt-omega @ 48b23c8), imported by path
+  vggt_omega_checkpoint: /raid/home/gochen/cvpr_2027/third_party/weights/vggt_omega_1b_512.pt
+
+verify:
+  model: vggt                       # feedforward model behind verify_poses: vggt (VGGT-1B) or vggt_omega (needs its code allowed to run)

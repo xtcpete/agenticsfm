@@ -1,0 +1,13 @@
+[project]
+name = "agenticsfm"
+version = "0.1.0"
+description = "A VLM agent that evaluates SfM reconstructions and chooses tools"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pyyaml", "pycolmap", "openai", "pillow"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
