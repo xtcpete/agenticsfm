@@ -255,7 +255,9 @@ Conda environments (each backend is a CLI run under its own interpreter, see
 GT is read by `scripts/evaluate.py` only. GT audits of the tools (benchmark layer):
 `scripts/eval_verify.py`, `eval_examine.py`, `eval_edges.py`, `eval_models.py`,
 `analyze_failures.py`, all with `--dataset`. Episode pages with every turn's thinking and
-evidence: `scripts/trace_site.py`; a trace as text: `scripts/trace.py`.
+evidence: `scripts/trace_site.py`; a trace as text: `scripts/trace.py`. The showcase site (every episode's VLM turns, tool steps and evidence, the open solver's growth rounds,
+and the models in a 3D viewer): `scripts/export_site.py --out outputs/site` writes the data and `scripts/showcase/index.html` is the
+page; the published copy of 2026-11-04 is at https://claude.ai/artifact/2hoxdMsajWP6VjoEFWnZbB (private link).
 
 ### 2026-11-02: harness reproduces the reference pipelines from images (M1)
 
