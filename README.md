@@ -780,7 +780,7 @@ primitives (PnP registration, triangulation, local and global bundle adjustment)
    scripted controller ([controllers/incremental.py](src/agenticsfm/controllers/incremental.py);
    `scripts/run.py --controller incremental`).
 
-Four dev scenes, one run each, unfiltered databases, same matches as every other controller. "Grown"
+Six runs on five dev scenes, one run each, unfiltered databases unless stated, same matches as every other controller. "Grown"
 is the solver's model before `optimize`; "incremental" is the submitted model. The scripted and
 fixed numbers are pass 12 on the same databases (the scripted controller runs COLMAP with the
 threshold sweep, verify and `optimize`).
@@ -789,6 +789,8 @@ threshold sweep, verify and `optimize`).
 |---|---|---|---|---|---|
 | WRIVA M07 (50) | `auc_all` @3 / 10 | 23.2 / 76.4 | 36.8 / 81.0 | 26.5 / 77.8 | **38.8 / 81.7** |
 | WRIVA BLH0001 (39) | `auc_all` @3 / 10 | 18.4 / 49.6 (34 img, filter 0.6) | 21.2 / 49.0 (36 img) | 19.3 / 46.8 (32 img) | **24.6** / 49.5 (32 img) |
+| WRIVA BLH0001, filter 0.6 (39) | `auc_all` @3 / 10 | 18.4 / 49.6 (34 img) | 21.2 / 49.0 (36 img) | – | **24.5** / 49.6 (33 img, no fold: 0.003) |
+| WRIVA A08 (150) | `auc_all` @3 / 10 | 17.8 / 44.3 | 17.8 / 44.3 | – | **18.4** / 44.2 (148 img) |
 | ETH3D terrace (23) | `colmap_auc` @1 / 3 / 5 | 53.9 / 81.0 / 88.1 | 65.6 / 88.4 / 93.0 | 57.3 / 84.0 / 90.3 | **67.7 / 89.2 / 93.5** |
 | ETH3D delivery_area (44) | `colmap_auc` @1 / 3 / 5 | 58.2 / 84.1 / 90.3 | 76.9 / 91.9 / 95.1 | 58.7 / 83.8 / 89.9 | **77.8 / 92.2 / 95.3** |
 
@@ -806,8 +808,11 @@ threshold sweep, verify and `optimize`).
 - **Pi3X vs VGGT as the seed and joiner** (M07, same loop): Pi3X 50 of 50 images, 77.8 at 10 deg,
   2 verified rejections; VGGT 47 of 50, 66.9, 13 rejections and 3 images left unplaced. Pi3X is the
   default (`feedforward.model` in the config).
+- **Scale check.** A08 (150 images): 148 registered in 21 rounds, one join refused (anchors did not align),
+  44.2 at 10 deg against 44.3 for COLMAP, 389 s for the solver. With the 0.6 covisibility filter BLH0001
+  grows without a fold (`strong_inconsistent_frac` 0.003) to 33 images and 49.6 / 24.5.
 - **Cost.** M07 237 s (40 s of it Pi3X including two model loads), BLH0001 116 s, terrace 40 s,
-  delivery_area 86 s for the solver; the global refinement after every round is most of it and is
+  delivery_area 86 s, A08 389 s for the solver; the global refinement after every round is most of it and is
   the first thing to make cheaper. `optimize` adds 20 to 65 s.
 
 What the loop does not do yet, in the order it will be added: cut edges instead of dropping images
