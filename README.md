@@ -309,10 +309,31 @@ that, and the registered count drops instead: on PTZ s00, 21 images were rejecte
 them the precision the PnP path would have. The PTZ runs also take 35 to 60 minutes each, almost all of it Pi3X
 model loads (13 s per call) and VLM calls in the hard rounds.
 
-v1.5, running as this is written: the seed is split into its largest self-consistent block when its strong pairs
+v1.5 (results in the next section): the seed is split into its largest self-consistent block when its strong pairs
 disagree; a fold repair after growth deregisters the minority block of the consistent-pair graph and re-places
 it as hard images with anchors from the majority block in view; and an image with support between 0.25 and 0.5
 gets render-and-compare as a second opinion before it is rejected.
+
+### 2026-11-04, end of day: v1.5 and v1.6, and the state of play
+
+| scene | metric | scripted | v1.3 | v1.5 | v1.6 | what GT says |
+|---|---|---|---|---|---|---|
+| old_computer (54) | `colmap_auc` @1 | 56.8 | 30.9 | 30.6 | 26.2 (2 models) | the fold is now detected (27% of strong pairs inconsistent; the signed split cuts 65% of them and 8% of the consistent ones) but re-placing the minority block failed: "anchors did not align" on most, and the leftover 16 became a second, correct model |
+| PTZ s00 (198) | `auc_all` @10 | 61.6 | 56.1 (194) | 55.6 (189) | 53.9 (186) | 31 images rejected by match support even with the rotation-aware test, so the PTZ failure is not the pure-rotation degeneracy; 20% of strong pairs read inconsistent in a model whose median camera error is 0.9 degrees, which points at the 4 px threshold on zoomed frames with long focal lengths |
+| BLH0001 (39) | `auc_all` @10 | 49.0 | 50.7 (36) | 39.8 (31) | 39.8 (31) | the stricter figure prompt made the advisor answer "neither" on correct placements whose renderings are sparse; 12 and 22 end 10 to 13 degrees off |
+| M07, delivery_area, lounge | | | | unchanged | | |
+
+Defaults after this: agreement within 10 degrees (v1.3), the link gate and the no-pick-over-inconsistent gate kept,
+the render second opinion for borderline support kept, fold repair detect-only (`repair_act`), the figure prompt
+tolerant of sparse renderings. The best measured configuration on WRIVA dev remains v1.3 (56.5 against the
+scripted controller's 59.7 and the fixed pipeline's 58.9), and on ETH3D dev v1.3 ties the scripted controller.
+
+Open items, in order, each with its GT evidence in this log: (1) precision of hard placements, which needs a pose
+refinement that does not depend on matches (photometric, against the render-and-compare depth); (2) the PTZ
+consistency threshold, angular rather than 4 px; (3) fold repair: the signed split finds the block, the
+re-placement needs anchors chosen from the majority block only and the feedforward model's own disambiguation;
+(4) a persistent Pi3X worker, since model loads are most of a run; (5) the VLM as scheduler, now that every
+decision point and its evidence are logged.
 
 ## Running the harness
 

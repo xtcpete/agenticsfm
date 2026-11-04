@@ -112,8 +112,8 @@ class Advisor:
               "overlay of the two. If the camera is placed correctly, the structures in the middle panel sit on the same structures in the "
               "photo: building edges, roofs, roads and ground coincide in the overlay (small blur is fine). If it is placed wrongly, the model "
               "shows a different place, or the same place shifted, rotated or at a different scale, and the overlay shows doubled edges. "
-              "First say what the middle panel depicts. If it depicts other objects than the photo (a different building, terrain where the photo "
-              "shows a wall), or is mostly dark grey or a thin scatter of dots with no recognisable structure, the placement is NOT aligned.")
+              "If the middle panel depicts other objects than the photo (a different building, terrain where the photo shows a wall), the placement is "
+              "NOT aligned. A sparse rendering is normal: judge where its points fall, not how many there are.")
 
     def render_verdict(self, figure_path: str, context: dict[str, Any] | None = None) -> str:
         """'aligned' / 'misaligned' / 'unsure' for one render-and-compare figure."""

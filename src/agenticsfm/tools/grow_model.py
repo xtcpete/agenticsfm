@@ -43,7 +43,7 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
                min_support: float = 0.5, hard: bool = True, vlm: str = "decide", multi_model: bool = True) -> ToolResult:
     started = time.time()
     params = {"feedforward": feedforward, "seed_size": int(seed_size), "group_size": int(group_size),
-              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 8}
+              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 9}
     id = ws.artifact_id("grow_model", params, {"db": db_id})
     if (r := cached_result(ws, id)) is not None:
         return r

@@ -74,3 +74,10 @@ has the evidence.
   many hard rounds makes dozens of calls. A persistent worker per env is the next engineering step.
 - **Never edit the source while runs are in flight** still holds for the solver: the backend is a subprocess per
   call, and a controller process imports the solver once, so edits mix versions across a batch.
+- **Detecting a fold is not repairing it.** The signed-graph split finds the mirrored block of old_computer;
+  re-placing it with the hard-image stage failed because the anchors still included lookalike images. Detection
+  is logged; repair stays off until the re-placement is verified on that scene.
+- **Do not tune the advisor's prompt on one failure.** Asking it to describe the rendering first stopped the
+  mixed-scene mistake and also made it refuse correct, sparsely rendered placements on BLH0001.
+- **One run per scene is not a measurement.** The dev set moved by points between versions on scenes where the
+  only change was a prompt wording or a threshold; multi-seed runs are needed before any threshold is final.

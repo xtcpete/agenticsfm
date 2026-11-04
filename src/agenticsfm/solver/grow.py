@@ -68,6 +68,7 @@ class GrowConfig:
     min_support: float = 0.5     # inlier-weighted share of consistent matches an image needs (strong pairs only)
     support_low: float = 0.25    # between support_low and min_support, render-and-compare gives the second opinion
     fold_frac: float = 0.05      # share of strong pairs inconsistent with the poses above which the model is treated as folded
+    repair_act: bool = False     # re-place the minority block of a detected fold (v1.6 misfired on old_computer: detect and log only until the re-placement is reliable)
     seed_fold_frac: float = 0.1
     strong_pair: int = 50        # inliers for a pair to count in the support
     epipolar_px: float = 4.0
@@ -78,7 +79,7 @@ class GrowConfig:
     hard_anchors_match: int = 4
     hard_anchors_diverse: int = 8
     hard_min_link: int = 50          # a hard candidate needs this many inliers to registered images in all (>= 2 pairs), or one pair this strong
-    hard_agree_deg: float = 5.0      # the two placements must agree in rotation (GT-correct ones agree within 3 deg, wrong ones within 8 to 10) ...
+    hard_agree_deg: float = 10.0     # the two placements must agree in rotation (GT-correct BLH0001 placements agreed within 3 deg; PTZ placements at 8-10 deg were imprecise: open item) ...
     hard_agree_frac: float = 0.05    # ... and in position (fraction of the scene span)
     max_alignment_frac: float = 0.08  # anchors' alignment residual over the scene span, after trimming
     drift_deg: float = 10.0          # a hard placement that bundle adjustment moves more than this is held at its placement
@@ -851,6 +852,10 @@ class Solver:
                 suspects, stats = sp[1], sp[2]
         row = {"round": k, "kind": "repair", "strong_pairs": len(rows), "inconsistent_frac": round(frac, 3), "components": [len(c) for c in comps[:6]],
                "signed_split": stats, "suspects": [self.names[i] for i in suspects]}
+        if not self.gc.repair_act:
+            row["action"] = "detected only (repair_act is off)"
+            self.say(f"repair: inconsistent strong pairs {frac:.3f}, components {row['components']}, split {stats}: detected, not acted on")
+            return [row]
         if not suspects or len(suspects) > 0.5 * len(self.reg()):
             row["action"] = "none: no minority block to re-place"
             self.say(f"repair: inconsistent strong pairs {frac:.3f}, components {row['components']}, no action")
