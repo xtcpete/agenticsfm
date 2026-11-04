@@ -164,7 +164,8 @@ def export_model(model_dir, out_path, images_dir, order=None, gt=None):
     header = json.dumps({"num_points": int(len(X)), "num_cameras": len(camera_rows), "sub_models": [(name, r.num_reg_images()) for r, name in recs],
                          "reproj": round(rec.compute_mean_reprojection_error(), 3) if rec.num_points3D() else None,
                          "num_points_total": rec.num_points3D(), "cameras": camera_rows, "gt_cameras": gt_rows,
-                         "gt_summary": align["summary"] if align else None}).encode()
+                         "gt_summary": align["summary"] if align else None,
+                         "metres_per_unit": (fr.span * align["summary"]["scale"]) if align else None}).encode()
     import base64
     Path(out_path).write_text(json.dumps({"header": json.loads(header), "pos": base64.b64encode(X.astype("<f4").tobytes()).decode(),
                                           "col": base64.b64encode(C.astype(np.uint8).tobytes()).decode()}))

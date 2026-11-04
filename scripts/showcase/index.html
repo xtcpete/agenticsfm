@@ -94,6 +94,8 @@ tr.link:hover td { background: var(--surface-2) }
 .vmeta { font-size: 12px; color: var(--muted); font-family: var(--font-mono) }
 .roundbar { margin-top: 8px }
 .alignbox { margin-top: 10px }
+.alignplot { margin-top: 8px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden }
+.alignplot svg { width: 100%; height: auto; display: block; max-width: 100% }
 .alignbox .growth svg { height: 120px }
 .roundbar input[type=range] { width: 100%; accent-color: var(--accent) }
 .legend { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-top: 4px; flex-wrap: wrap }
@@ -455,6 +457,62 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
     return h('div', { class: 'growth' }, [svg]);
   }
 
+  function alignPlot(container, d) {
+    var gts = d.gt_cameras || [], ests = d.cameras || [];
+    if (!gts.length) return;
+    var mpu = d.metres_per_unit || null, unit = mpu ? 'm' : 'span units', k = mpu || 1;
+    var est = {}; ests.forEach(function (c) { est[c.name] = c; });
+    var pts = [];
+    gts.forEach(function (g) { pts.push([g.c[0] * k, g.c[1] * k]); var e = est[g.name]; if (e) pts.push([e.c[0] * k, e.c[1] * k]); });
+    var xs = pts.map(function (p) { return p[0]; }), ys = pts.map(function (p) { return p[1]; });
+    var lo = Math.min.apply(null, xs), hi = Math.max.apply(null, xs), lo2 = Math.min.apply(null, ys), hi2 = Math.max.apply(null, ys);
+    var span = Math.max(hi - lo, hi2 - lo2) || 1, cx = (lo + hi) / 2, cy = (lo2 + hi2) / 2, half = span * 0.56;
+    var W = 600, H = 600, pad = 36, inner = W - 2 * pad;
+    function X(x) { return pad + (x - (cx - half)) / (2 * half) * inner; }
+    function Y(y) { return H - pad - (y - (cy - half)) / (2 * half) * inner; }
+    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H); svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', 'top view of ground-truth and reconstructed camera positions after alignment');
+    function el(nm, a) { var e = document.createElementNS('http://www.w3.org/2000/svg', nm); Object.keys(a).forEach(function (q) { e.setAttribute(q, a[q]); }); return e; }
+    var cs = getComputedStyle(document.documentElement), fg = cs.getPropertyValue('--muted').trim() || '#888', line = cs.getPropertyValue('--line').trim() || '#ccc', surface = cs.getPropertyValue('--surface').trim() || '#fff';
+    svg.appendChild(el('rect', { x: 0, y: 0, width: W, height: H, fill: surface, rx: 6 }));
+    // grid at a round step
+    var raw = (2 * half) / 6, mag = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10)), step = [1, 2, 5, 10].map(function (m) { return m * mag; }).reduce(function (a, b) { return Math.abs(b - raw) < Math.abs(a - raw) ? b : a; });
+    for (var gx = Math.ceil((cx - half) / step) * step; gx <= cx + half; gx += step) {
+      svg.appendChild(el('line', { x1: X(gx), y1: pad, x2: X(gx), y2: H - pad, stroke: line, 'stroke-width': 0.6 }));
+      var tx = el('text', { x: X(gx), y: H - pad + 12, 'text-anchor': 'middle', 'font-size': 9, fill: fg, 'font-family': 'IBM Plex Mono, monospace' }); tx.textContent = (Math.round(gx * 100) / 100) + ''; svg.appendChild(tx);
+    }
+    for (var gy = Math.ceil((cy - half) / step) * step; gy <= cy + half; gy += step) {
+      svg.appendChild(el('line', { x1: pad, y1: Y(gy), x2: W - pad, y2: Y(gy), stroke: line, 'stroke-width': 0.6 }));
+      var ty = el('text', { x: pad - 4, y: Y(gy) + 3, 'text-anchor': 'end', 'font-size': 9, fill: fg, 'font-family': 'IBM Plex Mono, monospace' }); ty.textContent = (Math.round(gy * 100) / 100) + ''; svg.appendChild(ty);
+    }
+    svg.appendChild(el('rect', { x: pad, y: pad, width: inner, height: inner, fill: 'none', stroke: fg, 'stroke-width': 0.8 }));
+    // GT trajectory in capture order (names sorted), then error segments, GT dots, reconstruction dots
+    var ordered = gts.slice().sort(function (a, b) { return a.name < b.name ? -1 : 1; });
+    var path = ordered.map(function (g, i) { return (i ? 'L' : 'M') + X(g.c[0] * k).toFixed(1) + ' ' + Y(g.c[1] * k).toFixed(1); }).join(' ');
+    svg.appendChild(el('path', { d: path, fill: 'none', stroke: '#8b5cf6', 'stroke-width': 0.8, opacity: 0.45 }));
+    gts.forEach(function (g) {
+      var e = est[g.name];
+      if (e) svg.appendChild(el('line', { x1: X(e.c[0] * k), y1: Y(e.c[1] * k), x2: X(g.c[0] * k), y2: Y(g.c[1] * k), stroke: '#dc2626', 'stroke-width': 1.1, opacity: 0.85 }));
+    });
+    gts.forEach(function (g) {
+      var c = el('circle', { cx: X(g.c[0] * k), cy: Y(g.c[1] * k), r: 4, fill: g.registered ? '#8b5cf6' : 'none', stroke: g.registered ? '#6d28d9' : '#8a94a0', 'stroke-width': 1, opacity: 0.8 });
+      var tt = document.createElementNS('http://www.w3.org/2000/svg', 'title'); tt.textContent = 'GT ' + g.name + (g.registered ? '' : ' (not in the model)'); c.appendChild(tt); svg.appendChild(c);
+    });
+    ests.forEach(function (e) {
+      var c = el('circle', { cx: X(e.c[0] * k), cy: Y(e.c[1] * k), r: 2.6, fill: '#dc2626' });
+      var tt = document.createElementNS('http://www.w3.org/2000/svg', 'title'); tt.textContent = e.name + (e.rot_deg != null ? ': ' + e.rot_deg + '° rotation, ' + (100 * e.pos_frac).toFixed(1) + '% of span' : ''); c.appendChild(tt); svg.appendChild(c);
+    });
+    // legend
+    var lg = [['#8b5cf6', 'gt', 'circle'], ['#dc2626', 'reconstruction', 'dot'], ['#dc2626', 'error', 'line'], ['#8a94a0', 'gt, not in the model', 'ring']];
+    lg.forEach(function (it, i) {
+      var y0 = pad + 12 + i * 15, x0 = pad + 10;
+      if (it[2] === 'line') svg.appendChild(el('line', { x1: x0 - 5, y1: y0, x2: x0 + 5, y2: y0, stroke: it[0], 'stroke-width': 1.5 }));
+      else svg.appendChild(el('circle', { cx: x0, cy: y0, r: it[2] === 'dot' ? 2.6 : 4, fill: it[2] === 'ring' ? 'none' : it[0], stroke: it[2] === 'ring' ? it[0] : 'none', 'stroke-width': 1 }));
+      var tl = el('text', { x: x0 + 10, y: y0 + 3, 'font-size': 10, fill: fg, 'font-family': 'IBM Plex Sans, sans-serif' }); tl.textContent = it[1]; svg.appendChild(tl);
+    });
+    var cap = el('text', { x: W / 2, y: 12, 'text-anchor': 'middle', 'font-size': 10, fill: fg, 'font-family': 'IBM Plex Sans, sans-serif' }); cap.textContent = 'Top view after similarity alignment · axes in ' + unit; svg.appendChild(cap);
+    container.appendChild(h('div', { class: 'alignplot' }, [svg]));
+  }
+
   function alignChart(container, d) {
     var cams = (d.cameras || []).filter(function (c) { return c.rot_deg != null; });
     var sum = d.gt_summary;
@@ -548,6 +606,25 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
   Viewer.prototype.clear = function () {
     if (this.points) { this.scene.remove(this.points); this.points.geometry.dispose(); this.points.material.dispose(); this.points = null; }
     if (this.cams) { this.scene.remove(this.cams); this.cams.geometry.dispose(); this.cams.material.dispose(); this.cams = null; }
+    if (this.gtcams) { this.scene.remove(this.gtcams); this.gtcams.geometry.dispose(); this.gtcams.material.dispose(); this.gtcams = null; }
+  };
+  Viewer.prototype.buildGt = function () {
+    if (this.gtcams) { this.scene.remove(this.gtcams); this.gtcams.geometry.dispose(); this.gtcams.material.dispose(); this.gtcams = null; }
+    if (!this.data || !this.data.gt_cameras || !this.data.gt_cameras.length) return;
+    var d = this.camSize * 0.9, verts = [], cols = [], est = {};
+    (this.data.cameras || []).forEach(function (c) { est[c.name] = c; });
+    var pink = new THREE.Color(0xf472b6), grey = new THREE.Color(0x8a94a0), red = new THREE.Color(0xff5a5a);
+    this.data.gt_cameras.forEach(function (c) {
+      var ax = c.ax, cx = c.c, col = c.registered ? pink : grey;
+      function p(u, v) { return [cx[0] + d * (u * c.hw * ax[0] + v * c.hh * ax[3] + ax[6]), cx[1] + d * (u * c.hw * ax[1] + v * c.hh * ax[4] + ax[7]), cx[2] + d * (u * c.hw * ax[2] + v * c.hh * ax[5] + ax[8])]; }
+      var k = [p(-1, -1), p(1, -1), p(1, 1), p(-1, 1)];
+      var segs = [[cx, k[0]], [cx, k[1]], [cx, k[2]], [cx, k[3]], [k[0], k[1]], [k[1], k[2]], [k[2], k[3]], [k[3], k[0]]];
+      segs.forEach(function (s) { verts.push(s[0][0], s[0][1], s[0][2], s[1][0], s[1][1], s[1][2]); for (var i = 0; i < 2; i++) cols.push(col.r, col.g, col.b); });
+      var e = est[c.name];
+      if (e) { verts.push(e.c[0], e.c[1], e.c[2], cx[0], cx[1], cx[2]); for (var j = 0; j < 2; j++) cols.push(red.r, red.g, red.b); }
+    });
+    var g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+    this.gtcams = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 })); this.gtcams.visible = this.showGt; this.scene.add(this.gtcams);
   };
   function b64bytes(s) { var bin = atob(s), out = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
   Viewer.prototype.load = function (obj) {
@@ -609,7 +686,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
         VIEWER.load(obj);
         var d = VIEWER.data;
         meta.textContent = d.num_cameras + ' cameras · ' + d.num_points_total.toLocaleString() + ' points (' + d.num_points.toLocaleString() + ' shown) · reproj ' + d.reproj + ' px' + (d.sub_models.length > 1 ? ' · ' + d.sub_models.length + ' sub-models, largest shown' : '');
-        alignWrap.innerHTML = ''; alignChart(alignWrap, d);
+        alignWrap.innerHTML = ''; alignChart(alignWrap, d); alignPlot(alignWrap, d);
         if (VIEWER.hasOrder) {
           var rg = h('input', { type: 'range', id: 'rg-round', min: '0', max: String(VIEWER.maxOrder), step: '1', value: String(VIEWER.maxOrder), 'aria-label': 'growth round' });
           var lab = h('div', { class: 'vmeta', text: 'all rounds · ' + d.num_cameras + ' cameras' });
