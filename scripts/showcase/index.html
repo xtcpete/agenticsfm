@@ -1,0 +1,572 @@
+<title>Agentic SfM Episodes</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a fixed episode rail on the left; the episode page is a two-column workbench, the trace on the left and the 3D model pinned on the right. */
+:root {
+  --bg: #eceff3; --surface: #ffffff; --surface-2: #e3e8ee; --fg: #151c24; --muted: #5a6673; --line: #cdd5de;
+  --accent: #0b6e99; --accent-soft: #d9ecf5; --ok: #1f8a5b; --warn: #b8700a; --bad: #b83a2e;
+  --viewer-bg: #0e141b; --viewer-grid: #22303d; --thinking-bg: #f4f1e8;
+  --font-body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-display: "IBM Plex Sans Condensed", "Arial Narrow", "IBM Plex Sans", sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f1418; --surface: #161d24; --surface-2: #1f2932; --fg: #e4e9ee; --muted: #93a0ac; --line: #2a3541;
+  --accent: #58b6e3; --accent-soft: #15364a; --ok: #4cc287; --warn: #e3a33a; --bad: #e46b5e;
+  --viewer-bg: #090d11; --viewer-grid: #1b2630; --thinking-bg: #1c1f1a; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0f1418; --surface: #161d24; --surface-2: #1f2932; --fg: #e4e9ee; --muted: #93a0ac; --line: #2a3541;
+  --accent: #58b6e3; --accent-soft: #15364a; --ok: #4cc287; --warn: #e3a33a; --bad: #e46b5e;
+  --viewer-bg: #090d11; --viewer-grid: #1b2630; --thinking-bg: #1c1f1a; color-scheme: dark }
+
+* { box-sizing: border-box }
+html, body { height: 100% }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 var(--font-body); -webkit-font-smoothing: antialiased }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--surface) }
+a { color: var(--accent) }
+button, select, input { font: inherit; color: inherit }
+button { cursor: pointer }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+h1, h2, h3 { font-family: var(--font-display); font-weight: 600; letter-spacing: 0.005em; text-wrap: balance; margin: 0 }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums }
+.muted { color: var(--muted) }
+.eyebrow { font: 500 11px/1.2 var(--font-body); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted) }
+
+.app { display: grid; grid-template-columns: 272px minmax(0, 1fr); min-height: 100%;
+  padding-left: max(0px, env(safe-area-inset-left, 0px)); padding-right: max(0px, env(safe-area-inset-right, 0px)) }
+.rail { background: var(--surface); border-right: 1px solid var(--line); position: sticky; top: env(safe-area-inset-top, 0px); height: calc(100vh - env(safe-area-inset-top, 0px)); overflow-y: auto;
+  padding-block: 18px 24px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: 12px }
+.rail .brand { display: block; color: inherit; text-decoration: none; margin-bottom: 18px }
+.rail .brand h1 { font-size: 20px; line-height: 1.15 }
+.rail .brand .sub { font-size: 12px; color: var(--muted); margin-top: 4px }
+.rail .group { margin-top: 16px }
+.rail .group .eyebrow { margin: 0 0 6px 8px }
+.rail .ep { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; width: 100%; text-align: left; border: 0; background: none; padding: 5px 8px; border-radius: 6px; color: inherit }
+.rail .ep:hover { background: var(--surface-2) }
+.rail .ep.current { background: var(--accent-soft); color: var(--fg) }
+.rail .ep .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0 }
+.rail .ep .s { font-family: var(--font-mono); font-size: 12px; color: var(--muted); flex: none }
+.picker { display: none }
+
+main { min-width: 0; padding-block: 20px 48px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)) }
+.wrap { max-width: 1380px; margin: 0 auto }
+
+/* overview */
+.lede { max-width: 68ch; font-size: 15px }
+.lede h2 { font-size: 30px; margin-bottom: 10px }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin: 22px 0 }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0 }
+.card .big { font: 600 26px/1.1 var(--font-display); margin: 6px 0 2px; font-variant-numeric: tabular-nums }
+.card .big small { font: 500 13px/1 var(--font-body); color: var(--muted); margin-left: 6px }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top }
+th { font-weight: 500; color: var(--muted); font-size: 12px; letter-spacing: 0.02em }
+td.num, th.num { text-align: right; font-family: var(--font-mono); font-size: 13px }
+.tablewrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; margin: 10px 0 24px }
+.tablewrap table { min-width: 560px }
+tr.link { cursor: pointer }
+tr.link:hover td { background: var(--surface-2) }
+.delta { font-family: var(--font-mono); font-size: 12px }
+.delta.up { color: var(--ok) } .delta.down { color: var(--bad) } .delta.flat { color: var(--muted) }
+.section h2 { font-size: 22px; margin: 26px 0 4px }
+.section p { max-width: 70ch; color: var(--muted); margin: 0 0 8px }
+
+/* episode */
+.ep-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 16px; margin-bottom: 6px }
+.ep-head h2 { font-size: 30px }
+.chip { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--fg) }
+.chip.accent { background: var(--accent-soft); color: var(--accent) }
+.stats { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 6px 0 14px; color: var(--muted); font-size: 13px }
+.stats b { color: var(--fg); font-weight: 500; font-family: var(--font-mono) }
+.scores { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin-bottom: 18px }
+.scores .note { font-size: 12px; color: var(--muted); margin: 6px 0 0 }
+.work { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 44%); gap: 20px; align-items: start }
+.viewer-col { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 14px) }
+.viewer { background: var(--viewer-bg); border-radius: 8px; border: 1px solid var(--line); aspect-ratio: 4 / 3; max-width: 100%; position: relative; overflow: hidden }
+.viewer canvas { display: block; width: 100%; height: 100% }
+.viewer .hint { position: absolute; left: 10px; bottom: 8px; font-size: 11px; color: #9fb0bf; pointer-events: none }
+.vbar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin: 8px 0 4px; font-size: 13px }
+.vbar label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted) }
+.vbar input[type=range] { width: 110px; accent-color: var(--accent) }
+.vbar select { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; max-width: 100% }
+.vbar button { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px }
+.vmeta { font-size: 12px; color: var(--muted); font-family: var(--font-mono) }
+.roundbar { margin-top: 8px }
+.roundbar input[type=range] { width: 100%; accent-color: var(--accent) }
+.legend { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-top: 4px; flex-wrap: wrap }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px }
+
+/* trace */
+.trace { display: flex; flex-direction: column; gap: 10px; min-width: 0 }
+.step { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px 12px; min-width: 0 }
+.step.vlm { border-left: 3px solid var(--accent) }
+.step.note { border-left: 3px solid var(--warn) }
+.step .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; margin-bottom: 6px }
+.step .head .name { font-family: var(--font-display); font-weight: 600; font-size: 16px }
+.step .head .meta { font-size: 12px; color: var(--muted); font-family: var(--font-mono) }
+.step .says { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 }
+.thinking { background: var(--thinking-bg); border-radius: 6px; padding: 8px 10px; margin: 6px 0; font-size: 13px }
+.thinking summary { cursor: pointer; color: var(--muted); font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase }
+.thinking .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px; color: var(--fg) }
+.calls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px }
+.call { font-family: var(--font-mono); font-size: 12px; background: var(--accent-soft); color: var(--accent); border-radius: 6px; padding: 3px 8px; overflow-wrap: anywhere }
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 14px; font-size: 13px; margin: 4px 0 }
+.kv dt { color: var(--muted); font-family: var(--font-mono); font-size: 12px } .kv dd { margin: 0; font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere }
+details.raw summary { cursor: pointer; font-size: 12px; color: var(--muted); margin-top: 4px }
+pre { font: 12px/1.45 var(--font-mono); background: var(--surface-2); border-radius: 6px; padding: 8px 10px; overflow-x: auto; margin: 6px 0; max-height: 420px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere }
+.thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-top: 8px }
+.thumbs button { padding: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); overflow: hidden; aspect-ratio: 4 / 3; max-width: 100% }
+.thumbs img { width: 100%; height: 100%; object-fit: cover; display: block }
+.thumbs .cap { font-size: 11px; color: var(--muted); font-family: var(--font-mono); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.err { color: var(--bad); font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere }
+
+/* growth rounds */
+.rounds { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px }
+.round { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 4px 12px; padding: 6px 6px; border-radius: 6px; font-size: 13px; cursor: pointer }
+.round:hover, .round.current { background: var(--surface-2) }
+.round .lab { font-family: var(--font-display); font-weight: 600 }
+.round .lab small { display: block; font: 11px/1.3 var(--font-mono); color: var(--muted); font-weight: 400 }
+.round .body { min-width: 0 }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px }
+.tag { font-family: var(--font-mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--surface-2); color: var(--fg) }
+.tag.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok) }
+.tag.warn { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn) }
+.tag.bad { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad) }
+.growth { margin: 6px 0 2px }
+.growth svg { width: 100%; height: 72px; display: block; max-width: 100% }
+
+dialog { border: 0; border-radius: 8px; padding: 0; background: var(--surface); color: var(--fg); max-width: min(96vw, 1200px); box-shadow: 0 10px 40px rgba(0,0,0,.4) }
+dialog::backdrop { background: rgba(5, 10, 15, .7) }
+dialog img { display: block; max-width: 96vw; max-height: 86vh }
+dialog .cap { display: flex; justify-content: space-between; gap: 12px; padding: 8px 12px; font-size: 12px; font-family: var(--font-mono); color: var(--muted) }
+dialog .cap button { background: none; border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px }
+.empty { color: var(--muted); padding: 20px 0 }
+
+@media (max-width: 1080px) { .work { grid-template-columns: minmax(0, 1fr) } .viewer-col { position: static; order: -1 } }
+@media (max-width: 860px) {
+  .app { grid-template-columns: minmax(0, 1fr) }
+  .rail { display: none }
+  .picker { display: block; background: var(--surface); border-bottom: 1px solid var(--line); padding-block: 10px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5 }
+  .picker select { width: 100%; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px }
+  .ep-head h2 { font-size: 24px }
+}
+@media (prefers-reduced-motion: no-preference) { .rail .ep, .round { transition: background .12s } }
+</style>
+
+<div class="picker"><select id="picker" aria-label="Choose an episode"></select></div>
+<div class="app">
+  <nav class="rail" id="rail" aria-label="Episodes">
+    <a class="brand" href="#"><h1>Agentic SfM Episodes</h1><div class="sub">VLM reasoning traces and the reconstructions they produced</div></a>
+  </nav>
+  <main><div class="wrap" id="view"><div class="empty">Loading episodes…</div></div></main>
+</div>
+<dialog id="dlg"><div class="cap"><span id="dlgcap"></span><button id="dlgclose" type="button">Close</button></div><img id="dlgimg" alt=""></dialog>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  'use strict';
+  var INDEX = null, VIEWER = null, CURRENT = null;
+  var $ = function (s, el) { return (el || document).querySelector(s); };
+  function h(tag, attrs, children) {
+    var el = document.createElement(tag);
+    if (attrs) Object.keys(attrs).forEach(function (k) {
+      if (k === 'class') el.className = attrs[k];
+      else if (k === 'text') el.textContent = attrs[k];
+      else if (k === 'html') el.innerHTML = attrs[k];
+      else if (k.slice(0, 2) === 'on') el.addEventListener(k.slice(2), attrs[k]);
+      else el.setAttribute(k, attrs[k]);
+    });
+    (children || []).forEach(function (c) { if (c == null) return; el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+    return el;
+  }
+  function fmt(v, d) { return (v == null || isNaN(v)) ? '–' : Number(v).toFixed(d == null ? 1 : d); }
+  function metricsFor(ds) {
+    return ds === 'eth3d' ? [['colmap_auc@1', 'AUC@1°'], ['colmap_auc@3', 'AUC@3°'], ['colmap_auc@5', 'AUC@5°']]
+                          : [['auc_all@3', 'AUC@3°'], ['auc_all@10', 'AUC@10°']];
+  }
+  function primary(ds) { return ds === 'eth3d' ? 'colmap_auc@1' : 'auc_all@10'; }
+  function delta(a, b) {
+    if (a == null || b == null) return h('span', { class: 'delta flat', text: '' });
+    var d = a - b, cls = Math.abs(d) < 0.05 ? 'flat' : (d > 0 ? 'up' : 'down');
+    return h('span', { class: 'delta ' + cls, text: (d > 0 ? '+' : '') + d.toFixed(1) });
+  }
+
+  /* ---------------- rail ---------------- */
+  function buildRail() {
+    var rail = $('#rail'), pick = $('#picker');
+    pick.appendChild(h('option', { value: '', text: 'Overview' }));
+    INDEX.groups.forEach(function (g) {
+      var box = h('div', { class: 'group' }, [h('div', { class: 'eyebrow', text: g.title })]);
+      var og = h('optgroup', { label: g.title });
+      g.episodes.forEach(function (id) {
+        var ep = INDEX.episodes[id], sc = ep.score ? ep.score[primary(ep.dataset)] : null;
+        box.appendChild(h('button', { class: 'ep', type: 'button', 'data-id': id, onclick: function () { location.hash = id; } },
+          [h('span', { class: 't', text: ep.title }), h('span', { class: 's', text: fmt(sc) })]));
+        og.appendChild(h('option', { value: id, text: ep.title + '  ·  ' + fmt(sc) }));
+      });
+      rail.appendChild(box); pick.appendChild(og);
+    });
+    pick.addEventListener('change', function () { location.hash = pick.value; });
+  }
+  function markCurrent(id) {
+    document.querySelectorAll('.rail .ep').forEach(function (b) { b.classList.toggle('current', b.getAttribute('data-id') === id); });
+    $('#picker').value = id || '';
+  }
+
+  /* ---------------- overview ---------------- */
+  function showOverview() {
+    CURRENT = null; markCurrent(null); if (VIEWER) { VIEWER.dispose(); VIEWER = null; }
+    var v = $('#view'); v.innerHTML = '';
+    var n = Object.keys(INDEX.episodes).length;
+    v.appendChild(h('div', { class: 'lede' }, [
+      h('div', { class: 'eyebrow', text: 'Agentic structure from motion · ' + n + ' episodes · exported ' + INDEX.generated }),
+      h('h2', { text: 'A VLM that runs reconstructions without computing geometry' }),
+      h('p', { html: 'Each episode is one scene handed to a controller. The <b>agent</b> is Qwen3.8-27B with a tool box (graph, match, pair scoring, filtering, COLMAP / GLOMAP mapping, examine, verify with a feedforward model, merge, optimize) and a budget; every turn below shows its thinking verbatim, what it said, which tool it called, and the evidence that came back. The <b>open solver</b> episodes are the newer loop that replaces COLMAP’s mapper: a Pi3X seed, PnP growth in verified rounds, feedforward joins, bundle adjustment. Every pose in every model came from a tool.' }),
+      h('p', { class: 'muted', text: 'Scores are computed against ground truth in the benchmark layer only, after the episode: nothing in a trace saw them. WRIVA uses the AUC of pairwise pose error over all image pairs (an unregistered image counts as wrong); ETH3D uses COLMAP’s AUC at 1, 3 and 5 degrees.' })
+    ]));
+    var cards = h('div', { class: 'cards' });
+    cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'ETH3D, 25 scenes · colmap_auc @1 / 3 / 5' }), h('div', { class: 'big', text: '68.7 / 88.3 / 92.8' }), h('div', { class: 'muted', text: 'agent, pass 13 · scripted 68.5 / 88.2 / 92.7 · best fixed pipeline 61.9 / 84.6 / 90.3 · FlexGlue paper 68.9 / 86.8 / 92.3' })]));
+    cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · auc_all @10 / @3' }), h('div', { class: 'big', text: '59.7 / 22.5' }), h('div', { class: 'muted', text: 'agent and scripted controller alike · best fixed pipeline 58.9 / 19.5' })]));
+    cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'Open solver v0 · M07, 50 images · auc_all @10 / @3' }), h('div', { class: 'big', text: '81.7 / 38.8' }), h('div', { class: 'muted', text: 'Pi3X seed + verified growth + optimize, one pass · scripted (COLMAP) 81.0 / 36.8 · fixed 76.4 / 23.2' })]));
+    v.appendChild(cards);
+    INDEX.groups.forEach(function (g) {
+      var sec = h('div', { class: 'section' }, [h('h2', { text: g.title })]);
+      var ds0 = INDEX.episodes[g.episodes[0]].dataset;
+      var hasEth = g.episodes.some(function (id) { return INDEX.episodes[id].dataset === 'eth3d'; });
+      var hasWr = g.episodes.some(function (id) { return INDEX.episodes[id].dataset === 'wriva'; });
+      sec.appendChild(h('p', { text: g.id === 'solver' ? 'grow_model on the same matches as the other controllers; the score is the submitted model (grown, then shared-intrinsics refinement). The 3D view can replay the growth round by round.' :
+        'One episode per scene, pass 13 (the agent may only submit models its own episode built). Primary score per dataset; the delta is against the scripted controller with the same tools.' }));
+      var head = h('tr', {}, [h('th', { text: 'Scene' }), h('th', { class: 'num', text: 'Images' }), h('th', { class: 'num', text: 'Registered' }),
+        h('th', { class: 'num', text: hasEth && !hasWr ? 'AUC@1°' : (hasWr && !hasEth ? 'AUC@10°' : 'Primary') }), h('th', { class: 'num', text: 'vs scripted' }), h('th', { class: 'num', text: 'vs fixed' }),
+        h('th', { class: 'num', text: g.id === 'solver' ? 'Rounds · joins' : 'Turns · tools' }), h('th', { class: 'num', text: 'Wall s' })]);
+      var tb = h('tbody');
+      g.episodes.forEach(function (id) {
+        var ep = INDEX.episodes[id], m = primary(ep.dataset), s = ep.score ? ep.score[m] : null;
+        var sc = ep.refs && ep.refs.scripted ? ep.refs.scripted[m] : null, fx = ep.refs && ep.refs.fixed ? ep.refs.fixed[m] : null;
+        tb.appendChild(h('tr', { class: 'link', onclick: function () { location.hash = id; } }, [
+          h('td', { text: ep.title + (ep.dataset === 'eth3d' ? '' : '') }), h('td', { class: 'num', text: ep.num_images == null ? '–' : ep.num_images }),
+          h('td', { class: 'num', text: ep.score ? ep.score.registered : '–' }), h('td', { class: 'num', text: fmt(s) }),
+          h('td', { class: 'num' }, [delta(s, sc)]), h('td', { class: 'num' }, [delta(s, fx)]),
+          h('td', { class: 'num', text: g.id === 'solver' ? ((ep.grow ? ep.grow.rounds : '–') + ' · ' + (ep.grow ? ep.grow.joins : '–')) : (ep.n_turns + ' · ' + ep.n_tools) }),
+          h('td', { class: 'num', text: ep.wall == null ? '–' : Math.round(ep.wall) })]));
+      });
+      sec.appendChild(h('div', { class: 'tablewrap' }, [h('table', {}, [h('thead', {}, [head]), tb])]));
+      v.appendChild(sec);
+    });
+  }
+
+  /* ---------------- episode ---------------- */
+  function showEpisode(id) {
+    var ep = INDEX.episodes[id]; CURRENT = id; markCurrent(id);
+    var v = $('#view'); v.innerHTML = ''; v.appendChild(h('div', { class: 'empty', text: 'Loading ' + ep.title + '…' }));
+    fetch('data/ep/' + id + '.json').then(function (r) { return r.json(); }).then(function (data) {
+      if (CURRENT !== id) return;
+      renderEpisode(data);
+    }).catch(function (e) { v.innerHTML = ''; v.appendChild(h('div', { class: 'err', text: 'Could not load this episode: ' + e })); });
+  }
+
+  function scoreTable(ep) {
+    var ms = metricsFor(ep.dataset);
+    var head = h('tr', {}, [h('th', { text: 'Model' })].concat(ms.map(function (m) { return h('th', { class: 'num', text: m[1] }); })).concat([h('th', { class: 'num', text: 'Registered' })]));
+    var rows = [['this episode (' + ep.controller + ')', ep.score], ['scripted controller, same tools', ep.refs && ep.refs.scripted], ['best fixed pipeline', ep.refs && ep.refs.fixed]];
+    var tb = h('tbody');
+    rows.forEach(function (r, i) {
+      if (!r[1]) return;
+      tb.appendChild(h('tr', {}, [h('td', { text: r[0], style: i === 0 ? 'font-weight:500' : '' })].concat(ms.map(function (m) { return h('td', { class: 'num', text: fmt(r[1][m[0]]) }); })).concat([h('td', { class: 'num', text: r[1].registered == null ? '–' : r[1].registered + (ep.num_images ? ' / ' + ep.num_images : '') })])));
+    });
+    return h('div', { class: 'scores' }, [h('div', { class: 'tablewrap', style: 'margin:0' }, [h('table', {}, [h('thead', {}, [head]), tb])]),
+      h('div', { class: 'note', text: 'Benchmark layer: scored against ground truth after the episode. ' + (ep.dataset === 'eth3d' ? 'colmap_auc at 1, 3, 5 degrees.' : 'auc_all: all image pairs, an unregistered image counts as wrong.') })]);
+  }
+
+  function renderEpisode(ep) {
+    var v = $('#view'); v.innerHTML = '';
+    v.appendChild(h('div', { class: 'ep-head' }, [h('h2', { text: ep.title }), h('span', { class: 'chip', text: ep.dataset.toUpperCase() }), h('span', { class: 'chip accent', text: ep.controller }), h('span', { class: 'muted mono', style: 'font-size:12px', text: ep.scene })]));
+    var st = [['images', ep.num_images], ['registered', ep.score && ep.score.registered]];
+    if (ep.n_turns) st.push(['VLM turns', ep.n_turns], ['tool calls', ep.n_tools], ['prompt tokens', ep.tokens ? ep.tokens.toLocaleString() : null]);
+    else st.push(['tool calls', ep.n_tools]);
+    if (ep.grow) st.push(['rounds', ep.grow.rounds], ['joins', ep.grow.joins], ['rejected', ep.grow.rejected_total], ['solver s', Math.round(ep.grow.wall)]);
+    st.push(['wall s', ep.wall == null ? null : Math.round(ep.wall)]);
+    v.appendChild(h('div', { class: 'stats' }, st.map(function (p) { return h('span', {}, [p[0] + ' ', h('b', { text: p[1] == null ? '–' : p[1] })]); })));
+    v.appendChild(scoreTable(ep));
+    var work = h('div', { class: 'work' });
+    var trace = h('div', { class: 'trace' });
+    var vcol = h('div', { class: 'viewer-col' });
+    work.appendChild(trace); work.appendChild(vcol); v.appendChild(work);
+    buildViewerPanel(vcol, ep);
+    var turn = 0;
+    ep.steps.forEach(function (s, i) {
+      if (s.kind === 'vlm') { turn += 1; trace.appendChild(vlmStep(s, turn)); }
+      else if (s.kind === 'tool') trace.appendChild(toolStep(s, ep));
+      else trace.appendChild(noteStep(s));
+    });
+  }
+
+  function vlmStep(s, turn) {
+    var u = s.usage || {};
+    var el = h('div', { class: 'step vlm' }, [h('div', { class: 'head' }, [h('span', { class: 'name', text: 'Turn ' + turn + ' · VLM' }),
+      h('span', { class: 'meta', text: (u.prompt_tokens ? u.prompt_tokens.toLocaleString() + ' prompt' : '') + (u.completion_tokens ? ' · ' + u.completion_tokens + ' out' : '') })])]);
+    if (s.reasoning && s.reasoning.trim()) {
+      var d = h('details', { class: 'thinking' }, [h('summary', { text: 'Thinking · ' + s.reasoning.trim().length.toLocaleString() + ' chars' }), h('div', { class: 'body', text: s.reasoning.trim() })]);
+      if (s.reasoning.trim().length < 700) d.open = true;
+      el.appendChild(d);
+    }
+    if (s.content) el.appendChild(h('div', { class: 'says', text: s.content }));
+    if (s.tool_calls && s.tool_calls.length) el.appendChild(h('div', { class: 'calls' }, s.tool_calls.map(function (c) {
+      var args = c.arguments; try { args = JSON.stringify(JSON.parse(c.arguments)); } catch (e) {}
+      return h('span', { class: 'call', text: c.name + ' ' + (args || '') });
+    })));
+    return el;
+  }
+
+  function kvList(obj, limit) {
+    var dl = h('dl', { class: 'kv' }), n = 0;
+    Object.keys(obj || {}).forEach(function (k) {
+      if (n >= (limit || 14)) return;
+      var val = obj[k];
+      if (val != null && typeof val === 'object') {
+        if (Array.isArray(val) && val.length && val.every(function (x) { return typeof x !== 'object'; }) && val.length <= 8) val = val.join(', ');
+        else return;
+      }
+      if (typeof val === 'number') val = Number.isInteger(val) ? val : val.toFixed(3);
+      dl.appendChild(h('dt', { text: k })); dl.appendChild(h('dd', { text: String(val) })); n += 1;
+    });
+    return dl;
+  }
+
+  function toolStep(s, ep) {
+    var el = h('div', { class: 'step tool' });
+    el.appendChild(h('div', { class: 'head' }, [h('span', { class: 'name', text: s.tool }),
+      h('span', { class: 'meta', text: (s.cached ? 'cached' : (s.wall != null ? s.wall + ' s' : '')) + (s.artifact ? ' · ' + s.artifact : '') + (s.source && s.source !== 'agent' ? ' · ' + s.source : '') })]));
+    var ps = Object.keys(s.params || {}).map(function (k) { return k + '=' + JSON.stringify(s.params[k]); }).join('  ');
+    if (ps) el.appendChild(h('div', { class: 'mono muted', style: 'font-size:12px;overflow-wrap:anywhere', text: ps }));
+    if (s.error) el.appendChild(h('div', { class: 'err', text: s.error }));
+    if (s.summary && typeof s.summary === 'object') {
+      el.appendChild(kvList(s.summary));
+      el.appendChild(h('details', { class: 'raw' }, [h('summary', { text: 'full result' }), h('pre', { text: JSON.stringify(s.summary, null, 1) })]));
+    }
+    if (s.images && s.images.length) {
+      el.appendChild(h('div', { class: 'thumbs' }, s.images.map(function (im) {
+        return h('div', {}, [h('button', { type: 'button', onclick: function () { openImage(im); } }, [h('img', { src: im.src, alt: im.name, loading: 'lazy' })]), h('div', { class: 'cap', text: im.name })]);
+      })));
+    }
+    if (s.grow_log) el.appendChild(growthBlock(s.grow_log, s.grow_summary));
+    return el;
+  }
+
+  function noteStep(s) {
+    var d = s.data || {};
+    var el = h('div', { class: 'step note' }, [h('div', { class: 'head' }, [h('span', { class: 'name', text: 'Decision record' }), h('span', { class: 'meta', text: d.source || '' })])]);
+    if (d.submitted) el.appendChild(h('div', {}, ['Submitted ', h('span', { class: 'mono', text: d.submitted })]));
+    el.appendChild(h('details', { class: 'raw' }, [h('summary', { text: 'details' }), h('pre', { text: JSON.stringify(d, null, 1) })]));
+    return el;
+  }
+
+  function tags(list, cls) { return (list || []).map(function (n) { return h('span', { class: 'tag ' + (cls || ''), text: String(n).replace(/\.(jpg|JPG|png|jpeg)$/, '') }); }); }
+  function growthBlock(log, summary) {
+    var box = h('div', { class: 'rounds' });
+    box.appendChild(h('div', { class: 'eyebrow', text: 'Growth, round by round · click a round to show the model at that point' }));
+    var counts = log.map(function (r) { return r.kind === 'seed' ? (r.attempts && r.attempts[r.chosen] ? r.attempts[r.chosen].num_registered : 0) : (r.num_registered || 0); });
+    var total = summary && summary.num_images ? summary.num_images : Math.max.apply(null, counts);
+    box.appendChild(growthChart(counts, total, log));
+    log.forEach(function (r) {
+      var row;
+      if (r.kind === 'seed') {
+        var a = r.attempts[r.chosen];
+        row = h('div', { class: 'round', 'data-round': 0 }, [h('div', { class: 'lab' }, ['Seed', h('small', { text: 'Pi3X · ' + a.group.length + ' images' })]),
+          h('div', { class: 'body' }, ['Centre ', h('span', { class: 'mono', text: a.centre }), ' · kept ' + a.kept.length + ' of ' + a.group.length + ' · ' + a.num_points + ' points · reproj ' + a.reproj + (r.attempts.length > 1 ? ' · attempt ' + (r.chosen + 1) + ' of ' + r.attempts.length : ''),
+            h('div', { class: 'tags' }, tags(a.kept, 'ok'))])]);
+      } else if (r.kind === 'join') {
+        var reg = r.registered || [];
+        row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, ['Join ' + r.round, h('small', { text: 'Pi3X + ' + (r.anchors ? r.anchors.length : 0) + ' anchors' })]),
+          h('div', { class: 'body' }, [r.error ? h('span', { class: 'err', text: r.error + (r.alignment_residual_frac_of_span != null ? ' (residual ' + r.alignment_residual_frac_of_span + ' of span)' : '') }) :
+            ('+' + reg.length + ' of ' + (r.group || []).length + ' · alignment residual ' + r.alignment_residual_frac_of_span + ' of span · ' + (r.num_registered || '') + ' registered'),
+            h('div', { class: 'tags' }, tags(reg, 'ok').concat(tags(Object.keys(r.rejected || {}).map(function (k) { return k + ' ' + (r.rejected[k] == null ? '' : r.rejected[k]); }), 'warn')))])]);
+      } else {
+        var rej = Object.keys(r.rejected || {});
+        row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, ['Round ' + r.round, h('small', { text: 'PnP · ' + r.candidates + ' candidates' })]),
+          h('div', { class: 'body' }, ['+' + (r.registered || []).length + ' registered · ' + rej.length + ' rejected · ' + (r.pnp_failed || []).length + ' PnP failed · ' + r.num_registered + ' in model · ' + r.num_points + ' points · reproj ' + r.reproj,
+            h('div', { class: 'tags' }, tags(r.registered, 'ok').concat(tags(rej.map(function (k) { return k + ' ' + r.rejected[k]; }), 'warn')).concat(tags(r.pnp_failed, '')))])]);
+      }
+      row.addEventListener('click', function () { if (VIEWER) VIEWER.setRound(Number(row.getAttribute('data-round'))); box.querySelectorAll('.round').forEach(function (x) { x.classList.toggle('current', x === row); }); });
+      box.appendChild(row);
+    });
+    return box;
+  }
+  function growthChart(counts, total, log) {
+    var W = 600, H = 72, pad = 26, bw = (W - pad - 6) / counts.length;
+    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H); svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', 'registered images per round');
+    function el(n, a) { var e = document.createElementNS('http://www.w3.org/2000/svg', n); Object.keys(a).forEach(function (k) { e.setAttribute(k, a[k]); }); return e; }
+    var fg = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#888';
+    var acc = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#0b6e99';
+    var warn = getComputedStyle(document.documentElement).getPropertyValue('--warn').trim() || '#b8700a';
+    svg.appendChild(el('line', { x1: pad, y1: H - 14, x2: W - 4, y2: H - 14, stroke: fg, 'stroke-width': 0.6 }));
+    svg.appendChild(el('line', { x1: pad, y1: 4, x2: W - 4, y2: 4, stroke: fg, 'stroke-width': 0.4, 'stroke-dasharray': '2 3' }));
+    var t1 = el('text', { x: pad - 4, y: 8, 'text-anchor': 'end', 'font-size': 9, fill: fg, 'font-family': 'IBM Plex Mono, monospace' }); t1.textContent = total; svg.appendChild(t1);
+    var t0 = el('text', { x: pad - 4, y: H - 11, 'text-anchor': 'end', 'font-size': 9, fill: fg, 'font-family': 'IBM Plex Mono, monospace' }); t0.textContent = '0'; svg.appendChild(t0);
+    counts.forEach(function (c, i) {
+      var hh = Math.max(1, (H - 18) * c / Math.max(1, total)), x = pad + i * bw + 1;
+      svg.appendChild(el('rect', { x: x, y: H - 14 - hh, width: Math.max(2, bw - 2), height: hh, fill: log[i].kind === 'join' ? warn : acc, rx: 1 }));
+      var lab = el('text', { x: x + (bw - 2) / 2, y: H - 3, 'text-anchor': 'middle', 'font-size': 8.5, fill: fg, 'font-family': 'IBM Plex Mono, monospace' }); lab.textContent = log[i].kind === 'seed' ? 'S' : log[i].round; svg.appendChild(lab);
+    });
+    return h('div', { class: 'growth' }, [svg]);
+  }
+
+  function openImage(im) {
+    var d = $('#dlg'); $('#dlgimg').src = im.src; $('#dlgimg').alt = im.name; $('#dlgcap').textContent = im.name + ' · ' + im.w + '×' + im.h;
+    if (typeof d.showModal === 'function') d.showModal(); else d.setAttribute('open', '');
+  }
+  $('#dlgclose').addEventListener('click', function () { $('#dlg').close(); });
+  $('#dlg').addEventListener('click', function (e) { if (e.target === $('#dlg')) $('#dlg').close(); });
+
+  /* ---------------- 3D viewer ---------------- */
+  function Viewer(container) {
+    var self = this;
+    this.el = container;
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    container.appendChild(this.renderer.domElement);
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(42, 4 / 3, 0.005, 200);
+    this.camera.up.set(0, 0, 1);
+    this.target = new THREE.Vector3(0, 0, 0);
+    this.sph = { r: 2.6, theta: 0.9, phi: 1.05 };
+    this.home = { r: 2.6, theta: 0.9, phi: 1.05 };
+    this.points = null; this.cams = null; this.data = null; this.round = Infinity; this.camSize = 0.05; this.pointSize = 2;
+    this.showPoints = true; this.showCams = true;
+    var grid = new THREE.GridHelper(4, 16, 0x334455, 0x223040); grid.rotation.x = Math.PI / 2; grid.material.transparent = true; grid.material.opacity = 0.35; this.grid = grid; this.scene.add(grid);
+    this.applyTheme();
+    this.ro = new ResizeObserver(function () { self.resize(); }); this.ro.observe(container);
+    this.resize(); this.bind();
+    this.mq = window.matchMedia('(prefers-color-scheme: dark)'); this.onTheme = function () { self.applyTheme(); self.render(); }; this.mq.addEventListener('change', this.onTheme);
+  }
+  Viewer.prototype.applyTheme = function () {
+    var bg = getComputedStyle(document.documentElement).getPropertyValue('--viewer-bg').trim() || '#0e141b';
+    this.renderer.setClearColor(new THREE.Color(bg), 1);
+  };
+  Viewer.prototype.resize = function () {
+    var w = this.el.clientWidth, hh = this.el.clientHeight; if (!w || !hh) return;
+    this.renderer.setSize(w, hh, false); this.camera.aspect = w / hh; this.camera.updateProjectionMatrix(); this.render();
+  };
+  Viewer.prototype.render = function () {
+    var s = this.sph;
+    this.camera.position.set(this.target.x + s.r * Math.sin(s.phi) * Math.cos(s.theta), this.target.y + s.r * Math.sin(s.phi) * Math.sin(s.theta), this.target.z + s.r * Math.cos(s.phi));
+    this.camera.lookAt(this.target);
+    this.renderer.render(this.scene, this.camera);
+  };
+  Viewer.prototype.bind = function () {
+    var self = this, el = this.renderer.domElement, drag = null, pinch = null;
+    el.style.touchAction = 'none';
+    el.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    el.addEventListener('pointerdown', function (e) { el.setPointerCapture(e.pointerId); drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey, id: e.pointerId }; });
+    el.addEventListener('pointermove', function (e) {
+      if (!drag || e.pointerId !== drag.id) return;
+      var dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY;
+      if (drag.pan) self.pan(dx, dy); else { self.sph.theta -= dx * 0.008; self.sph.phi = Math.min(Math.PI - 0.05, Math.max(0.05, self.sph.phi - dy * 0.008)); }
+      self.render();
+    });
+    el.addEventListener('pointerup', function () { drag = null; }); el.addEventListener('pointercancel', function () { drag = null; });
+    el.addEventListener('wheel', function (e) { e.preventDefault(); self.sph.r *= Math.exp(e.deltaY * 0.0012); self.sph.r = Math.min(40, Math.max(0.05, self.sph.r)); self.render(); }, { passive: false });
+    el.addEventListener('touchstart', function (e) { if (e.touches.length === 2) pinch = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY); }, { passive: true });
+    el.addEventListener('touchmove', function (e) { if (e.touches.length === 2 && pinch) { var d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY); self.sph.r *= pinch / d; pinch = d; drag = null; self.render(); } }, { passive: true });
+    el.addEventListener('touchend', function () { pinch = null; });
+  };
+  Viewer.prototype.pan = function (dx, dy) {
+    var right = new THREE.Vector3(), up = new THREE.Vector3(); this.camera.matrixWorld.extractBasis(right, up, new THREE.Vector3());
+    var k = this.sph.r * 0.0016; this.target.addScaledVector(right, -dx * k).addScaledVector(up, dy * k);
+  };
+  Viewer.prototype.reset = function () { this.target.set(0, 0, 0); this.sph = Object.assign({}, this.home); this.render(); };
+  Viewer.prototype.clear = function () {
+    if (this.points) { this.scene.remove(this.points); this.points.geometry.dispose(); this.points.material.dispose(); this.points = null; }
+    if (this.cams) { this.scene.remove(this.cams); this.cams.geometry.dispose(); this.cams.material.dispose(); this.cams = null; }
+  };
+  function b64bytes(s) { var bin = atob(s), out = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
+  Viewer.prototype.load = function (obj) {
+    var head = obj.header, n = head.num_points;
+    var pos = new Float32Array(b64bytes(obj.pos).buffer, 0, n * 3), col = b64bytes(obj.col);
+    this.clear(); this.data = head;
+    var g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    var cf = new Float32Array(n * 3); for (var i = 0; i < n * 3; i++) cf[i] = col[i] / 255; g.setAttribute('color', new THREE.BufferAttribute(cf, 3));
+    this.points = new THREE.Points(g, new THREE.PointsMaterial({ size: this.pointSize, sizeAttenuation: false, vertexColors: true })); this.points.visible = this.showPoints; this.scene.add(this.points);
+    this.maxOrder = 0; var hasOrder = false; head.cameras.forEach(function (c) { if (c.order != null) { hasOrder = true; if (c.order > this.maxOrder) this.maxOrder = c.order; } }, this);
+    this.hasOrder = hasOrder; this.round = Infinity;
+    this.buildCams(); this.reset();
+  };
+  function roundColor(order, maxOrder) {
+    if (order == null) return new THREE.Color(0x5ec3f0);
+    if (order === 0) return new THREE.Color(0xf6b73c);
+    var t = maxOrder > 1 ? (order - 1) / (maxOrder - 1) : 0; var c = new THREE.Color(); c.setHSL(0.56 - 0.2 * t, 0.75, 0.62); return c;
+  }
+  Viewer.prototype.buildCams = function () {
+    if (this.cams) { this.scene.remove(this.cams); this.cams.geometry.dispose(); this.cams.material.dispose(); this.cams = null; }
+    if (!this.data) return;
+    var d = this.camSize, verts = [], cols = [], self = this, shown = 0;
+    this.data.cameras.forEach(function (c) {
+      if (c.order != null && c.order > self.round) return;
+      shown += 1;
+      var ax = c.ax, cx = c.c, col = roundColor(c.order, self.maxOrder);
+      function p(u, v) { return [cx[0] + d * (u * c.hw * ax[0] + v * c.hh * ax[3] + ax[6]), cx[1] + d * (u * c.hw * ax[1] + v * c.hh * ax[4] + ax[7]), cx[2] + d * (u * c.hw * ax[2] + v * c.hh * ax[5] + ax[8])]; }
+      var k = [p(-1, -1), p(1, -1), p(1, 1), p(-1, 1)];
+      var segs = [[cx, k[0]], [cx, k[1]], [cx, k[2]], [cx, k[3]], [k[0], k[1]], [k[1], k[2]], [k[2], k[3]], [k[3], k[0]], [k[0], k[1]]];
+      segs.forEach(function (s) { verts.push(s[0][0], s[0][1], s[0][2], s[1][0], s[1][1], s[1][2]); for (var i = 0; i < 2; i++) cols.push(col.r, col.g, col.b); });
+    });
+    var g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+    this.cams = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ vertexColors: true })); this.cams.visible = this.showCams; this.scene.add(this.cams);
+    this.shownCams = shown;
+  };
+  Viewer.prototype.setRound = function (k) { this.round = k; this.buildCams(); this.render(); if (this.onRound) this.onRound(k, this.shownCams); };
+  Viewer.prototype.dispose = function () { this.clear(); this.ro.disconnect(); this.mq.removeEventListener('change', this.onTheme); this.renderer.dispose(); if (this.renderer.domElement.parentNode) this.renderer.domElement.parentNode.removeChild(this.renderer.domElement); };
+
+  function buildViewerPanel(col, ep) {
+    if (VIEWER) { VIEWER.dispose(); VIEWER = null; }
+    var box = h('div', { class: 'viewer' }, [h('div', { class: 'hint', text: 'drag to orbit · wheel to zoom · right-drag or shift-drag to pan' })]);
+    col.appendChild(box);
+    if (!ep.models || !ep.models.length) { col.appendChild(h('div', { class: 'vmeta', text: 'No model was exported for this episode.' })); return; }
+    if (!window.THREE) { col.appendChild(h('div', { class: 'err', text: 'The 3D library did not load; the trace is still available on the left.' })); return; }
+    var sel = h('select', { id: 'modelsel', 'aria-label': 'Model' }, ep.models.map(function (m) { return h('option', { value: m.file, text: m.label + ' · ' + m.num_images + ' images · ' + (m.num_points || 0).toLocaleString() + ' points' }); }));
+    var pts = h('input', { type: 'checkbox', id: 'cb-points', checked: '' }), cms = h('input', { type: 'checkbox', id: 'cb-cams', checked: '' });
+    var size = h('input', { type: 'range', id: 'rg-size', min: '1', max: '5', step: '0.5', value: '2' }), csize = h('input', { type: 'range', id: 'rg-cam', min: '0.01', max: '0.2', step: '0.01', value: '0.05' });
+    var reset = h('button', { type: 'button', text: 'Reset view' });
+    var bar = h('div', { class: 'vbar' }, [sel, h('label', {}, [pts, 'points']), h('label', {}, [cms, 'cameras']), h('label', {}, ['point size ', size]), h('label', {}, ['camera size ', csize]), reset]);
+    col.appendChild(bar);
+    var meta = h('div', { class: 'vmeta' }); col.appendChild(meta);
+    var roundWrap = h('div', { class: 'roundbar' }); col.appendChild(roundWrap);
+    try { VIEWER = new Viewer(box); } catch (e) { col.appendChild(h('div', { class: 'err', text: 'WebGL is not available here: ' + e })); return; }
+    function loadModel(file) {
+      meta.textContent = 'loading ' + file + '…'; roundWrap.innerHTML = '';
+      fetch(file).then(function (r) { return r.json(); }).then(function (obj) {
+        if (!VIEWER) return;
+        VIEWER.load(obj);
+        var d = VIEWER.data;
+        meta.textContent = d.num_cameras + ' cameras · ' + d.num_points_total.toLocaleString() + ' points (' + d.num_points.toLocaleString() + ' shown) · reproj ' + d.reproj + ' px' + (d.sub_models.length > 1 ? ' · ' + d.sub_models.length + ' sub-models, largest shown' : '');
+        if (VIEWER.hasOrder) {
+          var rg = h('input', { type: 'range', id: 'rg-round', min: '0', max: String(VIEWER.maxOrder), step: '1', value: String(VIEWER.maxOrder), 'aria-label': 'growth round' });
+          var lab = h('div', { class: 'vmeta', text: 'all rounds · ' + d.num_cameras + ' cameras' });
+          rg.addEventListener('input', function () { VIEWER.setRound(Number(rg.value)); });
+          VIEWER.onRound = function (k, shown) { rg.value = String(Math.min(k, VIEWER.maxOrder)); lab.textContent = (k >= VIEWER.maxOrder ? 'all rounds' : (k === 0 ? 'seed only' : 'through round ' + k)) + ' · ' + shown + ' cameras'; };
+          roundWrap.appendChild(h('label', { class: 'eyebrow', for: 'rg-round', text: 'Replay the growth' })); roundWrap.appendChild(rg); roundWrap.appendChild(lab);
+          roundWrap.appendChild(h('div', { class: 'legend' }, [h('span', {}, [h('i', { style: 'background:#f6b73c' }), 'seed (Pi3X)']), h('span', {}, [h('i', { style: 'background:#5ec3f0' }), 'early rounds']), h('span', {}, [h('i', { style: 'background:#5ee0b0' }), 'late rounds and joins'])]));
+        }
+      }).catch(function (e) { meta.textContent = 'Could not load the model: ' + e; });
+    }
+    sel.addEventListener('change', function () { loadModel(sel.value); });
+    pts.addEventListener('change', function () { VIEWER.showPoints = pts.checked; if (VIEWER.points) VIEWER.points.visible = pts.checked; VIEWER.render(); });
+    cms.addEventListener('change', function () { VIEWER.showCams = cms.checked; if (VIEWER.cams) VIEWER.cams.visible = cms.checked; VIEWER.render(); });
+    size.addEventListener('input', function () { VIEWER.pointSize = Number(size.value); if (VIEWER.points) { VIEWER.points.material.size = VIEWER.pointSize; VIEWER.points.material.needsUpdate = true; } VIEWER.render(); });
+    csize.addEventListener('input', function () { VIEWER.camSize = Number(csize.value); VIEWER.buildCams(); VIEWER.render(); });
+    reset.addEventListener('click', function () { VIEWER.reset(); });
+    loadModel(ep.models[0].file);
+  }
+
+  /* ---------------- routing ---------------- */
+  function route() {
+    var id = (location.hash || '').replace(/^#/, '');
+    if (id && INDEX.episodes[id]) showEpisode(id); else showOverview();
+    window.scrollTo(0, 0);
+  }
+  fetch('data/index.json').then(function (r) { return r.json(); }).then(function (idx) {
+    INDEX = idx; buildRail(); route(); window.addEventListener('hashchange', route);
+  }).catch(function (e) { $('#view').innerHTML = ''; $('#view').appendChild(h('div', { class: 'err', text: 'Could not load the episode index: ' + e })); });
+})();
+</script>
