@@ -485,10 +485,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
       var ty = el('text', { x: pad - 4, y: Y(gy) + 3, 'text-anchor': 'end', 'font-size': 9, fill: fg, 'font-family': 'IBM Plex Mono, monospace' }); ty.textContent = (Math.round(gy * 100) / 100) + ''; svg.appendChild(ty);
     }
     svg.appendChild(el('rect', { x: pad, y: pad, width: inner, height: inner, fill: 'none', stroke: fg, 'stroke-width': 0.8 }));
-    // GT trajectory in capture order (names sorted), then error segments, GT dots, reconstruction dots
-    var ordered = gts.slice().sort(function (a, b) { return a.name < b.name ? -1 : 1; });
-    var path = ordered.map(function (g, i) { return (i ? 'L' : 'M') + X(g.c[0] * k).toFixed(1) + ' ' + Y(g.c[1] * k).toFixed(1); }).join(' ');
-    svg.appendChild(el('path', { d: path, fill: 'none', stroke: '#8b5cf6', 'stroke-width': 0.8, opacity: 0.45 }));
+    // error segments, GT dots, reconstruction dots (no line between images: the collections are unordered)
     gts.forEach(function (g) {
       var e = est[g.name];
       if (e) svg.appendChild(el('line', { x1: X(e.c[0] * k), y1: Y(e.c[1] * k), x2: X(g.c[0] * k), y2: Y(g.c[1] * k), stroke: '#dc2626', 'stroke-width': 1.1, opacity: 0.85 }));
