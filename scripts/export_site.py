@@ -13,13 +13,60 @@ import numpy as np
 sys.path.insert(0, "/raid/home/gochen/cvpr_2027/agenticsfm/src")
 import pycolmap
 from PIL import Image
-from agenticsfm.tools.frame import Frame, cameras_of
+from agenticsfm.tools.frame import Frame, cameras_of, umeyama
+sys.path.insert(0, "/raid/home/gochen/cvpr_2027/agenticsfm/scripts")
+from analyze_failures import image_errors, rot_angle
+
+
+def robust_similarity(src, dst):
+    """s, R, t with dst ~ s R src + t, re-fitted on the inliers (residual < 3 x median) for three rounds."""
+    inl = np.ones(len(src), bool)
+    s_, R_, t_ = umeyama(src, dst)
+    for _ in range(3):
+        if inl.sum() < 3:
+            break
+        s_, R_, t_ = umeyama(src[inl], dst[inl])
+        res = np.linalg.norm((s_ * (R_ @ src.T)).T + t_ - dst, axis=1)
+        thr = max(3 * np.median(res[inl]), 1e-9)
+        inl = res < thr
+    return s_, R_, t_, inl
+
+
+def gt_alignment(rec, gt):
+    """Per-image errors of a model against GT (benchmark layer) and the GT cameras expressed in the model's frame."""
+    names = [im.name for im in rec.images.values() if im.has_pose and gt.find_image_with_name(im.name) is not None]
+    if len(names) < 3:
+        return None
+    Cm = np.array([rec.find_image_with_name(n).projection_center() for n in names])
+    Cg = np.array([gt.find_image_with_name(n).projection_center() for n in names])
+    s_, R_, t_, inl = robust_similarity(Cm, Cg)
+    gt_all = [im for im in gt.images.values() if im.has_pose]
+    gt_span = float(np.linalg.norm(np.ptp(np.array([im.projection_center() for im in gt_all]), axis=0))) or 1.0
+    rel = image_errors(gt, rec)
+    per = {}
+    for n in names:
+        Rm = rec.find_image_with_name(n).cam_from_world().rotation.matrix()
+        Rg = gt.find_image_with_name(n).cam_from_world().rotation.matrix()
+        c_in_gt = s_ * R_ @ rec.find_image_with_name(n).projection_center() + t_
+        per[n] = {"rot_deg": round(rot_angle(Rm @ R_.T @ Rg.T), 2), "pos_frac": round(float(np.linalg.norm(c_in_gt - gt.find_image_with_name(n).projection_center())) / gt_span, 4),
+                  "rel_deg": round(rel.get(n, float("nan")), 2)}
+    gt_in_model = []
+    for im in gt_all:
+        c = (R_.T @ (im.projection_center() - t_)) / s_
+        Rg = im.cam_from_world().rotation.matrix()
+        gt_in_model.append((im.name, c, Rg @ R_, im))
+    rot = np.array([v["rot_deg"] for v in per.values()])
+    summary = {"aligned_on": int(inl.sum()), "of": len(names), "scale": round(float(s_), 4), "median_rot_deg": round(float(np.median(rot)), 2),
+               "within_3": round(float((rot < 3).mean()), 3), "within_10": round(float((rot < 10).mean()), 3), "over_10": int((rot >= 10).sum()),
+               "gt_images": len(gt_all), "unregistered": len(gt_all) - len(names), "median_pos_frac": round(float(np.median([v["pos_frac"] for v in per.values()])), 4)}
+    return {"per": per, "gt_in_model": gt_in_model, "summary": summary}
 pycolmap.logging.minloglevel = 2
 ROOT = Path(__file__).resolve().parents[1]
 _ap = argparse.ArgumentParser()
 _ap.add_argument("--out", default=str(ROOT / "outputs/site"))
 _ap.add_argument("--runs", nargs="*", default=["agent_v13:wriva", "agent_eth3d_v13:eth3d"], help="agent runs as <run>:<dataset>")
-_ap.add_argument("--solver-runs", nargs="*", default=["incremental_v13", "incremental_v13_mixed", "incremental_v0"])
+_ap.add_argument("--solver-runs", nargs="*", default=["incremental_v13", "incremental_v13_mixed"])
+_ap.add_argument("--include-agent", action="store_true", help="also export the archived tool-selection agent episodes")
 _args = _ap.parse_args()
 SITE = Path(_args.out)
 for _d in ("data/ep", "models", "img"):
@@ -66,11 +113,12 @@ def largest_submodel(model_dir):
     recs.sort(key=lambda r: -r[0].num_reg_images())
     return recs
 
-def export_model(model_dir, out_path, images_dir, order=None):
+def export_model(model_dir, out_path, images_dir, order=None, gt=None):
     recs = largest_submodel(model_dir)
     rec, sub = recs[0]
     cams = cameras_of(rec)
     fr = Frame.build(cams)
+    align = gt_alignment(rec, gt) if gt is not None else None
     pts = list(rec.points3D.values())
     cols = np.array([p.color for p in pts[:500]]) if pts else np.zeros((0, 3))
     if len(pts) and (cols.sum(1) > 0).mean() < 0.05:
@@ -99,17 +147,29 @@ def export_model(model_dir, out_path, images_dir, order=None):
         # camera axes in frame coordinates: rows of R are the camera x, y, z axes expressed in world
         axes = fr.apply_dir(R)  # (3,3): row i = camera axis i in frame coords
         f = cam.mean_focal_length()
-        camera_rows.append({"name": im.name, "c": [round(float(v), 5) for v in c], "ax": [round(float(v), 5) for v in axes.ravel()],
-                            "hw": round(cam.width / (2 * f), 4), "hh": round(cam.height / (2 * f), 4),
-                            "order": (order or {}).get(im.name)})
+        row = {"name": im.name, "c": [round(float(v), 5) for v in c], "ax": [round(float(v), 5) for v in axes.ravel()],
+               "hw": round(cam.width / (2 * f), 4), "hh": round(cam.height / (2 * f), 4), "order": (order or {}).get(im.name)}
+        if align and im.name in align["per"]:
+            row.update(align["per"][im.name])
+        camera_rows.append(row)
+    gt_rows = []
+    if align:
+        reg_names = {r["name"] for r in camera_rows}
+        for name, cg, Rg, gim in align["gt_in_model"]:
+            gcam = gt.cameras[gim.camera_id]
+            fg = gcam.mean_focal_length()
+            gt_rows.append({"name": name, "c": [round(float(v), 5) for v in (fr.apply(cg[None])[0] / fr.span)],
+                            "ax": [round(float(v), 5) for v in fr.apply_dir(Rg).ravel()], "hw": round(gcam.width / (2 * fg), 4), "hh": round(gcam.height / (2 * fg), 4),
+                            "registered": name in reg_names})
     header = json.dumps({"num_points": int(len(X)), "num_cameras": len(camera_rows), "sub_models": [(name, r.num_reg_images()) for r, name in recs],
                          "reproj": round(rec.compute_mean_reprojection_error(), 3) if rec.num_points3D() else None,
-                         "num_points_total": rec.num_points3D(), "cameras": camera_rows}).encode()
+                         "num_points_total": rec.num_points3D(), "cameras": camera_rows, "gt_cameras": gt_rows,
+                         "gt_summary": align["summary"] if align else None}).encode()
     import base64
     Path(out_path).write_text(json.dumps({"header": json.loads(header), "pos": base64.b64encode(X.astype("<f4").tobytes()).decode(),
                                           "col": base64.b64encode(C.astype(np.uint8).tobytes()).decode()}))
     return {"num_images": rec.num_reg_images(), "num_points": rec.num_points3D(), "reproj": round(rec.compute_mean_reprojection_error(), 3) if rec.num_points3D() else None,
-            "num_models": len(recs)}
+            "num_models": len(recs), "gt": align["summary"] if align else None}
 
 def load_trace(run_dir):
     return [json.loads(l) for l in (run_dir / "trace.jsonl").read_text().splitlines() if l.strip()]
@@ -170,8 +230,18 @@ def store_of(run_dir):
     raise RuntimeError("store not found")
 
 index = {"generated": time.strftime("%Y-%m-%d"), "groups": [], "episodes": {}}
-plan = [(f"agent-{ds}", f"Agent, {ds.upper()} ({run})", run, ds, "agent") for run, ds in (r.split(":") for r in _args.runs)]
-plan.append(("solver", "Open solver v0 (Pi3X seed, no COLMAP mapper)", None, None, "incremental"))
+plan = [(f"agent-{ds}", f"Agent, {ds.upper()} ({run})", run, ds, "agent") for run, ds in (r.split(":") for r in _args.runs)] if _args.include_agent else []
+plan.append(("solver", "Open solver (Pi3X seed, verified growth, VLM-arbitrated hard images; no COLMAP mapper)", None, None, "incremental"))
+import pycolmap as _pc
+from agenticsfm.config import load_config as _lc
+from agenticsfm.datasets import load_benchmark as _lb
+_cfg = _lc()
+GT_DIRS = {b.name: b.gt_dir for ds in ("wriva", "eth3d") for b in _lb(_cfg, ds, "all")}
+_gt_cache = {}
+def gt_of(scene):
+    if scene not in GT_DIRS: return None
+    if scene not in _gt_cache: _gt_cache[scene] = _pc.Reconstruction(str(GT_DIRS[scene]))
+    return _gt_cache[scene]
 img_counter = [0]
 for gid, gtitle, run, dataset, controller in plan:
     group = {"id": gid, "title": gtitle, "episodes": []}
@@ -244,17 +314,18 @@ for gid, gtitle, run, dataset, controller in plan:
                             s["grow_log"] = grow_log["log"]; s["grow_summary"] = trim(grow_log["summary"]); break
                 models = []
                 if grow_art:
-                    minfo = export_model(store / "model" / grow_art, SITE / "models" / f"{ep_id}-grown.json", store / "images", order)
+                    minfo = export_model(store / "model" / grow_art, SITE / "models" / f"{ep_id}-grown.json", store / "images", order, gt_of(scene))
                     models.append({"id": f"{ep_id}-grown", "label": "grown (before refinement)", "file": f"models/{ep_id}-grown.json", "has_order": True, **minfo})
                 if (sc_dir / "final").is_dir():
-                    minfo = export_model(sc_dir / "final", SITE / "models" / f"{ep_id}-final.json", store / "images", order)
+                    minfo = export_model(sc_dir / "final", SITE / "models" / f"{ep_id}-final.json", store / "images", order, gt_of(scene))
                     models.append({"id": f"{ep_id}-final", "label": "submitted (after optimize)", "file": f"models/{ep_id}-final.json", "has_order": True, **minfo})
                 r = results.get(scene, {})
                 ep = {"id": ep_id, "group": gid, "title": short_scene(scene) + label + ("" if run == "incremental_v0" else f" [{run.replace('incremental_', '')}]"), "scene": scene, "dataset": dataset,
-                      "controller": "incremental (open solver " + ("v0" if run == "incremental_v0" else "v1.3") + ")", "run": run,
+                      "controller": "open solver " + ("v0" if run == "incremental_v0" else "v1.3"), "run": run,
                       "num_images": r.get("num_images_gt"), "score": score_of(r), "refs": ref_scores(scene, dataset), "wall": r.get("wall"),
                       "n_turns": 0, "n_tools": sum(1 for s in steps if s["kind"] == "tool"), "tokens": 0, "submitted": r.get("submitted"), "models": models,
-                      "grow": trim(grow_log["summary"]) if grow_log else None}
+                      "grow": trim(grow_log["summary"]) if grow_log else None,
+                      "gt_align": next((m["gt"] for m in reversed(models) if m.get("gt")), None)}
                 (SITE / "data/ep" / f"{ep_id}.json").write_text(json.dumps({**ep, "steps": steps}, default=str))
                 index["episodes"][ep_id] = ep; group["episodes"].append(ep_id)
     index["groups"].append(group)
