@@ -4,6 +4,7 @@
     python scripts/run.py --controller scripted --split dev --gpus 4 5 6 7 --workers 4 --evaluate
     python scripts/run.py --controller agent --split dev --gpus 4 5 6 7 --workers 4 --evaluate --max-steps 20
     python scripts/run.py --folder /path/to/images --pipeline colmap_alikedfg
+    python scripts/run.py --controller incremental --scenes <scene> --gpus 4 --evaluate   # the open solver (no COLMAP mapper)
 
 Scenes run in parallel (--workers), each pinned to one of --gpus. Outputs:
 outputs/runs/<run>/<scene>/{trace.jsonl, artifacts.json, final/} and outputs/runs/<run>/results.jsonl.
@@ -44,6 +45,12 @@ def run_scene(args, cfg, run, scene, gpu, gt_dir):
             from agenticsfm.controllers.scripted import run_scripted
 
             row.update(run_scripted(ws, cfg, dataset=None if args.folder else args.dataset))
+        elif args.controller == "incremental":
+            from agenticsfm.controllers.incremental import run_incremental
+
+            row.update(run_incremental(ws, cfg, dataset=None if args.folder else args.dataset, feedforward=args.feedforward,
+                                       threshold=args.threshold, optimize=not args.no_optimize, seed_size=args.seed_size,
+                                       group_size=args.group_size, min_support=args.min_support, join=not args.no_join))
         elif args.controller == "agent":
             from agenticsfm.agent import Agent
 
@@ -70,11 +77,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--run", help="run name (default: <controller>[_<pipeline>])")
-    parser.add_argument("--controller", default="fixed", choices=["fixed", "scripted", "agent"])
+    parser.add_argument("--controller", default="fixed", choices=["fixed", "scripted", "agent", "incremental"])
     parser.add_argument("--pipeline", default="colmap_alikedfg_covis", choices=sorted(PIPELINES))
     parser.add_argument("--max-steps", type=int, default=25, help="agent: tool-call budget (after the prelude)")
     parser.add_argument("--max-minutes", type=float, default=60, help="agent: wall-time budget")
     parser.add_argument("--no-prelude", action="store_true", help="agent: start from scratch instead of the default recipe's candidates")
+    parser.add_argument("--feedforward", help="incremental: feedforward model for seed and joins (default: config feedforward.model)")
+    parser.add_argument("--threshold", type=float, help="incremental: covisibility filter threshold before growing (default: none)")
+    parser.add_argument("--no-optimize", action="store_true", help="incremental: submit the grown model without the shared-intrinsics refinement")
+    parser.add_argument("--seed-size", type=int, default=12)
+    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--min-support", type=float, default=0.5)
+    parser.add_argument("--no-join", action="store_true", help="incremental: no feedforward joins")
     parser.add_argument("--dataset", default="wriva")
     parser.add_argument("--split", default="all", choices=["dev", "test", "all"])
     parser.add_argument("--scenes", nargs="*")

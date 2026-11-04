@@ -80,7 +80,7 @@ def schemas() -> list[dict[str, Any]]:
     return [t.schema() for t in TOOLS.values()]
 
 
-from agenticsfm.tools import analyze, compare_models, examine, filter_edges, graph, inspect, match, merge_models, optimize, partition_graph, rank_models, reconstruct, reconstruct_parts, score_pairs, submit, verify_poses, view_graph  # noqa: E402,F401
+from agenticsfm.tools import analyze, compare_models, examine, filter_edges, graph, grow_model, inspect, match, merge_models, optimize, partition_graph, rank_models, reconstruct, reconstruct_parts, score_pairs, submit, verify_poses, view_graph  # noqa: E402,F401
 
 for _name, _tool in TOOLS.items():  # a decorator placed before a helper would register the wrong function
     assert _tool.run.__name__ == _name, f"tool {_name} is bound to {_tool.run.__name__}"

@@ -156,3 +156,14 @@ COLMAP's loop. PoseAgent ([arXiv 2609.38755](https://arxiv.org/abs/2609.38755)):
 orchestrates pair estimators with a learned verifier, up to +4.2 AUC@5. Solv3R: learns the loop,
 cannot reject. None does verified incremental growth with a feedforward joiner and a
 correspondence finisher.
+
+## Status (2026-11-04, branch `open-solver`)
+
+v0 of the loop exists: `grow_model` (`src/agenticsfm/solver/grow.py`) with a Pi3X seed, PnP growth
+in verified groups, Pi3X joins and bundle adjustment on pycolmap's primitives; the `incremental`
+controller runs it end to end. On WRIVA M07 and BLH0001 and ETH3D terrace and delivery_area it
+matches the scripted controller (COLMAP + threshold sweep + verify + optimize) in a single pass and
+beats every fixed pipeline; the grown models before refinement are at COLMAP's mapper level. Numbers
+and the open items are in the README's 2026-11-04 section. The decision experiment's first branch
+holds: the direction is validated for the small scenes; the LaMAR session and the fold repair
+(edge cutting inside the loop) are next.

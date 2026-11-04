@@ -81,6 +81,7 @@ envs:
   xdg: /home/gochen/miniconda3/envs/xdg/bin/python                 # XDG classifier (torch 2.7)
   gluemap: /home/gochen/miniconda3/envs/gluemap/bin/python         # GLUEMAP (torch 2.4), M3
   vggt: /home/gochen/miniconda3/envs/agentic-dg/bin/python         # VGGT via FastVGGT (torch 2.7); the vggt env has no vggt package
+  pi3x: /home/gochen/miniconda3/envs/gluemap/bin/python            # Pi3X (pi3 package from GLUEMAP's checkout, weights yyfz233/Pi3X in the HF cache)
 
 # External code the backends import.
 repos:
@@ -90,6 +91,10 @@ repos:
   vggt: /home/gochen/agentic_dg/third_party/FastVGGT               # VGGT-1B (facebook/VGGT_tracker_fixed weights in the HF cache)
   vggt_omega: /raid/home/gochen/cvpr_2027/third_party/vggt-omega    # VGGT-Omega (facebookresearch/vggt-omega @ 48b23c8), imported by path
   vggt_omega_checkpoint: /raid/home/gochen/cvpr_2027/third_party/weights/vggt_omega_1b_512.pt
+  pi3: /raid/home/gochen/test/gluemap/thirdparty/pi3                # Pi3 / Pi3X package (GLUEMAP submodule)
+
+feedforward:
+  model: pi3x                       # default feedforward model of the open solver (grow_model): pi3x | vggt | vggt_omega
 
 verify:
   model: vggt                       # feedforward model behind verify_poses: vggt (VGGT-1B) or vggt_omega (needs its code allowed to run)

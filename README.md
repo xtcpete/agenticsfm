@@ -33,7 +33,7 @@ the FlexGlue paper's own pipeline reports 68.9 / 86.8 / 92.3), and the agent doe
 script. All reconstruction runs were stopped on 2026-11-03 evening to change direction: an open
 incremental solver whose loop the agent schedules, with COLMAP's mapper replaced and its bundle
 adjustment kept ([docs/DIRECTION.md](docs/DIRECTION.md)). What the experiments taught:
-[docs/LESSONS.md](docs/LESSONS.md). The dated results log is under [Results so far](#results-so-far).
+[docs/LESSONS.md](docs/LESSONS.md). The first step, the open solver v0 (`grow_model`, Pi3X seed, verified PnP growth, no COLMAP mapper), is on branch `open-solver` and matches the scripted controller on four dev scenes (2026-11-04 section below). The dated results log is under [Results so far](#results-so-far).
 
 ## Design principles
 
@@ -105,6 +105,7 @@ Each tool has one schema and several backends; the agent chooses the backend as 
 | `score_pairs` | one score per edge from a covisibility / doppelganger classifier or a geometric test | XDG, DG++ (MASt3R), FlexGlue covisibility · *have*; rotation cycle consistency, missing-correspondence test · *to write* |
 | `filter_edges` | new database keeping edges above a threshold, or minus a list; keeps the graph connected if asked | – |
 | `reconstruct` | poses from a database (global) or from a chosen image subset (local) | COLMAP incremental, GLOMAP (pycolmap 4.2), GLUEMAP coarse · *have*; VGGT, Pi3, MapAnything, VGGSfM on subsets · *have weights; wrap* |
+| `grow_model` | the open incremental solver: Pi3X seed on the densest cluster, PnP growth in verified groups, Pi3X joins, bundle adjustment; no COLMAP mapper (branch `open-solver`) | pycolmap primitives + Pi3X / VGGT · *have* |
 | `examine` | GT-free diagnostics of a model: registration, components, reprojection error, track length, triangulation angles, per-edge residual between each two-view geometry and the model's relative pose, cycle inconsistency, pairs with many inliers but inconsistent poses; renders | *to write* |
 | `inspect` | thumbnails of chosen images; a pair with its matches; a crop | agentic_dg tools · *have* |
 | `split_model` / `merge_models` / `register_images` / `remove_images` | repair at image and component level; merge via shared images or via a feedforward model on images spanning both components | pycolmap · *to write* |
@@ -138,6 +139,7 @@ Same tools, different policies. Each is a trajectory through the tool space.
 - **Fixed pipelines**: COLMAP, GLOMAP, GLUEMAP, each with no filter / XDG / FlexGlue covisibility.
 - **Scripted**: fixed diagnose-and-repair rules on `examine` output (the table above).
 - **Agent**: Qwen3.8-27B with the tools, a budget, and the playbook in its system prompt.
+- **Incremental** (branch `open-solver`): graph, match, `grow_model`, examine, optimize, submit: the open solver end to end, the mapper comparison against the scripted controller.
 - **Oracle**: best fixed pipeline per scene, using GT. An upper bound on *pipeline selection*.
 
 ## Benchmarks
@@ -752,6 +754,67 @@ The models stay in `outputs/runs/{fixed_wriva_v12,scripted_v12}/<scene>/final`; 
 - a shared-intrinsics test (`optimize`) on CAB_ios.
 
 The VLM server on GPUs 0 to 3 was left running.
+
+### 2026-11-04: open solver v0 (branch `open-solver`): no COLMAP mapper, Pi3X seed, verified growth
+
+The first step of [docs/DIRECTION.md](docs/DIRECTION.md), built and run in one night. `grow_model`
+([solver/grow.py](src/agenticsfm/solver/grow.py)) replaces COLMAP's incremental pipeline with our own
+loop over an explicit state (a pycolmap `Reconstruction`: cameras, poses, tracks) and pycolmap's
+primitives (PnP registration, triangulation, local and global bundle adjustment):
+
+1. **Seed.** Pi3X ([backends/feedforward.py](src/agenticsfm/backends/feedforward.py), `model: pi3x`;
+   the focal length is recovered from its local point map as GLUEMAP does) solves the 12 images
+   around the image with the largest inlier-weighted degree; its poses and focal lengths initialise
+   the reconstruction, tracks are triangulated from the database's matches and bundle adjusted.
+   Pi3X on 12 images: 2 s forward, 13 s model load.
+2. **Grow.** Rounds of 8 PnP registrations (the images with most 2D-3D correspondences), each
+   triangulated and locally refined; then every new image is verified: the inlier-weighted share of
+   its strong pairs' matches (>= 50 inliers, partner registered) within 4 px of the epipolar lines
+   must be >= 0.5, otherwise the image is deregistered and deferred. Global refinement whenever the
+   model has grown by 10%.
+3. **Join.** When PnP finds nothing, Pi3X solves up to 12 unplaced images together with the 6
+   registered images they share most inliers with; the group is aligned to the model on those
+   anchors (similarity on the camera centres; rejected above 5% of the scene span), registered,
+   triangulated, refined and verified like any other addition.
+4. Final global refinement; the model goes through `examine`, `optimize` and `submit` as in the
+   scripted controller ([controllers/incremental.py](src/agenticsfm/controllers/incremental.py);
+   `scripts/run.py --controller incremental`).
+
+Four dev scenes, one run each, unfiltered databases, same matches as every other controller. "Grown"
+is the solver's model before `optimize`; "incremental" is the submitted model. The scripted and
+fixed numbers are pass 12 on the same databases (the scripted controller runs COLMAP with the
+threshold sweep, verify and `optimize`).
+
+| Scene (images) | metric | fixed pipeline | scripted (COLMAP) | **grown** | **incremental (grown + optimize)** |
+|---|---|---|---|---|---|
+| WRIVA M07 (50) | `auc_all` @3 / 10 | 23.2 / 76.4 | 36.8 / 81.0 | 26.5 / 77.8 | **38.8 / 81.7** |
+| WRIVA BLH0001 (39) | `auc_all` @3 / 10 | 18.4 / 49.6 (34 img, filter 0.6) | 21.2 / 49.0 (36 img) | 19.3 / 46.8 (32 img) | **24.6** / 49.5 (32 img) |
+| ETH3D terrace (23) | `colmap_auc` @1 / 3 / 5 | 53.9 / 81.0 / 88.1 | 65.6 / 88.4 / 93.0 | 57.3 / 84.0 / 90.3 | **67.7 / 89.2 / 93.5** |
+| ETH3D delivery_area (44) | `colmap_auc` @1 / 3 / 5 | 58.2 / 84.1 / 90.3 | 76.9 / 91.9 / 95.1 | 58.7 / 83.8 / 89.9 | **77.8 / 92.2 / 95.3** |
+
+- **The mapper replacement costs nothing.** The grown models alone are at the level of COLMAP's
+  mapper on the same database (terrace 57.3 vs 53.9, delivery_area 58.7 vs 58.2 at 1 deg; M07
+  77.8 vs 76.4 at 10 deg), with all images registered in one model on three scenes, and the whole
+  pipeline is at or above the scripted controller on all four, in one pass instead of a threshold
+  sweep over several COLMAP mappings. One seed per scene; the ETH3D margins are within COLMAP's
+  run-to-run noise, so this is parity, not a win.
+- **BLH0001 is still the doppelganger scene.** Unfiltered, the solver registers 32 of 39: 18 PnP
+  failures, 9 verified rejections, one join adding 3 of 10; its `strong_inconsistent_frac` is 0.088
+  (a fold survives), and the result ties the fixed and scripted numbers at 10 deg with fewer images
+  while leading at 3 deg. The verification rule removes images; it does not yet remove the wrong
+  edges that fold the model (the pass 5 lesson), which is the first repair step to add to the loop.
+- **Pi3X vs VGGT as the seed and joiner** (M07, same loop): Pi3X 50 of 50 images, 77.8 at 10 deg,
+  2 verified rejections; VGGT 47 of 50, 66.9, 13 rejections and 3 images left unplaced. Pi3X is the
+  default (`feedforward.model` in the config).
+- **Cost.** M07 237 s (40 s of it Pi3X including two model loads), BLH0001 116 s, terrace 40 s,
+  delivery_area 86 s for the solver; the global refinement after every round is most of it and is
+  the first thing to make cheaper. `optimize` adds 20 to 65 s.
+
+What the loop does not do yet, in the order it will be added: cut edges instead of dropping images
+when a verified rejection points at a fold; the feedforward focal for every image (today only the
+seed and joined images get it; PnP-registered images start from the 1.2 x max(w, h) prior);
+feedforward relative poses as priors in the bundle adjustment; the agent as the scheduler over
+`seed` / `grow_round` / `join` with the per-round log as its evidence.
 
 ## Plan
 
