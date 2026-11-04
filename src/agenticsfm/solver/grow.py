@@ -1,4 +1,4 @@
-"""Open incremental solver, v0 (2026-11-03).
+"""Open incremental solver, v1 (2026-11-04).
 
 The state is a pycolmap ``Reconstruction`` (cameras, poses, tracks; explicit and exportable) driven
 through pycolmap's ``IncrementalMapper`` primitives (PnP registration, triangulation, local and
@@ -11,11 +11,19 @@ global bundle adjustment) under OUR loop, instead of COLMAP's incremental pipeli
    triangulated and locally refined; every new image is then verified against the database's
    matches (inlier-weighted share of its strong pairs' matches that agree with the poses) and
    deregistered when it fails; global refinement when the model has grown by 10%.
-3. ``join``: when PnP finds nothing, the feedforward model solves a group of unplaced images
-   together with anchor images of the model; the group is aligned to the model on the anchors,
-   registered, triangulated, verified like any other addition.
+3. ``place_hard``: images PnP cannot place, or keeps placing against their matches, are the hard
+   ones: their matches are mostly lookalike (doppelganger) pairs, so match support cannot judge
+   them. The feedforward model places them twice, with two different anchor sets (a few match
+   neighbours plus cameras sampled from all over the model, so the model's layout is in view);
+   the two placements must agree, or the VLM advisor decides which neighbourhood the image really
+   shows. Accepted placements are protected from being dragged by their wrong matches in bundle
+   adjustment (drift guard).
+4. ``multi-model``: images left over that are connected among themselves are reconstructed as a
+   further model; the advisor judges whether it is the same site (then the solver absorbs it as
+   hard images) or a different scene (then it is returned as a separate model).
 
-Nothing here reads ground truth. Every decision is logged per round for the trace / the agent.
+Nothing here reads ground truth. Every decision, including every VLM question and answer, is in
+the per-round log for the trace, the episode page and later audits.
 """
 
 from __future__ import annotations
@@ -23,19 +31,32 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from agenticsfm.backends import run_backend
-from agenticsfm.tools.examine import sampson
-from agenticsfm.tools.frame import umeyama
+from agenticsfm.solver.render_compare import RenderCompare
 from agenticsfm.workspace import Workspace
+
+
+def sampson(E, x0, x1):   # imported lazily: agenticsfm.tools imports the grow_model tool, which imports this module
+    from agenticsfm.tools.examine import sampson as _sampson
+    return _sampson(E, x0, x1)
+
+
+def umeyama(src, dst):
+    from agenticsfm.tools.frame import umeyama as _umeyama
+    return _umeyama(src, dst)
 
 FEEDFORWARD_ENV = {"vggt": "vggt", "vggt_omega": "vggt", "pi3x": "pi3x"}
 MAX_IMAGE_ID = 2147483647  # COLMAP pair id = image_id1 * MAX_IMAGE_ID + image_id2
+
+
+def rot_angle(R: np.ndarray) -> float:
+    return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
 
 
 @dataclass
@@ -49,26 +70,41 @@ class GrowConfig:
     epipolar_px: float = 4.0
     max_tries: int = 2           # PnP attempts per image in our loop (COLMAP's own cap is 3)
     global_ba_growth: float = 1.1
-    join: bool = True
-    join_group: int = 12
-    join_anchors: int = 6
-    join_tries: int = 1
-    max_alignment_frac: float = 0.05   # anchors' alignment residual over the scene span
+    hard: bool = True            # feedforward placement of hard images with two anchor sets
+    hard_batch: int = 6
+    hard_anchors_match: int = 4
+    hard_anchors_diverse: int = 8
+    hard_min_link: int = 50          # a hard candidate needs this many inliers to registered images in all (>= 2 pairs), or one pair this strong
+    hard_agree_deg: float = 5.0      # the two placements must agree in rotation (GT-correct ones agree within 3 deg, wrong ones within 8 to 10) ...
+    hard_agree_frac: float = 0.05    # ... and in position (fraction of the scene span)
+    max_alignment_frac: float = 0.08  # anchors' alignment residual over the scene span, after trimming
+    drift_deg: float = 10.0          # a hard placement that bundle adjustment moves more than this is held at its placement
+    vlm: str = "decide"              # off | log (ask, never act) | decide (arbitrate ambiguous placements, judge scenes)
+    audit: bool = True               # render-and-compare audit of every camera after the final refinement (logged; drops only with audit_drop)
+    audit_drop: bool = False         # until the verdict is calibrated against GT (docs/EXAMINE.md), the audit reports and does not act
+    audit_max_images: int = 100
+    veto_score: float = -1.0         # render veto of a placement (score below this AND margin below veto_margin); disabled: the calibration
+    veto_margin: float = -0.05       # (docs/EXAMINE.md) shows the score is a precision test, and feedforward placements are coarse before BA
+    multi_model: bool = True
+    min_component: int = 4
+    max_models: int = 4
     max_rounds: int = 2000
     num_threads: int = 8
 
 
 class Solver:
     def __init__(self, ws: Workspace, cfg: dict[str, Any], db_id: str, gc: GrowConfig, workdir: Path,
-                 gpu: int | None = None, verbose: bool = True):
+                 gpu: int | None = None, verbose: bool = True, image_subset: list[str] | None = None, advisor=None, tag: str = "main"):
         import pycolmap
 
-        self.ws, self.cfg, self.gc, self.workdir, self.gpu, self.verbose = ws, cfg, gc, workdir, gpu, verbose
+        self.ws, self.cfg, self.gc, self.workdir, self.gpu, self.verbose, self.tag = ws, cfg, gc, workdir, gpu, verbose, tag
         self.db_id = db_id
         self.db_path = ws.abspath(db_id)
         self.database = pycolmap.Database.open(str(self.db_path))
         co = pycolmap.DatabaseCacheOptions()
         co.min_num_matches = 15
+        if image_subset:
+            co.image_names = set(image_subset)
         self.cache = pycolmap.DatabaseCache.create(self.database, co)
         self.rec = pycolmap.Reconstruction()
         self.mapper = pycolmap.IncrementalMapper(self.cache)
@@ -91,8 +127,10 @@ class Solver:
             self.W.setdefault(j, {})[i] = n
         self.kps: dict[int, np.ndarray] = {}
         self.tries = {i: 0 for i in self.names}
-        self.join_tried = {i: 0 for i in self.names}
+        self.hard_tried = {i: 0 for i in self.names}
         self.status = {i: "unplaced" for i in self.names}
+        self.held: set[int] = set()
+        self.hard_placed: set[int] = set()
         self.mo = pycolmap.IncrementalMapperOptions()
         self.mo.num_threads = gc.num_threads
         self.tri = pycolmap.IncrementalTriangulatorOptions()
@@ -102,11 +140,20 @@ class Solver:
         self.ff_calls = 0
         self.ff_seconds = 0.0
         self.log: list[dict[str, Any]] = []
+        self.rac = RenderCompare(self.rec, ws.images_dir)
+        if advisor is not None:
+            self.advisor = advisor
+            self.advisor.log = self.log
+        elif gc.vlm != "off":
+            from agenticsfm.solver.advisor import Advisor
+            self.advisor = Advisor(cfg, ws.images_dir, self.log, mode=gc.vlm)
+        else:
+            self.advisor = None
 
     # -- helpers -----------------------------------------------------------------------------
     def say(self, msg: str) -> None:
         if self.verbose:
-            print(f"[{self.ws.scene.name}] grow: {msg}", flush=True)
+            print(f"[{self.ws.scene.name}] grow{'' if self.tag == 'main' else '/' + self.tag}: {msg}", flush=True)
 
     def kp(self, i: int) -> np.ndarray:
         if i not in self.kps:
@@ -115,6 +162,13 @@ class Solver:
 
     def reg(self) -> set[int]:
         return set(self.rec.reg_image_ids())
+
+    def centres(self) -> dict[int, np.ndarray]:
+        return {i: self.rec.images[i].projection_center() for i in self.reg()}
+
+    def span(self) -> float:
+        C = np.array(list(self.centres().values()))
+        return float(np.linalg.norm(np.ptp(C, axis=0))) if len(C) > 1 else 1.0
 
     def pair_consistency(self, i: int, j: int) -> float:
         """Share of the pair's verified matches within ``epipolar_px`` of the epipolar lines under the current poses."""
@@ -154,17 +208,25 @@ class Solver:
             out[i] = num / den if den > 0 else float("nan")
         return out
 
-    def feedforward(self, names: list[str], tag: str) -> dict[str, dict[str, Any]]:
-        """Run the feedforward model on one group. Returns per image: cam_from_world (3x4, frame of the group's
-        first camera, arbitrary scale) and the focal length / principal point in original pixels."""
+    def ff_groups(self, groups: list[list[str]], tag: str, save_depth: bool = False) -> list[dict[str, Any]]:
+        """One backend invocation (one model load) for several groups; registers dense depth with render-and-compare."""
         model = self.gc.feedforward
         t0 = time.time()
         res = run_backend(self.cfg, "feedforward", FEEDFORWARD_ENV[model],
-                          {"images_dir": str(self.ws.images_dir), "groups": [names], "model": model, "points_per_image": 0},
+                          {"images_dir": str(self.ws.images_dir), "groups": groups, "model": model, "points_per_image": 0, "save_depth": save_depth},
                           self.workdir / f"ff_{tag}", gpu=self.gpu)
         self.ff_calls += 1
         self.ff_seconds += time.time() - t0
-        g = res["groups"][0]
+        if save_depth:
+            for g in res["groups"]:
+                if g.get("depth_path"):
+                    self.rac.add_depth(g["depth_path"])
+        return res["groups"]
+
+    def feedforward(self, names: list[str], tag: str, save_depth: bool = False) -> dict[str, dict[str, Any]]:
+        """Run the feedforward model on one group. Returns per image: cam_from_world (3x4, frame of the group's
+        first camera, arbitrary scale) and the focal length / principal point in original pixels."""
+        g = self.ff_groups([names], tag, save_depth)[0]
         out = {}
         for name, E, K, tr in zip(g["names"], g["extrinsics"], g["intrinsics"], g["transforms"]):
             sx, sy, ox, oy = tr
@@ -187,6 +249,72 @@ class Solver:
                 p[0] = f
             cam.params = p
 
+    def pose_of(self, i: int) -> tuple[np.ndarray, np.ndarray]:
+        cfw = self.rec.images[i].cam_from_world()
+        return cfw.rotation.matrix(), cfw.translation
+
+    def refine_pose_2d3d(self, i: int, R: np.ndarray, t: np.ndarray, schedule: tuple[float, ...] | None = None) -> dict[str, Any]:
+        """Coarse-to-fine: refine on the correspondences within the first threshold, then re-select within the next.
+        The default schedule is relative to the image width (3%, 1.5%, 0.75%, 0.25%): a coarse feedforward placement is
+        degrees off, which is a hundred pixels on a large image."""
+        out: dict[str, Any] = {}
+        if schedule is None:
+            w = self.rec.cameras[self.rec.images[i].camera_id].width
+            schedule = tuple(max(12.0, w * f) for f in (0.03, 0.015, 0.0075, 0.0025))
+        for px in schedule:
+            r = self._refine_pose_2d3d(i, R, t, px)
+            R, t = r["R"], r["t"]
+            out = {**r, "schedule": list(schedule)}
+            if r.get("inliers", 0) < 15:
+                break
+        return out
+
+    def _refine_pose_2d3d(self, i: int, R: np.ndarray, t: np.ndarray, max_px: float = 12.0) -> dict[str, Any]:
+        """Refine a placement from the 2D-3D correspondences that agree with it (reprojection under the given pose below
+        ``max_px``): the lookalike correspondences project elsewhere and are left out. Returns the refined pose and counts."""
+        import pycolmap
+
+        reg = self.reg()
+        kp_i = self.kp(i)
+        pts2d, pts3d = [], []
+        for j, n in self.W.get(i, {}).items():
+            if j not in reg:
+                continue
+            a, b = (i, j) if i < j else (j, i)
+            m = self.pairs[(a, b)]
+            idx_i, idx_j = (m[:, 0], m[:, 1]) if i < j else (m[:, 1], m[:, 0])
+            p2s = self.rec.images[j].points2D
+            for ii, jj in zip(idx_i, idx_j):
+                p2 = p2s[int(jj)]
+                if p2.has_point3D():
+                    pts2d.append(kp_i[int(ii)])
+                    pts3d.append(self.rec.points3D[p2.point3D_id].xyz)
+        out: dict[str, Any] = {"num_2d3d": len(pts3d)}
+        if len(pts3d) < 15:
+            return {**out, "R": R, "t": t, "inliers": 0}
+        pts2d, pts3d = np.array(pts2d, dtype=np.float64), np.array(pts3d, dtype=np.float64)
+        cam = self.rec.cameras[self.rec.images[i].camera_id]
+        Xc = pts3d @ R.T + t
+        front = Xc[:, 2] > 1e-6
+        proj = np.full((len(pts3d), 2), np.inf)
+        if front.any():
+            proj[front] = np.asarray(cam.img_from_cam(Xc[front], False))
+        err = np.linalg.norm(proj - pts2d, axis=1)
+        inl = err < max_px
+        out.update({"inliers": int(inl.sum()), "inlier_frac": round(float(inl.mean()), 3)})
+        if inl.sum() < 15:
+            return {**out, "R": R, "t": t}
+        opts = pycolmap.AbsolutePoseRefinementOptions()
+        opts.refine_focal_length = False
+        opts.refine_extra_params = False
+        res = pycolmap.refine_absolute_pose(pycolmap.Rigid3d(pycolmap.Rotation3d(R), t), pts2d, pts3d, inl, cam, opts)
+        if not res:
+            return {**out, "R": R, "t": t}
+        pose = res["cam_from_world"] if isinstance(res, dict) else res
+        R2, t2 = pose.rotation.matrix(), pose.translation
+        out.update({"refined_deg": round(rot_angle(R2 @ R.T), 2), "refined_move_frac": round(float(np.linalg.norm((-R2.T @ t2) - (-R.T @ t))) / max(self.span(), 1e-9), 4)})
+        return {**out, "R": R2, "t": t2}
+
     def attach_mapper(self) -> None:
         """A fresh mapper on the current reconstruction: its bookkeeping (registration events, observation
         statistics) is rebuilt from the registered frames, which is how externally posed images enter the loop."""
@@ -202,14 +330,73 @@ class Solver:
         return {"num_registered": self.rec.num_reg_images(), "num_points": self.rec.num_points3D(),
                 "reproj": round(self.rec.compute_mean_reprojection_error(), 3) if self.rec.num_points3D() else None}
 
+    def fps(self, pool: list[int], k: int, far_from: list[int]) -> list[int]:
+        """Farthest-point sample of registered cameras, started far from ``far_from``."""
+        C = self.centres()
+        pool = [i for i in pool if i in C]
+        if not pool or k <= 0:
+            return []
+        ref = np.array([C[i] for i in far_from if i in C]) if any(i in C for i in far_from) else np.mean([C[i] for i in pool], axis=0, keepdims=True)
+        chosen = [max(pool, key=lambda i: float(np.min(np.linalg.norm(ref - C[i], axis=1))))]
+        while len(chosen) < min(k, len(pool)):
+            chosen.append(max((i for i in pool if i not in chosen), key=lambda i: min(float(np.linalg.norm(C[i] - C[c])) for c in chosen)))
+        return chosen
+
+    def nearest_registered(self, c: np.ndarray, d: np.ndarray, k: int = 3, exclude: set[int] = frozenset()) -> list[int]:
+        """Registered images closest to a camera position, favouring similar viewing directions."""
+        span = self.span()
+        rows = []
+        for j in self.reg():
+            if j in exclude:
+                continue
+            im = self.rec.images[j]
+            dist = float(np.linalg.norm(im.projection_center() - c)) / max(span, 1e-9)
+            ang = 1 - float(np.dot(im.viewing_direction(), d))
+            rows.append((dist + 0.5 * ang, j))
+        return [j for _, j in sorted(rows)[:k]]
+
+    def align(self, ff: dict[str, dict[str, Any]], anchors: list[int]) -> dict[str, Any] | None:
+        """Similarity from the feedforward frame to the model on the anchors' camera centres, trimming up to two
+        anchors that do not fit. None when the anchors do not align (the feedforward layout disagrees with the model)."""
+        centre = lambda E: -E[:, :3].T @ E[:, 3]  # noqa: E731
+        use = [a for a in anchors if self.names[a] in ff and a in self.reg()]
+        span = self.span()
+        dropped = []
+        while len(use) >= 3:
+            src = np.array([centre(ff[self.names[a]]["E"]) for a in use])
+            dst = np.array([self.rec.images[a].projection_center() for a in use])
+            s, R, t = umeyama(src, dst)
+            resid = np.linalg.norm((s * (R @ src.T)).T + t - dst, axis=1) / max(span, 1e-9)
+            if resid.mean() <= self.gc.max_alignment_frac or len(dropped) >= 2 or len(use) <= 3:
+                break
+            worst = int(np.argmax(resid))
+            dropped.append(self.names[use[worst]])
+            use.pop(worst)
+        if len(use) < 3:
+            return None
+        if resid.mean() > self.gc.max_alignment_frac:
+            return {"ok": False, "resid": float(resid.mean()), "used": len(use), "dropped": dropped}
+        return {"ok": True, "s": s, "R": R, "t": t, "resid": float(resid.mean()), "used": len(use), "dropped": dropped}
+
+    @staticmethod
+    def transform_pose(E: np.ndarray, al: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        Rn = E[:, :3] @ al["R"].T
+        tn = al["s"] * E[:, 3] - Rn @ al["t"]
+        return Rn, tn
+
     # -- steps -------------------------------------------------------------------------------
     def seed(self) -> dict[str, Any]:
         deg = {i: sum(v.values()) for i, v in self.W.items()}
         order = sorted(deg, key=deg.get, reverse=True)
+        if not order:
+            raise RuntimeError("no verified pairs among these images")
         attempts = []
+        size = min(self.gc.seed_size, len(self.names))
         for k, centre in enumerate(order[: self.gc.seed_attempts]):
-            nb = sorted(self.W[centre], key=self.W[centre].get, reverse=True)[: self.gc.seed_size - 1]
+            nb = sorted(self.W[centre], key=self.W[centre].get, reverse=True)[: size - 1]
             group = [centre] + nb
+            if len(group) < 3:
+                continue
             names = [self.names[i] for i in group]
             ff = self.feedforward(names, f"seed{k}")
             for i in group:
@@ -245,9 +432,23 @@ class Solver:
         raise RuntimeError(f"no seed cluster held together: {json.dumps(attempts, default=str)[:800]}")
 
     def global_refine(self, final: bool = False) -> None:
+        held = {i: self.pose_of(i) for i in self.held if i in self.reg()}
         self.mapper.iterative_global_refinement(5 if final else 3, 0.0005, self.mo, self.ba, self.tri, True)
         self.mapper.filter_frames(self.mo)
         self.last_global = self.rec.num_reg_images()
+        self.rac.invalidate()
+        # normalisation moved the whole model: re-express held poses in the new frame via a registered reference
+        if held:
+            self.restore_held(held)
+
+    def restore_held(self, before: dict[int, tuple[np.ndarray, np.ndarray]]) -> None:
+        """Held images keep their placement relative to the rest of the model: after a refinement that may have
+        moved them (and re-normalised the scene), put them back using the similarity between old and new frames
+        of the free images."""
+        free = [j for j in self.reg() if j not in self.held]
+        if len(free) < 3 or not before:
+            return
+        return  # v1: the drift guard removes a held image's observations, so BA has nothing to move it with; normalisation is a similarity applied to all frames alike
 
     def grow_round(self, k: int) -> dict[str, Any] | None:
         cand = [i for i in self.mapper.find_next_images(self.mo, False) if self.tries[i] < self.gc.max_tries]
@@ -283,89 +484,363 @@ class Solver:
                  f"{self.rec.num_reg_images()}/{len(self.names)} registered, {row['num_points']} pts, reproj {row['reproj']}")
         return row
 
-    def join(self, k: int) -> dict[str, Any] | None:
-        """Feedforward placement of a group the PnP path cannot reach, aligned to the model on anchor images."""
+    def pose_neighbours(self, R: np.ndarray, t: np.ndarray, k: int = 4, exclude: set[int] = frozenset()) -> list[int]:
+        return self.nearest_registered(-R.T @ t, R[2], k, exclude)
+
+    def judge_pose(self, i: int, R: np.ndarray, t: np.ndarray, tag: str, figure: bool = False) -> dict[str, Any]:
+        """Render-and-compare verdict of a candidate pose; the three-panel figure for the advisor when asked."""
+        import pycolmap
+
+        n = self.names[i]
+        P = pycolmap.Rigid3d(pycolmap.Rotation3d(R), t)
+        nbs = [self.names[j] for j in self.pose_neighbours(R, t, 4, {i})]
+        j = self.rac.judge(n, P, nbs)
+        if figure and self.rac.usable(nbs):
+            j["figure"] = self.rac.figure(n, P, nbs, self.workdir / "rac" / f"{Path(n).stem}_{tag}.jpg")
+        return j
+
+    def ensure_depth(self, wants: list[tuple[int, np.ndarray, np.ndarray]], tag: str) -> None:
+        """Dense depth for the registered neighbours of the given candidate poses, in one backend call."""
+        groups, seen = [], set()
+        for i, R, t in wants:
+            nbs = self.pose_neighbours(R, t, 4, {i})
+            need = [j for j in nbs if self.names[j] not in self.rac.depth]
+            if need:
+                g = tuple([self.names[i]] + [self.names[j] for j in nbs])
+                if g not in seen:
+                    seen.add(g)
+                    groups.append(list(g))
+        if groups:
+            self.ff_groups(groups, tag, save_depth=True)
+
+    def place_hard(self, k: int, candidates: list[int] | None = None) -> dict[str, Any] | None:
+        """Feedforward placement of hard images with two anchor sets, pose-only refinement on the correspondences that
+        agree with each placement, and acceptance by render-and-compare; the advisor arbitrates on the figures."""
         reg = self.reg()
-        link = {i: sum(n for j, n in self.W.get(i, {}).items() if j in reg) for i in self.names if i not in reg}
-        cand = [i for i in sorted(link, key=link.get, reverse=True) if link[i] > 0 and self.join_tried[i] < self.gc.join_tries]
-        if not cand:
+        if candidates is None:
+            link, strongest, npairs = {}, {}, {}
+            for i in self.names:
+                if i in reg:
+                    continue
+                ns = [n for j, n in self.W.get(i, {}).items() if j in reg]
+                link[i], strongest[i], npairs[i] = sum(ns), max(ns, default=0), len(ns)
+            candidates = [i for i in sorted(link, key=link.get, reverse=True) if self.hard_tried[i] < 1
+                          and ((link[i] >= self.gc.hard_min_link and npairs[i] >= 2) or strongest[i] >= self.gc.hard_min_link)]
+        candidates = [i for i in candidates if i not in reg]
+        if not candidates or len(reg) < 3:
             return None
-        group = cand[: self.gc.join_group]
-        anchor_w: dict[int, int] = {}
-        for i in group:
+        batch = candidates[: self.gc.hard_batch]
+        for i in batch:
+            self.hard_tried[i] += 1
+        match_w: dict[int, int] = {}
+        for i in batch:
             for j, n in self.W.get(i, {}).items():
                 if j in reg:
-                    anchor_w[j] = anchor_w.get(j, 0) + n
-        anchors = sorted(anchor_w, key=anchor_w.get, reverse=True)[: self.gc.join_anchors]
-        for i in group:
-            self.join_tried[i] += 1
-        if len(anchors) < 3:
-            return {"round": k, "kind": "join", "error": f"only {len(anchors)} anchors", "group": [self.names[i] for i in group]}
-        names = [self.names[i] for i in anchors + group]
-        ff = self.feedforward(names, f"join{k}")
-        centre = lambda E: -E[:, :3].T @ E[:, 3]  # noqa: E731
-        src = np.array([centre(ff[self.names[j]]["E"]) for j in anchors])
-        dst = np.array([self.rec.images[j].projection_center() for j in anchors])
-        s, R, t = umeyama(src, dst)
-        resid = np.linalg.norm((s * (R @ src.T)).T + t - dst, axis=1)
-        all_c = np.array([self.rec.images[j].projection_center() for j in reg])
-        span = float(np.linalg.norm(np.ptp(all_c, axis=0))) if len(all_c) > 1 else 1.0
-        frac = float(resid.mean() / max(span, 1e-9))
-        row: dict[str, Any] = {"round": k, "kind": "join", "anchors": [self.names[j] for j in anchors], "group": [self.names[i] for i in group],
-                               "alignment_residual_frac_of_span": round(frac, 4), "scale": round(float(s), 4)}
-        if frac > self.gc.max_alignment_frac:
-            row["error"] = "anchors do not align with the model"
-            self.say(f"join {k}: alignment residual {frac:.3f} of span, skipped")
-            return row
-        for i in group:
-            E = ff[self.names[i]]["E"]
-            Rn = E[:, :3] @ R.T
-            tn = s * E[:, 3] - Rn @ t
-            self.set_pose(i, np.c_[Rn, tn], ff[self.names[i]]["f"])
-            self.rec.register_frame(self.rec.images[i].frame_id)
-        self.attach_mapper()
-        for i in group:
-            self.mapper.triangulate_image(self.tri, i)
-        for i in group:
-            self.mapper.iterative_local_refinement(2, 0.001, self.mo, self.ba, self.tri, i)
-        sup = self.support(group)
-        kept, rejected = [], []
-        for i in group:
-            s_i = sup.get(i, float("nan"))
-            if i not in self.reg():
-                rejected.append(i)
-            elif s_i == s_i and s_i < self.gc.min_support:
-                self.deregister(i)
-                rejected.append(i)
-                self.status[i] = "deferred"
+                    match_w[j] = match_w.get(j, 0) + n
+        ms = sorted(match_w, key=match_w.get, reverse=True)
+        good = [j for j in reg if self.rec.images[j].num_points3D >= 50] or list(reg)
+        nm, nd = self.gc.hard_anchors_match, self.gc.hard_anchors_diverse
+        mA = ms[:nm]
+        dA = self.fps([j for j in good if j not in mA], nd, mA or list(reg)[:1])
+        mB = ms[nm: 2 * nm] or ms[:nm]
+        dB = self.fps([j for j in good if j not in set(mB) | set(dA)], nd, list(dict.fromkeys(mB + dA)))
+        A = list(dict.fromkeys(mA + dA))[: nm + nd]
+        B = list(dict.fromkeys(mB + dB))[: nm + nd]
+        names = lambda L: [self.names[i] for i in L]  # noqa: E731
+        if len(A) < 3 or len(B) < 3:
+            return {"round": k, "kind": "hard", "error": "too few anchors", "batch": names(batch)}
+        ffA, ffB = self.ff_groups([names(A) + names(batch), names(B) + names(batch)], f"hard{k}")
+        ffA = {n: {"E": np.asarray(E, dtype=np.float64), "f": 0.5 * (K[0][0] / tr[0] + K[1][1] / tr[1])} for n, E, K, tr in zip(ffA["names"], ffA["extrinsics"], ffA["intrinsics"], ffA["transforms"])}
+        ffB = {n: {"E": np.asarray(E, dtype=np.float64), "f": 0.5 * (K[0][0] / tr[0] + K[1][1] / tr[1])} for n, E, K, tr in zip(ffB["names"], ffB["extrinsics"], ffB["intrinsics"], ffB["transforms"])}
+        alA, alB = self.align(ffA, A), self.align(ffB, B)
+        span = self.span()
+        # candidate poses, refined on the correspondences that agree with them
+        poses: dict[int, dict[str, tuple[np.ndarray, np.ndarray, float, dict]]] = {}
+        for i in batch:
+            n = self.names[i]
+            poses[i] = {}
+            for tag, ff, al in (("A", ffA, alA), ("B", ffB, alB)):
+                if al and al.get("ok"):
+                    Rn, tn = self.transform_pose(ff[n]["E"], al)
+                    r = self.refine_pose_2d3d(i, Rn, tn)
+                    poses[i][tag] = (r["R"], r["t"], ff[n]["f"], {kk: v for kk, v in r.items() if kk not in ("R", "t")})
+        self.ensure_depth([(i, R, t) for i in batch for (R, t, _, _) in poses[i].values()], f"hard{k}depth")
+        per: dict[str, dict[str, Any]] = {}
+        accepted: dict[int, tuple[np.ndarray, np.ndarray, float, str]] = {}
+        decide = self.gc.vlm == "decide" and self.advisor is not None and self.advisor.enabled
+        askable = self.advisor is not None and self.advisor.enabled
+        for i in batch:
+            n = self.names[i]
+            ps = poses[i]
+            info: dict[str, Any] = {"placements": {tag: v[3] for tag, v in ps.items()}}
+            judges = {tag: self.judge_pose(i, v[0], v[1], tag) for tag, v in ps.items()}
+            info["render"] = {tag: {kk: j.get(kk) for kk in ("score", "margin", "verdict", "overlap")} for tag, j in judges.items()}
+            choice, why = None, ""
+            strong_bad = lambda tg: (judges[tg]["score"] is not None and judges[tg]["score"] < self.gc.veto_score and (judges[tg]["margin"] or 0) < self.gc.veto_margin)  # noqa: E731
+            if len(ps) == 2:
+                ang = rot_angle(ps["A"][0] @ ps["B"][0].T)
+                dist = float(np.linalg.norm((-ps["A"][0].T @ ps["A"][1]) - (-ps["B"][0].T @ ps["B"][1]))) / max(span, 1e-9)
+                info.update({"agree_deg": round(ang, 1), "agree_frac": round(dist, 4)})
+                agree = ang < self.gc.hard_agree_deg and dist < self.gc.hard_agree_frac
+                cons = [tag for tag in ("A", "B") if judges[tag]["verdict"] == "consistent"]
+                if agree:
+                    best = max(("A", "B"), key=lambda tg: (judges[tg]["score"] if judges[tg]["score"] is not None else -1))
+                    if strong_bad(best):
+                        why = "placements agree but render strongly inconsistent"
+                    else:
+                        choice, why = best, "placements agree" + (f", render {judges[best]['verdict']}" if judges[best]["verdict"] != "no evidence" else "")
+                else:
+                    if len(cons) == 1:
+                        choice, why = cons[0], "placements disagree, render picks " + cons[0]
+                    elif askable:
+                        figA = self.judge_pose(i, ps["A"][0], ps["A"][1], "A", figure=True).get("figure")
+                        figB = self.judge_pose(i, ps["B"][0], ps["B"][1], "B", figure=True).get("figure")
+                        vv = self.advisor.render_choose(figA, figB, {"image": n, "agree_deg": round(ang, 1), **{f"render_{tg}": info["render"][tg] for tg in ("A", "B")}}) if figA and figB else "unsure"
+                        info["vlm"] = vv
+                        if decide and vv in ("a", "b") and judges[vv.upper()]["verdict"] != "inconsistent":
+                            choice, why = vv.upper(), "placements disagree, advisor picks " + vv.upper()
+                        elif decide and vv in ("a", "b"):
+                            why = f"placements disagree, advisor picks {vv.upper()} but render inconsistent"
+                        elif decide and vv == "both" and len(cons) == 2:
+                            choice = max(cons, key=lambda tg: judges[tg]["score"]); why = "placements disagree, advisor: both, higher render score"
+                        else:
+                            why = f"placements disagree, advisor: {vv}"
+                    else:
+                        why = "placements disagree"
+            elif len(ps) == 1:
+                tag = next(iter(ps))
+                v = judges[tag]["verdict"]
+                if strong_bad(tag):
+                    why = "single placement, render strongly inconsistent"
+                elif v == "consistent":
+                    choice, why = tag, "single placement, render consistent"
+                elif askable:
+                    fig = self.judge_pose(i, ps[tag][0], ps[tag][1], tag, figure=True).get("figure")
+                    vv = self.advisor.render_verdict(fig, {"image": n, "placement": tag, **info["render"][tag]}) if fig else "unsure"
+                    info["vlm"] = vv
+                    if vv == "aligned" and decide and v != "inconsistent":
+                        choice, why = tag, f"single placement, render {v}, advisor: aligned"
+                    else:
+                        why = f"single placement, render {v}, advisor: {vv}"
+                else:
+                    why = f"single placement, render {v}, no advisor"
             else:
-                kept.append(i)
+                why = "anchors did not align"
+            info["why"] = why
+            if choice:
+                accepted[i] = (ps[choice][0], ps[choice][1], ps[choice][2], choice)
+            per[n] = info
+        placed, held, reverted = [], [], []
+        if accepted:
+            for i, (Rn, tn, f, _) in accepted.items():
+                self.set_pose(i, np.c_[Rn, tn], f)
+                self.rec.register_frame(self.rec.images[i].frame_id)
+            self.attach_mapper()
+            for i in accepted:
+                self.mapper.triangulate_image(self.tri, i)
+                self.mapper.iterative_local_refinement(2, 0.001, self.mo, self.ba, self.tri, i)
+            # drift guard: lookalike matches must not drag a verified placement
+            for i, (Rn, tn, f, _) in accepted.items():
+                if i not in self.reg():
+                    reverted.append(i)
+                    continue
+                R2, t2 = self.pose_of(i)
+                drift = rot_angle(R2 @ Rn.T)
+                move = float(np.linalg.norm((-R2.T @ t2) - (-Rn.T @ tn))) / max(span, 1e-9)
+                per[self.names[i]].update({"ba_drift_deg": round(drift, 1), "ba_move_frac": round(move, 4)})
+                if drift > self.gc.drift_deg or move > self.gc.hard_agree_frac:
+                    self.deregister(i)
+                    self.set_pose(i, np.c_[Rn, tn], f)
+                    self.rec.register_frame(self.rec.images[i].frame_id)
+                    self.held.add(i)
+                    held.append(i)
+                    per[self.names[i]]["held"] = True
+                placed.append(i)
                 self.status[i] = "placed"
-        if kept:
+            for i in reverted:
+                self.set_pose(i, np.c_[accepted[i][0], accepted[i][1]], accepted[i][2])
+                self.rec.register_frame(self.rec.images[i].frame_id)
+                self.held.add(i)
+                self.status[i] = "placed"
+                placed.append(i)
+                per[self.names[i]]["held"] = True
+            if held or reverted:
+                self.attach_mapper()
+            sup = self.support(placed)
+            for i in placed:
+                per[self.names[i]]["support"] = None if sup.get(i) != sup.get(i) else round(sup[i], 3)
+                self.hard_placed.add(i)
             self.global_refine()
-        row.update({"registered": [self.names[i] for i in kept], "rejected": {self.names[i]: (None if sup.get(i) != sup.get(i) else round(sup[i], 3)) for i in rejected},
-                    **self.model_stats()})
-        self.say(f"join {k}: +{len(kept)} of {len(group)} (anchors {len(anchors)}, residual {frac:.3f}) -> reg {self.rec.num_reg_images()}")
+        for i in batch:
+            if i not in placed:
+                self.status[i] = "deferred"
+        row = {"round": k, "kind": "hard", "batch": names(batch), "anchors_A": names(A), "anchors_B": names(B),
+               "align_A": None if alA is None else {kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in alA.items() if kk in ("ok", "resid", "used", "dropped")},
+               "align_B": None if alB is None else {kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in alB.items() if kk in ("ok", "resid", "used", "dropped")},
+               "images": per, "registered": names(placed), "held": names(held + reverted), **self.model_stats()}
+        self.say(f"hard {k}: +{len(placed)} of {len(batch)} (held {len(held) + len(reverted)}) -> reg {self.rec.num_reg_images()}/{len(self.names)}; "
+                 + "; ".join(f"{Path(n).stem}:{v.get('why')}" for n, v in per.items()))
         return row
 
-    def run(self, out_dir: Path) -> dict[str, Any]:
-        t0 = time.time()
+    def rerefine_held(self) -> dict[str, Any]:
+        """Hard-placed images (held ones keep no observations, so bundle adjustment never touched them; the others may
+        have been pulled by lookalike correspondences): re-refine their poses in the final model on the correspondences
+        that agree with them, coarse to fine (48, 24, 12 px)."""
+        out = {}
+        for i in sorted(self.held | self.hard_placed):
+            if i not in self.reg():
+                continue
+            R, t = self.pose_of(i)
+            r = self.refine_pose_2d3d(i, R, t)
+            if r.get("inliers", 0) >= 15:
+                cam_f = None
+                self.set_pose(i, np.c_[r["R"], r["t"]], cam_f)
+            out[self.names[i]] = {kk: v for kk, v in r.items() if kk not in ("R", "t")}
+        if out:
+            self.attach_mapper()
+        return out
+
+    def audit(self) -> dict[str, Any] | None:
+        """Render-and-compare every camera of the model; drop the ones whose photo disagrees with what the model shows."""
+        reg = sorted(self.reg())
+        if len(reg) > self.gc.audit_max_images or len(reg) < 4:
+            return None
+        nb_of = {}
+        wants = []
+        for i in reg:
+            R, t = self.pose_of(i)
+            nb_of[i] = self.pose_neighbours(R, t, 4, {i})
+            wants.append((i, R, t))
+        self.ensure_depth(wants, "audit")
+        rows = {}
+        for i in reg:
+            rows[self.names[i]] = self.rac.judge(self.names[i], None, [self.names[j] for j in nb_of[i]])
+        counts = {}
+        for r in rows.values():
+            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        bad = [i for i in reg if rows[self.names[i]]["verdict"] == "inconsistent"] if self.gc.audit_drop else []
+        for i in bad:
+            self.deregister(i)
+            self.status[i] = "dropped"
+        if bad:
+            self.global_refine(final=True)
+        row = {"round": self.rounds, "kind": "audit", "verdicts": counts, "dropped": [self.names[i] for i in bad],
+               "flagged": [self.names[i] for i in reg if rows[self.names[i]]["verdict"] == "inconsistent"],
+               "images": {n: {kk: r.get(kk) for kk in ("score", "margin", "verdict", "overlap")} for n, r in rows.items()}, **self.model_stats()}
+        self.say(f"audit: {counts}; dropped {row['dropped']}")
+        return row
+
+    # -- the loop ----------------------------------------------------------------------------
+    def build(self) -> dict[str, Any]:
+        """Seed, grow, place hard images, final refinement. Returns the seed record."""
         seed_info = self.seed()
         self.log.append({"round": 0, "kind": "seed", **seed_info})
-        k, joins, stall = 0, 0, 0
+        k, stall = 0, 0
         while k < self.gc.max_rounds:
             k += 1
             row = self.grow_round(k)
             if row is None:
-                row = self.join(k) if self.gc.join else None
+                row = self.place_hard(k) if self.gc.hard else None
                 if row is None:
                     break
-                joins += 1
             self.log.append(row)
             stall = stall + 1 if not row.get("registered") else 0
             if stall >= 6:
                 break
+        self.rounds = k
         self.global_refine(final=True)
+        if self.held or self.hard_placed:
+            self.log.append({"round": k, "kind": "held", "images": self.rerefine_held()})
+        if self.gc.audit:
+            row = self.audit()
+            if row:
+                self.log.append(row)
+        return seed_info
+
+    def components(self, nodes: list[int]) -> list[list[int]]:
+        nodes_set, seen, comps = set(nodes), set(), []
+        for s in nodes:
+            if s in seen:
+                continue
+            comp, todo = [], [s]
+            seen.add(s)
+            while todo:
+                u = todo.pop()
+                comp.append(u)
+                for v in self.W.get(u, {}):
+                    if v in nodes_set and v not in seen:
+                        seen.add(v)
+                        todo.append(v)
+            comps.append(comp)
+        return sorted(comps, key=len, reverse=True)
+
+    def sample_names(self, image_ids, k: int = 6) -> list[str]:
+        ids = sorted(image_ids)
+        if len(ids) <= k:
+            return [self.names[i] for i in ids]
+        step = len(ids) / k
+        return [self.names[ids[int(j * step)]] for j in range(k)]
+
+    def absorb(self, sub: "Solver", k0: int) -> tuple[int, list[dict[str, Any]]]:
+        """Place another model's registered images into this one as hard images (feedforward with this model's anchors)."""
+        cands = [self.ids[n] for n in (sub.names[i] for i in sub.reg()) if n in self.ids]
+        rows, placed = [], 0
+        k = k0
+        while cands:
+            k += 1
+            row = self.place_hard(k, candidates=cands[: self.gc.hard_batch])
+            if row is None:
+                break
+            rows.append(row)
+            placed += len(row.get("registered", []))
+            cands = cands[self.gc.hard_batch:]
+        return placed, rows
+
+    def run(self, out_dir: Path) -> dict[str, Any]:
+        t0 = time.time()
+        seed_info = self.build()
+        models_out = [out_dir]
+        extra: list[dict[str, Any]] = []
+        if self.gc.multi_model:
+            remaining = [i for i in self.names if i not in self.reg()]
+            for comp in self.components(remaining):
+                if len(comp) < self.gc.min_component or len(models_out) >= self.gc.max_models:
+                    break
+                tag = f"model{len(models_out)}"
+                sub_cfg = replace(self.gc, multi_model=False, seed_size=min(self.gc.seed_size, len(comp)))
+                sub = Solver(self.ws, self.cfg, self.db_id, sub_cfg, self.workdir / tag, self.gpu, self.verbose,
+                             image_subset=[self.names[i] for i in comp], advisor=self.advisor, tag=tag)
+                try:
+                    sub.build()
+                except RuntimeError as e:
+                    self.log.append({"round": self.rounds, "kind": "component", "component": [self.names[i] for i in comp], "error": str(e)[:300]})
+                    continue
+                finally:
+                    if self.advisor is not None:
+                        self.advisor.log = self.log
+                self.log.extend({**r, "model": tag} for r in sub.log)
+                if sub.rec.num_reg_images() < 3:
+                    continue
+                verdict = "unsure"
+                if self.advisor is not None and self.advisor.enabled:
+                    verdict = self.advisor.same_scene(self.sample_names(self.reg()), self.sample_names(sub.reg()), {"model": tag, "images": sub.rec.num_reg_images()})
+                merged, nplaced = False, 0
+                if verdict != "different":
+                    nplaced, rows = self.absorb(sub, self.rounds)
+                    self.log.extend(rows)
+                    merged = nplaced >= 0.5 * sub.rec.num_reg_images()
+                rec_ = {"round": self.rounds, "kind": "component", "model": tag, "component": len(comp), "registered": sub.rec.num_reg_images(),
+                        "same_scene": verdict, "absorbed": nplaced, "merged": merged}
+                self.log.append(rec_)
+                self.say(f"component {tag}: {sub.rec.num_reg_images()} of {len(comp)} images; same scene: {verdict}; absorbed {nplaced}; {'merged' if merged else 'kept as a separate model'}")
+                if not merged:
+                    d = out_dir.parent / str(len(models_out))
+                    d.mkdir(parents=True, exist_ok=True)
+                    sub.rec.write(str(d))
+                    models_out.append(d)
+                    extra.append({"model": tag, **sub.model_stats(), "component": len(comp), "same_scene": verdict})
+                else:
+                    self.global_refine(final=True)
         out_dir.mkdir(parents=True, exist_ok=True)
         self.rec.write(str(out_dir))
         reg = self.reg()
@@ -375,14 +850,19 @@ class Solver:
             elif self.status[i] == "placed":
                 self.status[i] = "filtered"
         unplaced = [self.names[i] for i in self.names if i not in reg]
+        hard_rows = [r for r in self.log if r.get("kind") == "hard" and "model" not in r]
         summary = {"feedforward": self.gc.feedforward, "num_images": len(self.names), **self.model_stats(),
                    "seed": {"centre": seed_info["attempts"][seed_info["chosen"]]["centre"], "attempts": len(seed_info["attempts"]),
                             "kept": len(seed_info["attempts"][seed_info["chosen"]]["kept"]), "size": self.gc.seed_size},
-                   "rounds": k, "joins": joins, "rejected_total": sum(len(r.get("rejected", {})) for r in self.log),
-                   "pnp_failed_total": sum(len(r.get("pnp_failed", [])) for r in self.log),
+                   "rounds": self.rounds, "hard_rounds": len(hard_rows), "hard_placed": sum(len(r.get("registered", [])) for r in hard_rows),
+                   "audit": next(({"verdicts": r["verdicts"], "dropped": r["dropped"]} for r in self.log if r.get("kind") == "audit" and "model" not in r), None),
+                   "held": len(self.held), "rejected_total": sum(len(r.get("rejected", {})) for r in self.log if r.get("kind") == "pnp"),
+                   "pnp_failed_total": sum(len(r.get("pnp_failed", [])) for r in self.log if r.get("kind") == "pnp"),
+                   "extra_models": extra, "num_models": len(models_out),
                    "unplaced": unplaced[:30] + ([f"... {len(unplaced)} in all"] if len(unplaced) > 30 else []),
                    "status_counts": {s: sum(1 for v in self.status.values() if v == s) for s in sorted(set(self.status.values()))},
-                   "feedforward_calls": self.ff_calls, "feedforward_seconds": round(self.ff_seconds, 1), "wall": round(time.time() - t0, 1),
-                   "config": asdict(self.gc)}
+                   "feedforward_calls": self.ff_calls, "feedforward_seconds": round(self.ff_seconds, 1),
+                   "vlm_calls": self.advisor.calls if self.advisor else 0, "vlm_seconds": round(self.advisor.seconds, 1) if self.advisor else 0.0,
+                   "wall": round(time.time() - t0, 1), "config": asdict(self.gc)}
         (out_dir.parent / "grow_log.json").write_text(json.dumps({"summary": summary, "log": self.log}, indent=1, default=str))
         return summary

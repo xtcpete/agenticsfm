@@ -17,7 +17,7 @@ from agenticsfm.workspace import Workspace
 
 def run_incremental(ws: Workspace, cfg: dict[str, Any], verbose: bool = True, dataset: str | None = None,
                     feedforward: str | None = None, threshold: float | None = None, optimize: bool = True,
-                    seed_size: int = 12, group_size: int = 8, min_support: float = 0.5, join: bool = True) -> dict[str, Any]:
+                    seed_size: int = 12, group_size: int = 8, min_support: float = 0.5, hard: bool = True, vlm: str = "decide", multi_model: bool = True) -> dict[str, Any]:
     n = len(ws.image_names())
     step = make_step(ws, cfg, "incremental", verbose)
     rc = recipe_of(cfg, dataset)
@@ -27,12 +27,12 @@ def run_incremental(ws: Workspace, cfg: dict[str, Any], verbose: bool = True, da
     if threshold is not None:
         scores = step("score_pairs", db_id=db, method="flexglue_covis").artifact
         db = step("filter_edges", db_id=db, scores_id=scores, threshold=float(threshold)).artifact
-    m = step("grow_model", db_id=db, feedforward=ff, seed_size=seed_size, group_size=group_size, min_support=min_support, join=join)
+    m = step("grow_model", db_id=db, feedforward=ff, seed_size=seed_size, group_size=group_size, min_support=min_support, hard=hard, vlm=vlm, multi_model=multi_model)
     e = step("examine", model_id=m.artifact).summary
     best = m.artifact
     grow = m.summary.get("grow", {})
     decisions: dict[str, Any] = {
-        "grow": {k: grow.get(k) for k in ("num_registered", "num_images", "rounds", "joins", "rejected_total", "pnp_failed_total", "seed", "wall", "feedforward_calls")},
+        "grow": {k: grow.get(k) for k in ("num_registered", "num_images", "num_models", "rounds", "hard_rounds", "hard_placed", "held", "rejected_total", "pnp_failed_total", "seed", "wall", "feedforward_calls", "vlm_calls", "extra_models")},
         "examine": {"largest": e["models"][0]["num_images"] if e.get("models") else 0,
                     "strong_inconsistent_frac": e.get("edges", {}).get("consistency", {}).get("strong_inconsistent_frac"),
                     "quality": quality(e, n)}}

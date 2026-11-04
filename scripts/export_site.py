@@ -19,12 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 _ap = argparse.ArgumentParser()
 _ap.add_argument("--out", default=str(ROOT / "outputs/site"))
 _ap.add_argument("--runs", nargs="*", default=["agent_v13:wriva", "agent_eth3d_v13:eth3d"], help="agent runs as <run>:<dataset>")
-_ap.add_argument("--solver-runs", nargs="*", default=["incremental_v0", "incremental_v0_t06"])
+_ap.add_argument("--solver-runs", nargs="*", default=["incremental_v13", "incremental_v13_mixed", "incremental_v0"])
 _args = _ap.parse_args()
 SITE = Path(_args.out)
 for _d in ("data/ep", "models", "img"):
     (SITE / _d).mkdir(parents=True, exist_ok=True)
-MAX_POINTS, IMG_SIDE = 40000, 820
+MAX_POINTS, IMG_SIDE = 40000, 1100
 
 def read_results(run):
     out = {}
@@ -200,9 +200,10 @@ for gid, gtitle, run, dataset, controller in plan:
         for run in _args.solver_runs:
             label, dataset_of = (" (filter 0.6)" if "t06" in run else ""), {s: "eth3d" for s in eth}
             results = read_results(run)
+            if not (ROOT / "outputs/runs" / run).is_dir(): continue
             for sc_dir in sorted((ROOT / "outputs/runs" / run).iterdir()):
                 if not (sc_dir / "trace.jsonl").is_file(): continue
-                scene = sc_dir.name; dataset = dataset_of.get(scene, "wriva")
+                scene = sc_dir.name; dataset = dataset_of.get(scene, "wriva" if not scene.startswith(("m07_", "mixed", "images")) else "mixed")
                 ep_id = f"solver-{re.sub(r'[^a-z0-9]+', '-', short_scene(scene).lower()).strip('-')}" + ("-t06" if "t06" in run else "")
                 print("==", ep_id)
                 store = store_of(sc_dir)
@@ -217,6 +218,24 @@ for gid, gtitle, run, dataset, controller in plan:
                             for n in row["attempts"][row["chosen"]]["kept"]: order.setdefault(n, 0)
                         else:
                             for n in row.get("registered", []) or []: order.setdefault(n, row["round"])
+                    # vlm rows: copy the figures / photos they were shown into the site
+                    for row in grow_log["log"]:
+                        if row.get("kind") == "vlm":
+                            imgs = {}
+                            for label, names_ in (row.get("images") or {}).items():
+                                out_names = []
+                                for nm in names_:
+                                    src = Path(nm) if Path(nm).is_absolute() else store / "images" / nm
+                                    if src.is_file():
+                                        img_counter[0] += 1
+                                        rel = f"img/{ep_id}/{img_counter[0]:03d}.jpg"
+                                        try:
+                                            save_image(src, SITE / rel); out_names.append({"src": rel, "name": Path(nm).name})
+                                        except Exception as e:
+                                            print("   figure failed", src, e)
+                                imgs[label] = out_names
+                            row["images"] = imgs
+                            row["reasoning"] = (row.get("reasoning") or "")[-1200:]
                     # splice the growth rounds after the grow_model tool step
                     for i, s in enumerate(steps):
                         if s["kind"] == "tool" and s["tool"] == "grow_model":
@@ -229,7 +248,8 @@ for gid, gtitle, run, dataset, controller in plan:
                     minfo = export_model(sc_dir / "final", SITE / "models" / f"{ep_id}-final.json", store / "images", order)
                     models.append({"id": f"{ep_id}-final", "label": "submitted (after optimize)", "file": f"models/{ep_id}-final.json", "has_order": True, **minfo})
                 r = results.get(scene, {})
-                ep = {"id": ep_id, "group": gid, "title": short_scene(scene) + label, "scene": scene, "dataset": dataset, "controller": "incremental (open solver v0)", "run": run,
+                ep = {"id": ep_id, "group": gid, "title": short_scene(scene) + label + ("" if run == "incremental_v0" else f" [{run.replace('incremental_', '')}]"), "scene": scene, "dataset": dataset,
+                      "controller": "incremental (open solver " + ("v0" if run == "incremental_v0" else "v1.3") + ")", "run": run,
                       "num_images": r.get("num_images_gt"), "score": score_of(r), "refs": ref_scores(scene, dataset), "wall": r.get("wall"),
                       "n_turns": 0, "n_tools": sum(1 for s in steps if s["kind"] == "tool"), "tokens": 0, "submitted": r.get("submitted"), "models": models,
                       "grow": trim(grow_log["summary"]) if grow_log else None}

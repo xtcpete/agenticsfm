@@ -122,6 +122,7 @@ pre { font: 12px/1.45 var(--font-mono); background: var(--surface-2); border-rad
 .err { color: var(--bad); font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere }
 
 /* growth rounds */
+.round.vlm { border-left: 3px solid var(--accent); cursor: default }
 .rounds { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px }
 .round { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 4px 12px; padding: 6px 6px; border-radius: 6px; font-size: 13px; cursor: pointer }
 .round:hover, .round.current { background: var(--surface-2) }
@@ -240,7 +241,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
         'One episode per scene, pass 13 (the agent may only submit models its own episode built). Primary score per dataset; the delta is against the scripted controller with the same tools.' }));
       var head = h('tr', {}, [h('th', { text: 'Scene' }), h('th', { class: 'num', text: 'Images' }), h('th', { class: 'num', text: 'Registered' }),
         h('th', { class: 'num', text: hasEth && !hasWr ? 'AUC@1°' : (hasWr && !hasEth ? 'AUC@10°' : 'Primary') }), h('th', { class: 'num', text: 'vs scripted' }), h('th', { class: 'num', text: 'vs fixed' }),
-        h('th', { class: 'num', text: g.id === 'solver' ? 'Rounds · joins' : 'Turns · tools' }), h('th', { class: 'num', text: 'Wall s' })]);
+        h('th', { class: 'num', text: g.id === 'solver' ? 'Rounds · hard' : 'Turns · tools' }), h('th', { class: 'num', text: 'Wall s' })]);
       var tb = h('tbody');
       g.episodes.forEach(function (id) {
         var ep = INDEX.episodes[id], m = primary(ep.dataset), s = ep.score ? ep.score[m] : null;
@@ -249,7 +250,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
           h('td', { text: ep.title + (ep.dataset === 'eth3d' ? '' : '') }), h('td', { class: 'num', text: ep.num_images == null ? '–' : ep.num_images }),
           h('td', { class: 'num', text: ep.score ? ep.score.registered : '–' }), h('td', { class: 'num', text: fmt(s) }),
           h('td', { class: 'num' }, [delta(s, sc)]), h('td', { class: 'num' }, [delta(s, fx)]),
-          h('td', { class: 'num', text: g.id === 'solver' ? ((ep.grow ? ep.grow.rounds : '–') + ' · ' + (ep.grow ? ep.grow.joins : '–')) : (ep.n_turns + ' · ' + ep.n_tools) }),
+          h('td', { class: 'num', text: g.id === 'solver' ? ((ep.grow ? ep.grow.rounds : '–') + ' · ' + (ep.grow ? (ep.grow.hard_placed != null ? ep.grow.hard_placed : ep.grow.joins) : '–')) : (ep.n_turns + ' · ' + ep.n_tools) }),
           h('td', { class: 'num', text: ep.wall == null ? '–' : Math.round(ep.wall) })]));
       });
       sec.appendChild(h('div', { class: 'tablewrap' }, [h('table', {}, [h('thead', {}, [head]), tb])]));
@@ -286,7 +287,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
     var st = [['images', ep.num_images], ['registered', ep.score && ep.score.registered]];
     if (ep.n_turns) st.push(['VLM turns', ep.n_turns], ['tool calls', ep.n_tools], ['prompt tokens', ep.tokens ? ep.tokens.toLocaleString() : null]);
     else st.push(['tool calls', ep.n_tools]);
-    if (ep.grow) st.push(['rounds', ep.grow.rounds], ['joins', ep.grow.joins], ['rejected', ep.grow.rejected_total], ['solver s', Math.round(ep.grow.wall)]);
+    if (ep.grow) st.push(['rounds', ep.grow.rounds], ['hard placed', ep.grow.hard_placed != null ? ep.grow.hard_placed : ep.grow.joins], ['VLM calls', ep.grow.vlm_calls || 0], ['models', ep.grow.num_models || 1], ['solver s', Math.round(ep.grow.wall)]);
     st.push(['wall s', ep.wall == null ? null : Math.round(ep.wall)]);
     v.appendChild(h('div', { class: 'stats' }, st.map(function (p) { return h('span', {}, [p[0] + ' ', h('b', { text: p[1] == null ? '–' : p[1] })]); })));
     v.appendChild(scoreTable(ep));
@@ -367,12 +368,46 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
   function growthBlock(log, summary) {
     var box = h('div', { class: 'rounds' });
     box.appendChild(h('div', { class: 'eyebrow', text: 'Growth, round by round · click a round to show the model at that point' }));
-    var counts = log.map(function (r) { return r.kind === 'seed' ? (r.attempts && r.attempts[r.chosen] ? r.attempts[r.chosen].num_registered : 0) : (r.num_registered || 0); });
+    var rounds = log.filter(function (r) { return ['seed', 'pnp', 'join', 'hard'].indexOf(r.kind) >= 0 && !r.model; });
+    var counts = rounds.map(function (r) { return r.kind === 'seed' ? (r.attempts && r.attempts[r.chosen] ? r.attempts[r.chosen].num_registered : 0) : (r.num_registered || 0); });
     var total = summary && summary.num_images ? summary.num_images : Math.max.apply(null, counts);
-    box.appendChild(growthChart(counts, total, log));
+    box.appendChild(growthChart(counts, total, rounds));
     log.forEach(function (r) {
       var row;
-      if (r.kind === 'seed') {
+      if (r.kind === 'vlm') {
+        var ans = (r.answer && typeof r.answer === 'object') ? r.answer : {};
+        var figs = [];
+        Object.keys(r.images || {}).forEach(function (label) { (r.images[label] || []).forEach(function (im) { figs.push({ src: im.src, name: label.replace(/:.*$/, '') + ' · ' + im.name, w: 0, h: 0 }); }); });
+        row = h('div', { class: 'round vlm' }, [h('div', { class: 'lab' }, ['VLM', h('small', { text: r.question + (r.model ? ' · ' + r.model : '') })]),
+          h('div', { class: 'body' }, [h('span', { class: 'tag ' + (['a', 'b', 'same', 'aligned'].indexOf(String(ans.answer).toLowerCase()) >= 0 ? 'ok' : (String(ans.answer).toLowerCase() === 'unsure' ? '' : 'warn')), text: 'answer: ' + ans.answer + (ans.confidence != null ? ' (' + ans.confidence + ')' : '') }),
+            ' ', h('span', { class: 'muted', text: (r.context && r.context.image ? r.context.image + ' · ' : '') + (r.seconds || '') + ' s' }),
+            ans.reason ? h('div', { class: 'says', style: 'font-size:13px;margin:4px 0', text: ans.reason }) : null,
+            r.reasoning ? h('details', { class: 'thinking' }, [h('summary', { text: 'Thinking · ' + r.reasoning.length + ' chars' }), h('div', { class: 'body', text: r.reasoning })]) : null,
+            figs.length ? h('div', { class: 'thumbs' }, figs.map(function (im) { return h('div', {}, [h('button', { type: 'button', onclick: function () { openImage(im); } }, [h('img', { src: im.src, alt: im.name, loading: 'lazy' })]), h('div', { class: 'cap', text: im.name })]); })) : null])]);
+        box.appendChild(row); return;
+      }
+      if (r.kind === 'hard') {
+        var ims = r.images || {};
+        var items = Object.keys(ims).map(function (n) {
+          var v = ims[n], ok = (r.registered || []).indexOf(n) >= 0;
+          var rd = v.render || {}; var rtxt = Object.keys(rd).map(function (tg) { return tg + ' ' + (rd[tg].score == null ? '–' : rd[tg].score) + '/' + (rd[tg].margin == null ? '–' : rd[tg].margin); }).join('  ');
+          return h('div', { style: 'margin:2px 0' }, [h('span', { class: 'tag ' + (ok ? 'ok' : 'warn'), text: n.replace(/\.(jpg|JPG|png|jpeg)$/, '') }), ' ', h('span', { text: v.why || '' }),
+            h('span', { class: 'muted mono', style: 'font-size:11px', text: (v.agree_deg != null ? ' · agree ' + v.agree_deg + '°' : '') + (rtxt ? ' · render score/margin ' + rtxt : '') + (v.vlm ? ' · VLM ' + v.vlm : '') + (v.held ? ' · held' : '') + (v.ba_drift_deg != null ? ' · BA moved ' + v.ba_drift_deg + '°' : '') })]);
+        });
+        row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, ['Hard ' + r.round, h('small', { text: 'Pi3X × 2 anchor sets' + (r.model ? ' · ' + r.model : '') })]),
+          h('div', { class: 'body' }, ['+' + (r.registered || []).length + ' of ' + (r.batch || []).length + (r.error ? ' · ' + r.error : '') + ' · ' + (r.num_registered || '') + ' in model'].concat(items))]);
+      } else if (r.kind === 'audit') {
+        var flagged = r.flagged || r.dropped || [];
+        row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Audit', h('small', { text: 'render and compare' })]),
+          h('div', { class: 'body' }, [JSON.stringify(r.verdicts || {}).replace(/[{}"]/g, '').replace(/,/g, ', '), flagged.length ? ' · flagged: ' : '', h('span', {}, tags(flagged, 'warn')), (r.dropped || []).length ? ' · dropped: ' + r.dropped.join(', ') : ''])]);
+      } else if (r.kind === 'held') {
+        var hk = Object.keys(r.images || {});
+        row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Re-refine', h('small', { text: 'hard cameras' })]),
+          h('div', { class: 'body' }, [hk.map(function (n) { var v = r.images[n]; return n.replace(/\.(jpg|JPG|png|jpeg)$/, '') + ' (' + (v.inliers || 0) + ' inl, ' + (v.refined_deg == null ? '–' : v.refined_deg + '°') + ')'; }).join(' · ')])]);
+      } else if (r.kind === 'component') {
+        row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Component', h('small', { text: r.model || '' })]),
+          h('div', { class: 'body' }, [r.error ? h('span', { class: 'err', text: String(r.error).slice(0, 200) }) : (r.registered + ' of ' + (Array.isArray(r.component) ? r.component.length : r.component) + ' images · same scene: ' + r.same_scene + ' · absorbed ' + r.absorbed + ' · ' + (r.merged ? 'merged' : 'kept as a separate model'))])]);
+      } else if (r.kind === 'seed') {
         var a = r.attempts[r.chosen];
         row = h('div', { class: 'round', 'data-round': 0 }, [h('div', { class: 'lab' }, ['Seed', h('small', { text: 'Pi3X · ' + a.group.length + ' images' })]),
           h('div', { class: 'body' }, ['Centre ', h('span', { class: 'mono', text: a.centre }), ' · kept ' + a.kept.length + ' of ' + a.group.length + ' · ' + a.num_points + ' points · reproj ' + a.reproj + (r.attempts.length > 1 ? ' · attempt ' + (r.chosen + 1) + ' of ' + r.attempts.length : ''),
@@ -389,7 +424,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
           h('div', { class: 'body' }, ['+' + (r.registered || []).length + ' registered · ' + rej.length + ' rejected · ' + (r.pnp_failed || []).length + ' PnP failed · ' + r.num_registered + ' in model · ' + r.num_points + ' points · reproj ' + r.reproj,
             h('div', { class: 'tags' }, tags(r.registered, 'ok').concat(tags(rej.map(function (k) { return k + ' ' + r.rejected[k]; }), 'warn')).concat(tags(r.pnp_failed, '')))])]);
       }
-      row.addEventListener('click', function () { if (VIEWER) VIEWER.setRound(Number(row.getAttribute('data-round'))); box.querySelectorAll('.round').forEach(function (x) { x.classList.toggle('current', x === row); }); });
+      if (row.getAttribute('data-round') != null) row.addEventListener('click', function () { if (VIEWER) VIEWER.setRound(Number(row.getAttribute('data-round'))); box.querySelectorAll('.round').forEach(function (x) { x.classList.toggle('current', x === row); }); });
       box.appendChild(row);
     });
     return box;

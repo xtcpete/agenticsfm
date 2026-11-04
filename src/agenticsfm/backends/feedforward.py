@@ -247,6 +247,12 @@ def main() -> None:
             E = extr[0].float().cpu().numpy()
             K = intr[0].float().cpu().numpy()
         g = {"names": names, "extrinsics": E.tolist(), "intrinsics": K.tolist(), "transforms": transforms}
+        if spec.get("save_depth") and depth is not None:
+            # dense depth (model pixels) for render-and-compare checks; conf in [0, 1] where the model gives one
+            dp = Path(spec["result_path"]).parent / f"depth_{len(out)}.npz"
+            np.savez_compressed(dp, depth=depth.astype(np.float16), conf=(conf if conf is not None else np.ones_like(depth)).astype(np.float16),
+                                K=K.astype(np.float32), E=E.astype(np.float32), transforms=np.array(transforms, dtype=np.float32), names=np.array(names))
+            g["depth_path"] = str(dp)
         if ppi and depth is not None:
             pts, owner = [], []
             for i in range(len(names)):

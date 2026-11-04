@@ -50,7 +50,7 @@ def run_scene(args, cfg, run, scene, gpu, gt_dir):
 
             row.update(run_incremental(ws, cfg, dataset=None if args.folder else args.dataset, feedforward=args.feedforward,
                                        threshold=args.threshold, optimize=not args.no_optimize, seed_size=args.seed_size,
-                                       group_size=args.group_size, min_support=args.min_support, join=not args.no_join))
+                                       group_size=args.group_size, min_support=args.min_support, hard=not args.no_hard, vlm=args.vlm, multi_model=not args.no_multi_model))
         elif args.controller == "agent":
             from agenticsfm.agent import Agent
 
@@ -88,7 +88,9 @@ def main() -> None:
     parser.add_argument("--seed-size", type=int, default=12)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--min-support", type=float, default=0.5)
-    parser.add_argument("--no-join", action="store_true", help="incremental: no feedforward joins")
+    parser.add_argument("--no-hard", action="store_true", help="incremental: no feedforward placement of hard images")
+    parser.add_argument("--vlm", default="decide", choices=["off", "log", "decide"], help="incremental: the VLM advisor mode")
+    parser.add_argument("--no-multi-model", action="store_true", help="incremental: do not reconstruct leftover image sets as further models")
     parser.add_argument("--dataset", default="wriva")
     parser.add_argument("--split", default="all", choices=["dev", "test", "all"])
     parser.add_argument("--scenes", nargs="*")

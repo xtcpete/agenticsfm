@@ -53,3 +53,24 @@ has the evidence.
   plumbing; sequential similarity merges drift.
 - **Model choice is not the bottleneck**: the GT-free quality rule picks within 1 to 1.5 points
   of the GT-best candidate; the candidates are what limit the result.
+
+## Open solver (2026-11-04)
+
+- **Match support is blind on doppelganger images.** Their matches are wrong and self-consistent, so a correct
+  pose fails the epipolar test and a wrong one can pass it. Judge those images by the feedforward model's
+  agreement across anchor sets and by render-and-compare, never by their matches.
+- **Diverse anchors make the feedforward placement right.** Pi3X with match anchors only places a lookalike
+  image relative to the wrong facade; with cameras sampled from all over the model it places BLH0001's seven
+  hard images within 1 to 3 degrees.
+- **Ask the VLM image questions with rendered evidence.** It chose correctly between two overlay figures five
+  times out of five with content; it cannot see a 13-degree pose error in photos, and on a garbage rendering it
+  still said "aligned". Cheap gates first (links, render verdict), the VLM only on what passes them.
+- **The render score is a precision instrument.** Calibrated: margin > 0.05 keeps 88% of correct poses and
+  passes 2 to 4% of 10-to-20-degree errors. It must not veto coarse feedforward placements (v1.1 regression).
+- **Hold or refine, do not let lookalike correspondences drag.** Bundle adjustment moved a correct placement by
+  30% of the scene span; the drift guard caught it. Holding costs 2 to 6 degrees of precision; pose-only
+  refinement on the correspondences that agree, coarse to fine, is the current compromise.
+- **Backends reload weights on every call** (13 s for Pi3X), which now dominates the solver's time; a run with
+  many hard rounds makes dozens of calls. A persistent worker per env is the next engineering step.
+- **Never edit the source while runs are in flight** still holds for the solver: the backend is a subprocess per
+  call, and a controller process imports the solver once, so edits mix versions across a batch.
