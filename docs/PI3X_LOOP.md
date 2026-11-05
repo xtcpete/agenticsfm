@@ -521,3 +521,86 @@ The user noted that in both render-choose figures (28 in hard round 7, 33 in har
 
   - Images 22 and 12 (0.27) came in through the hard path.
   - Of the VLM placements, 13, 28 and 33 are good. Image 32 has a good rotation (3.2°) but a depth error along its viewing axis. Narrow-view distant cameras are poorly constrained in depth by Pi3X and by few matches.
+
+### Step 18 (2026-11-05): repeat VLM pass complete; co-located cameras checked against GT
+- **`p3b_vlm_rep2`:**
+
+  | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|
+  | 45.0 | 82.9 | 41.9 (30/39) | 57.3 | 59.1 | 53.8 | **56.7** |
+
+  - Phase 3b code, three VLM runs: 57.3, 56.7, and the graph control at 55.6.
+- **Co-located groups (GT centres within 2% of the camera spread; `scripts/analysis/colocated.py`):**
+  - On PTZ, almost every group is fully registered and lands on one point (median spread 0.005).
+  - Each Pi3X-loop run splits 0–3 groups per scene: one member sits far from its partners (0.25–2.2 camera spreads). Scripted COLMAP splits none; v1.3 splits one.
+  - **The split member is always one of the run's large errors (13–43°), and it enters through a weak path:**
+    - "disagree; render confirms PnP" (s01 118 at 25°, s02 144 at 24°);
+    - the hard path (s02 168 at 43°, BLH 12 at 13°);
+    - unverified VLM placements in `p123` (s02 13 and 156, s01 93);
+    - and twice through "agree" (s01 108, s02 073).
+- **Can Pi3X detect co-location at runtime? (`scripts/analysis/coloc_pi3x.py`, all saved Pi3X groups of `p3b_vlm_dev`):** a pair counts as co-located when Pi3X's centres are within τ × the group's camera spread.
+
+  | τ | Precision | Recall |
+  |---|---|---|
+  | 0.02 | 0.96 | 0.09 |
+  | 0.03 | 0.96 | 0.19 |
+  | 0.05 | 0.92 | 0.34 |
+  | 0.08 | 0.81 | 0.55 |
+
+  - A08 is the weak scene (0.71 at τ 0.03).
+  - For 4 of the 7 split pairs, Pi3X put the two cameras on one spot (gap 0.006–0.037), including in the round where the wrong pose was accepted.
+- **Correctly placed co-located pairs in the final models are up to 0.06–0.08 of the scene depth apart; split pairs are 0.25 or more.**
+
+### Step 19 (2026-11-05): Phase 4, sky masking and the co-location guard (commit `8285d3d`, cache v22)
+- **Sky:** Pi3X's confidence already separates sky.
+  - `conf ≥ 0.1` removes the sky and keeps all structure, including a flagpole; 0.3 and above cut walls.
+  - Point alignment and depth-filtered PnP already used 0.1. Render-and-compare ignored confidence, so sky "points" were drawn into the figures and counted in the NCC score.
+  - It now drops depth below 0.1 (`rac_min_conf`; `--ff-off sky` reverts).
+  - Effect at the near-correct final poses of BLH 28 and 33: the sky streaks are gone, and the render score goes from −0.11 to +0.19 (inconsistent → positive).
+  - Structure behind the unmodelled perimeter wall still shows through: no occluder, no fix.
+- **Co-location guard (`ff_coloc`; `--ff-off coloc` reverts):** every Pi3X round, a batch image whose Pi3X centre is within 0.03 × the group's camera spread of a registered anchor is called co-located with it.
+  - If the accepted pose's centre is more than 0.10 × the scene depth from the partner's, the guard tries fixed-centre poses: the partner's centre, with the rotation from Pi3X, from the chosen pose, or from the pair's homography.
+  - The best of these is taken when its match support is ≥ the minimum and not clearly below the chosen pose's support. Otherwise the image is deferred.
+  - Images that would be rejected get the same fixed-centre candidates.
+  - Not yet in the hard path (BLH 12/22 were placed there).
+- **Smoke run (PTZ s01, graph selection):** 58.9, 179/182, no crash. The guard detected 6 co-located pairs, all already within 0.015, so it never had to act. No group split.
+- **Launched:** `p4_vlm_dev`, all six scenes on GPUs 4–6.
+
+### Step 20 (2026-11-05, 10:20): Phase 4 VLM pass (`p4_vlm_dev`)
+| Scene | `p4_vlm` | `p3b_vlm` | `p3b_vlm_rep2` | `p3b_graph` | v1.3 | scripted |
+|---|---|---|---|---|---|---|
+| A08 | 45.1 | 45.0 | 45.0 | 43.8 | 43.1 | 44.3 |
+| M07 | 82.6 | 82.4 | 82.9 | 82.1 | 81.6 | 81.0 |
+| BLH | 42.0 (31/39) | 44.5 | 41.9 | 40.7 | 50.7 | 49.0 |
+| PTZ s00 | 57.4 | 56.3 | 57.3 | 59.0 | 56.1 | 61.6 |
+| PTZ s01 | 58.9 | 59.9 | 59.1 | 58.0 | 55.3 | 61.5 |
+| PTZ s02 | 56.8 | 55.4 | 53.8 | 50.4 | 52.3 | 60.9 |
+| **mean** | **57.1** | 57.3 | 56.7 | 55.6 | 56.5 | 59.7 |
+
+- **Co-located groups:** no split group on any scene; `p3b_vlm` had one per PTZ scene, `p3b_vlm_rep2` none.
+- **The guard acted twice**, deferring 2 images whose pose was away from their Pi3X partner (118 and 127); both are later registered.
+- **Cameras > 10°** (A08 / BLH / s00 / s01 / s02):
+
+  | Run | Counts |
+  |---|---|
+  | `p4` | 3 / 1 / 5 / 2 / 3 |
+  | `p3b_vlm` | 3 / 1 / 4 / 2 / 3 |
+  | `p3b_rep2` | 3 / 0 / 4 / 2 / 3 |
+  | `p3b_graph` | 4 / 1 / 3 / 4 / 9 |
+
+- **No measurable change, positive or negative:** splits were already rare in the VLM runs, and one pass cannot separate a one-image effect from run noise.
+  - The sky mask changes every render score. Since the mean did not drop, it does not hurt.
+  - Kept both: they are correct by construction.
+- **BLH is the scene that keeps losing** (31/39). The back-of-building cameras are judged by renders made from front-side images (see step 21).
+
+### Step 21 (2026-11-05): why the BLH renders compare the photo to the front of the buildings
+- **How render-and-compare picks its sources:** it warps the 4 registered images *nearest the candidate pose* (camera distance + 0.5 × (1 − cos of the viewing-direction angle); `grow.py` `nearest_registered`, `render_compare.py` `neighbours`), whatever they see.
+- **What that gives for the back cameras (28, 33):**
+  - The nearest registered images are inside the compound, looking at the inner faces of the brick buildings.
+  - Unverified neighbours (13, 33) have no sparse points, so their depth cannot be scaled to the model and they are skipped.
+  - With no visibility or back-face test, those inner faces are drawn through the unmodelled perimeter wall.
+  - The figure compares the photo's wall with the far side of the buildings, so even the correct pose looks "inconsistent".
+- **Proposed fixes:**
+  1. Choose render sources by shared matches with the candidate, not by pose distance.
+  2. Drop back-facing points, using normals from the Pi3X depth.
+  3. Report "no evidence" instead of "inconsistent" when the sources share little content with the photo.
