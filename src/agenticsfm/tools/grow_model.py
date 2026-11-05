@@ -38,7 +38,7 @@ PARAMS = {
         "select": {"type": "string", "enum": ["graph", "vlm"], "default": "graph", "description": "who picks each round's images"},
         "ff_off": {"type": "string", "default": "", "description": "ff-loop features to switch off (ablations), comma separated: "
                    "evidence (inliers in the VLM selection prompt), fill (fill VLM picks up to the round size), points (point-based alignment), "
-                   "settle (match support settles disagreements), sweep (final retry of unregistered images), anchors (matched anchors only), rotation, vlmplace, sky, coloc, rsrc, backface, cover, rgate (Phase 3b stability gate for VLM placements instead of the 3c render veto)"},
+                   "settle (match support settles disagreements), sweep (final retry of unregistered images), anchors (matched anchors only), rotation, vlmplace, sky, coloc, rsrc, backface, cover, rgate (Phase 3b stability gate for VLM placements instead of the 3c render veto), ainl (no alignment-inlier requirement for 3c)"},
         "scores_id": {"type": "string", "description": "FlexGlue covisibility scores of the database: the images are split into scenes first, "
                                                        "so feedforward calls never mix scenes; each scene gets its own solver run"},
     },
@@ -57,7 +57,7 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
 
     started = time.time()
     params = {"feedforward": feedforward, "seed_size": int(seed_size), "group_size": int(group_size),
-              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 25,
+              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 26,
               "support_pairs": int(support_pairs), "support_norm": bool(support_norm), "loop": loop, "select": select,
               "ff_off": ",".join(sorted(x for x in ff_off.split(",") if x.strip()))}
     inputs = {"db": db_id, **({"scores": scores_id} if scores_id else {})}
@@ -71,14 +71,14 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
                     vlm=vlm, multi_model=bool(multi_model), support_pairs=int(support_pairs),
                     support_norm=bool(support_norm), loop=loop, select=select)
     off = {x.strip() for x in ff_off.split(",") if x.strip()}
-    unknown = off - {"evidence", "fill", "points", "settle", "sweep", "anchors", "rotation", "vlmplace", "sky", "coloc", "rsrc", "backface", "cover", "rgate"}
+    unknown = off - {"evidence", "fill", "points", "settle", "sweep", "anchors", "rotation", "vlmplace", "sky", "coloc", "rsrc", "backface", "cover", "rgate", "ainl"}
     if unknown:
         raise ValueError(f"unknown ff_off features: {sorted(unknown)}")
     gc = replace(gc, select_evidence="evidence" not in off, select_fill="fill" not in off, ff_align_points="points" not in off,
                  ff_settle_support="settle" not in off, ff_sweep="sweep" not in off, ff_rotation="rotation" not in off,
                  ff_vlm_place="vlmplace" not in off, rac_min_conf=0.0 if "sky" in off else gc.rac_min_conf, ff_coloc="coloc" not in off, rac_sources_match="rsrc" not in off, rac_backface="backface" not in off,
                  rac_min_cover=0.0 if "cover" in off else gc.rac_min_cover,
-                 vlm_place_render="rgate" not in off, vlm_place_stable="rgate" in off,
+                 vlm_place_render="rgate" not in off, vlm_place_stable="rgate" in off, vlm_place_min_inl=0.0 if "ainl" in off else gc.vlm_place_min_inl,
                  **({"ff_anchors_match": 6, "ff_anchors_diverse": 4} if "anchors" in off else {}))
     gpu = ws.gpus[0] if ws.gpus else None
     split = None

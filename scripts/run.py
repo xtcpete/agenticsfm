@@ -93,7 +93,7 @@ def main() -> None:
     parser.add_argument("--support-pairs", type=int, default=1000, help="incremental: match support from each image's strongest pairs only")
     parser.add_argument("--loop", default="ff", choices=["ff", "pnp"], help="incremental: feedforward placement every round (checked by PnP), or PnP rounds")
     parser.add_argument("--select", default="graph", choices=["graph", "vlm"], help="incremental: who picks each round's images")
-    parser.add_argument("--ff-off", default="", help="incremental ff loop: features to switch off, comma separated (evidence,fill,points,settle,sweep,anchors,rotation,vlmplace,sky,coloc,rsrc,backface,cover,rgate)")
+    parser.add_argument("--ff-off", default="", help="incremental ff loop: features to switch off, comma separated (evidence,fill,points,settle,sweep,anchors,rotation,vlmplace,sky,coloc,rsrc,backface,cover,rgate,ainl)")
     parser.add_argument("--raw-support", action="store_true", help="incremental: raw match support (fixed pixel threshold, not normalised by the pair's own best fit)")
     parser.add_argument("--no-hard", action="store_true", help="incremental: no feedforward placement of hard images")
     parser.add_argument("--vlm", default="decide", choices=["off", "log", "decide"], help="incremental: the VLM advisor mode")

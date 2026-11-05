@@ -113,6 +113,8 @@ class GrowConfig:
     vlm_place_render: bool = True      # ... gate by render-and-compare of the Pi3X poses (Phase 3c): the group's placement is joint, so
                                        # if at least half of its pending members are "inconsistent" the whole group is left out;
                                        # otherwise every member not "inconsistent" registers unverified (the layout check is advisory)
+    vlm_place_min_inl: float = 0.9     # ... and only when Pi3X aligned to the model on points with at least this inlier share (its geometry
+                                       # of the anchors agrees with the model; GT audit: correct groups 0.92-0.98, wrong ones <= 0.85)
     vlm_place_stable: bool = False     # Phase 3b gate (instead of 3c): Pi3X places the image the same way with two disjoint halves of the picks
     vlm_place_stable_deg: float = 5.0  # ... rotation within this, centre within ff_agree_frac of the scene scale
     ff_coloc: bool = True        # co-location guard: Pi3X puts a candidate on a registered anchor's centre -> its pose must sit there
@@ -1989,6 +1991,13 @@ class Solver:
                         row["images"][self.names[i]]["why"] = "too few picked anchors for the stability check; left out"
                     pending = []
             render_ok = None
+            if pending and self.gc.vlm_place_unverified and self.gc.vlm_place_render and not self.gc.vlm_place_stable:
+                inl = al.get("point_inl") if al.get("by") == "points" else None
+                if inl is None or inl < self.gc.vlm_place_min_inl:
+                    for i in pending:
+                        row["images"][self.names[i]]["why"] = (f"Pi3X aligned to the model {'on ' + al.get('by', '?') if inl is None else f'with {inl:.2f} point inliers'}"
+                                                               f" (< {self.gc.vlm_place_min_inl}): its frame is not trusted for unverified poses; left out")
+                    pending = []
             if pending and self.gc.vlm_place_unverified and self.gc.vlm_place_render and not self.gc.vlm_place_stable:
                 # Phase 3c: render-and-compare of each pending Pi3X pose. Pi3X places the group jointly, so a group whose
                 # members are mostly "inconsistent" has a wrong layout and its "no evidence" members cannot be trusted either.
