@@ -182,6 +182,41 @@ class Advisor:
         canvas.save(out, quality=90)
         return str(out)
 
+    def overlap_pick(self, group_sheet: str, ref_sheet: str, num: int, context: dict[str, Any] | None = None) -> tuple[list[int], dict[str, Any]]:
+        """Which already-placed photos show the same physical structures as a group of unplaced photos (possibly from
+        another side). Returns 0-based indices into the numbered reference sheet and the answer."""
+        parts = [("Photos that could not be placed yet (one group, probably taken close together):", [group_sheet]),
+                 (f"Photos already placed in the 3D model, numbered 1 to {num} (yellow labels):", [ref_sheet])]
+        q = ("Which of the numbered photos show some of the same physical structures as the group: the same building, wall, tower, "
+             "or landmark, even when seen from another side or from farther away? Pick up to 6, the clearest overlap first; pick none when "
+             "none of them shows the same structures. Beware of similar-looking but different structures elsewhere on the site. "
+             'Answer {"pick": [numbers], "shared": "<the shared structures, a few words>"}')
+        a = self.ask("overlap_pick", parts, q, context, max_side=1440)
+        out: list[int] = []
+        if isinstance(a, dict) and isinstance(a.get("pick"), list):
+            for v in a["pick"]:
+                try:
+                    k = int(v) - 1
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= k < num and k not in out:
+                    out.append(k)
+        return out[:6], a
+
+    def layout_check(self, map_path: str, group_sheet: str, ref_sheet: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Is a proposed placement of a group plausible on a top-down map of the model?"""
+        parts = [("Photos to place, numbered (red labels on the map use the same numbers):", [group_sheet]),
+                 ("Reference photos already placed, numbered (blue labels on the map use the same numbers):", [ref_sheet]),
+                 ("Top-down map of the reconstructed site:", [map_path])]
+        q = ("On the map, grey dots are reconstructed 3D points seen from above (walls and buildings appear as lines and blobs), small "
+             "dots are the positions of all placed photos, numbered blue arrows are the reference photos (position and viewing direction), "
+             "and numbered red arrows are the proposed positions and viewing directions of the photos to place. Is the proposal plausible: "
+             "standing at each red position and looking along its arrow, would a camera see what that photo shows, consistent with what the "
+             "reference photos show from their positions (which side of a building, what is in front and behind)? "
+             'Answer {"answer": "plausible" | "implausible" | "unsure", "confidence": 0-1, "reason": "<one sentence>"}')
+        a = self.ask("layout_check", parts, q, context, max_side=1440)
+        return a if isinstance(a, dict) else {"answer": "unsure"}
+
     def select_next(self, model_sheet: str, cand_sheet: str, num: int, pick: int, context: dict[str, Any] | None = None,
                     evidence: list[str] | None = None) -> tuple[list[int], dict[str, Any]]:
         """Which candidates should join the reconstruction next. Returns 0-based candidate indices (best first) and the answer.

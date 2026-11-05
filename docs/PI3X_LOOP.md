@@ -233,3 +233,118 @@ Findings:
 - Without undistortion, BLH passes only 5%, so the solver must undistort with each camera's current parameters.
 
 **Decision:** Phase 2 attaches an image to a registered co-located partner (shared centre, rotation from the homography). It accepts only through the match-support check, which already handles pure-rotation pairs through the rotation-transfer term.
+
+### Step 6 (2026-11-05): smoke runs and a focal-length fix
+Smoke runs: `p1_smoke_graph` (M07, graph selection, no VLM) and `p1_smoke_vlm` (BLH, VLM selection).
+
+- **M07:** 82.5, all 50 images (baseline 82.1). The new paths ran: "disagree; matches support PnP" once, and the sweep (+0, nothing left).
+- **BLH:** 41.3 (baseline 60.2). 35 images in the main model, two of them > 10° from GT (32 at 11.8°, 39 at 10.7°). `scripts/analysis/ff_paths.py` traces both to the "feedforward and PnP agree" path.
+  - Image 32: PnP had 39/328 inliers and estimated a focal of 2,431 px, where Pi3X said 4,932 px. The rotations agreed (0.9°, view gap 9.7°), so the pose was accepted with half the focal length.
+  - In the baseline, PnP failed on this image and it was never accepted this way.
+
+**Fix:**
+- Pi3X and PnP agree only if PnP's own focal estimate is within ×1.25 of Pi3X's. The test applies only when the mapper actually changed the focal (`focal_estimated`).
+- When the focals disagree, the image goes to the match-support path.
+- Cache version 19.
+
+Commit `007bc30`. The full VLM dev pass `p1_vlm_dev` was launched on it: one process per GPU, scenes one after another (GPU 4: s00, A08; GPU 5: s01, BLH; GPU 6: s02, M07).
+
+### Step 7 (2026-11-05): P5, Pi3X depth in bundle adjustment (offline test, running)
+Requested on 2026-11-05: use Pi3X's predicted 3D points in bundle adjustment.
+
+pycolmap 4.2.1's bundle adjuster has no hook for custom costs, and pyceres is not installed. So `scripts/analysis/depth_ba.py` implements the test as its own sparse least-squares bundle adjustment (scipy `least_squares`, trf + lsmr, soft-L1 loss) over poses and points, with intrinsics fixed.
+
+Residuals:
+- reprojection error, divided by 1 px;
+- for every observation with Pi3X depth: (log z − log d_Pi3X(u, v) − b_image) / σ_d. b_image is a free per-image log scale, since Pi3X depth is relative.
+
+Variants: the submitted model, plain BA with the same solver (control), and BA + depth at σ_d = 0.2 / 0.1 / 0.05. Each is scored with the benchmark evaluator and GT rotation errors.
+
+**BLH** (ff_vlm_dev model, 20 iterations):
+
+| Variant | auc@3 | auc@10 | GT rot median | > 5° |
+|---|---|---|---|---|
+| submitted | 29.6 | 60.2 | 1.78° | 0 |
+| plain BA | 29.6 | 60.2 | 1.81° | 0 |
+| + depth σ 0.2 | 29.5 | 60.2 | 1.81° | 0 |
+| + depth σ 0.1 | 29.4 | 60.1 | 1.82° | 0 |
+| + depth σ 0.05 | 29.2 | 60.1 | 1.84° | 0 |
+
+On a well-constrained model the depth term changes nothing, and a stronger prior costs slightly. A08, M07 and PTZ are running.
+
+### Step 8 (2026-11-05): Phase 1 dev pass `p1_vlm_dev` (VLM selection), first scenes
+| Scene | auc@3 | auc@10 | registered | baseline ff_vlm auc@10 | v1.3 | best open solver (v2, no support) |
+|---|---|---|---|---|---|---|
+| PTZ s00 | 19.4 | **59.0** | 195/198 | 48.5 | 56.1 | 59.6 |
+| PTZ s01 | 17.2 | **56.6** | 179/182 | 52.0 | 55.3 | 60.5 |
+| PTZ s02 | 16.3 | **55.8** | 170/174 | 45.3 | 52.3 | 58.8 |
+| M07 | 40.0 | 82.0 | 50/50 | 82.1 | 81.6 | 82.0 |
+
+Wall times: 1,350–1,760 s per PTZ scene, 455 s on M07.
+
+GT audit of the acceptance paths (`ff_paths.py`), count / median error / count > 10°:
+
+| Path | s00 | s01 | s02 |
+|---|---|---|---|
+| Pi3X and PnP agree | 151 / 1.59° / 1 | 144 / 1.83° / 0 | 124 / 1.97° / 0 |
+| **disagree; matches support PnP** (new) | 26 / 1.55° / 1 | 14 / 1.83° / 2 | 26 / 2.27° / 2 |
+| sweep (new) | 6 images / 2 > 10° | 1 / 0 | 3 / 0 |
+
+Settling disagreements by match support recovers most of the deferred PTZ images at the same precision as the agree path. This is the main source of the +4.6 to +10.5 gain.
+
+**P5 results on all dev scenes** (ff_vlm_dev models, 20 iterations; auc@10, with cameras > 5° in brackets):
+
+| Scene | submitted | plain BA | depth σ 0.2 | σ 0.1 | σ 0.05 |
+|---|---|---|---|---|---|
+| A08 | 27.7 (6) | 27.7 (6) | 27.7 (6) | 27.7 (7) | 27.7 (7) |
+| M07 | 82.1 (0) | 82.1 (0) | 82.1 (0) | 82.1 (0) | 82.1 (0) |
+| BLH | 60.2 (0) | 60.2 (0) | 60.2 (0) | 60.1 (0) | 60.1 (0) |
+| PTZ s00 | 48.5 (21) | 48.5 (21) | 48.5 (21) | 48.5 (21) | 48.4 (21) |
+| PTZ s01 | 52.0 (20) | 52.0 (20) | 52.0 (20) | 52.0 (20) | 52.0 (20) |
+| PTZ s02 | 45.3 (20) | 45.3 (20) | 45.3 (21) | 45.3 (21) | 45.4 (21) |
+
+The depth prior changes nothing measurable: ±0.1 auc, median rotation within 0.05°.
+- Cameras that are well constrained by matches do not need it.
+- Cameras that are wrong (> 5°) are wrong placements, not weakly constrained ones, and a depth term cannot move them back.
+- Cameras with no observations at all (Phase 3's unverified ones) get no depth residuals either.
+
+**Decision:** P5 is not added to the solver. Pi3X's 3D points earn their place in alignment (P1) and in filtering matches for PnP (P3/P4, Phase 3), not in bundle adjustment.
+
+### Step 9 (2026-11-05): Phase 1 dev pass complete
+| Scene | auc@3 | auc@10 | registered | before Phase 1 | v1.3 | best open solver |
+|---|---|---|---|---|---|---|
+| A08 | 18.3 | **44.8** | 149/150 | 27.7 | 43.1 | 43.8 |
+| M07 | 40.0 | 82.0 | 50/50 | 82.1 | 81.6 | 82.0 |
+| BLH | 20.0 | 39.9 | 33 (+6 in a second model) | **60.2** | 50.7 | 39.8 |
+| PTZ s00 | 19.4 | 59.0 | 195/198 | 48.5 | 56.1 | 59.6 |
+| PTZ s01 | 17.2 | 56.6 | 179/182 | 52.0 | 55.3 | 60.5 |
+| PTZ s02 | 16.3 | 55.8 | 170/174 | 45.3 | 52.3 | 58.8 |
+| **mean** | 21.9 | **56.4** | | 52.6 | 56.5 | 57.4 |
+
+**A08:**
+- 149 of 150 images, median GT error 0.75°.
+- 39 images came in through "disagree; matches support PnP" (median 0.86°).
+- Point alignment and matched anchors removed the "anchors did not align" stall.
+- 2 cameras > 10° (agree path 0137 and 0097; sweep 0147).
+
+**BLH regression** (60.2 → 39.9). The cause is the hard-image fallback (`place_hard`, unchanged), running on a different model:
+- Hard round 7 accepted 12, 22 (a co-located pair) and 34 on "placements agree, render inconsistent". 12 and 22 ended 8–9° off; in the baseline they were within 2°.
+- Hard round 8 accepted 2, 32, 38 and 36. 2, 32 and 38 were later filtered out; 36 ended 19° off.
+- The leftover component {2, 13, 28, 32, 33, 38} became a second model with no 3D points, which was not absorbed (the baseline absorbed 5 of its images).
+
+The Phase 1 changes did their job on BLH (16 agree, 0 > 10°). The loss is in the fallback's acceptance of "placements agree" without match support. That is the same weakness that placed v1.3's image 28 at 9.7°.
+
+Phase 2 and Phase 3 target exactly these leftover groups (co-located pairs, the back group). Patches applied: `rotation_fit`/`rotation_attach` (Phase 2) and `vlm_place` with `lifted_pnp` and `layout_figure` (Phase 3). Cache version 20. Smoke runs `p3_smoke` on BLH and PTZ s02.
+
+### Step 10 (2026-11-05): Phase 2–3 smoke run on BLH (`p3_smoke`)
+**BLH: auc@3 30.0, auc@10 68.5** (best ever on this scene; was 60.2 in the baseline and 39.9 after Phase 1). **39/39 images, none more than 5° from GT.**
+
+What `vlm_place` did:
+- **Leftover group:** {13, 28, 33, 32}.
+- **The VLM's overlap pick:** 6 placed photos (2, 38, 36, 29, 19, 18) showing "brick building with white tower and the white container/modular structure".
+- **Alignment:** Pi3X on the group plus these anchors aligned on points with 98% inliers.
+- **Match check:** of the group's 28–231 matches to anchor model points, **0** survived the depth-consistency filter. This agrees with the GT finding that these matches are all false. So no match-confirmed pose.
+- **Layout check:** the VLM judged the map plausible (confidence 0.7): "red 4 lies just southeast of the container row and looks northwest, matching the container-and-road composition seen in the reference photos".
+- **Result:** all 4 were registered unverified, with no points and no bundle adjustment. All 4 are within 5° of GT.
+
+The hard fallback also behaved better on this model: 7 "placements agree, render inconsistent" images, median 1.91°, none > 5°. Phase 2's rotation attach was not needed here.

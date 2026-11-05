@@ -397,12 +397,15 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
             sfigs.length ? h('div', { class: 'thumbs' }, sfigs.map(function (im) { return h('div', {}, [h('button', { type: 'button', onclick: function () { openImage(im); } }, [h('img', { src: im.src, alt: im.name, loading: 'lazy' })]), h('div', { class: 'cap', text: im.name })]); })) : null])]));
         return;
       }
+      if (r.kind === 'vlm' && r.question === 'overlap_pick' && r.answer && typeof r.answer === 'object' && !('answer' in r.answer)) {
+        r = Object.assign({}, r, { answer: { answer: 'picked ' + JSON.stringify(r.answer.pick || []), reason: r.answer.shared } });
+      }
       if (r.kind === 'vlm') {
         var ans = (r.answer && typeof r.answer === 'object') ? r.answer : {};
         var figs = [];
         var named = []; Object.keys(r.images || {}).forEach(function (label) { (r.images[label] || []).forEach(function (im) { if (im.src) figs.push({ src: im.src, name: label.replace(/:.*$/, '') + ' · ' + im.name, w: 0, h: 0 }); else named.push(im.name); }); });
         row = h('div', { class: 'round vlm' }, [h('div', { class: 'lab' }, ['VLM', h('small', { text: r.question + (r.model ? ' · ' + r.model : '') })]),
-          h('div', { class: 'body' }, [h('span', { class: 'tag ' + (['a', 'b', 'same', 'aligned'].indexOf(String(ans.answer).toLowerCase()) >= 0 ? 'ok' : (String(ans.answer).toLowerCase() === 'unsure' ? '' : 'warn')), text: 'answer: ' + ans.answer + (ans.confidence != null ? ' (' + ans.confidence + ')' : '') }),
+          h('div', { class: 'body' }, [h('span', { class: 'tag ' + (['a', 'b', 'same', 'aligned', 'plausible'].indexOf(String(ans.answer).toLowerCase()) >= 0 ? 'ok' : (String(ans.answer).toLowerCase() === 'unsure' ? '' : 'warn')), text: 'answer: ' + ans.answer + (ans.confidence != null ? ' (' + ans.confidence + ')' : '') }),
             ' ', h('span', { class: 'muted', text: (r.context && r.context.image ? r.context.image + ' · ' : '') + (r.seconds || '') + ' s' }),
             ans.reason ? h('div', { class: 'says', style: 'font-size:13px;margin:4px 0', text: ans.reason }) : null,
             r.reasoning ? h('details', { class: 'thinking' }, [h('summary', { text: 'Thinking · ' + r.reasoning.length + ' chars' }), h('div', { class: 'body', text: r.reasoning })]) : null,
@@ -421,6 +424,8 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
           if (v.refined_agree_deg != null) bits.push('after refining ' + v.refined_agree_deg + '°' + (v.refined_agree_view_deg != null ? ' / ' + v.refined_agree_view_deg + '°' : ''));
           if (rtxt) bits.push('render: ' + rtxt);
           if (v.support) bits.push('match support ' + Object.keys(v.support).filter(function (tg) { return tg !== 'align_good'; }).map(function (tg) { return (tg === 'ff' ? 'Pi3X' : 'PnP') + ' ' + (v.support[tg] == null ? '–' : v.support[tg]); }).join(', '));
+          if (v.rotation) bits.push('co-located with ' + String(v.rotation.partner).replace(/\.(jpg|JPG|png|jpeg)$/, '') + ' (homography fits ' + Math.round(100 * v.rotation.h_frac) + '%, support ' + (v.rotation.support == null ? '–' : v.rotation.support) + ')');
+          if (v.focal_disagree != null) bits.push('PnP focal ' + v.focal_disagree + '× Pi3X');
           if (v.ba_drift_deg != null) bits.push('local BA moved it ' + v.ba_drift_deg + '°');
           return h('div', { style: 'margin:2px 0' }, [h('span', { class: 'tag ' + (ok ? 'ok' : 'warn'), text: n.replace(/\.(jpg|JPG|png|jpeg)$/, '') }), ' ', h('span', { text: v.why || '' }),
             h('span', { class: 'muted mono', style: 'font-size:11px', text: bits.length ? ' · ' + bits.join(' · ') : '' })]);
@@ -432,6 +437,17 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
         row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, [(r.sweep ? 'Sweep ' : 'Round ') + r.round, h('small', { text: 'Pi3X + ' + (r.anchors || []).length + ' anchors' + (r.model ? ' · ' + r.model : '') })]),
           h('div', { class: 'body' }, [h('div', {}, ['+' + freg.length + ' of ' + (r.batch || []).length + ' · ' + (r.deferred || []).length + ' deferred · chosen by ' + (sel.by === 'vlm' ? 'the VLM' : 'the match graph') + ' from ' + (sel.pool || r.candidates) + ' candidates · ' + r.num_registered + ' in model · ' + r.num_points + ' points · reproj ' + r.reproj]),
             h('div', { class: 'muted', style: 'font-size:12px;margin:2px 0' }, [atxt])].concat(fitems))]);
+      } else if (r.kind === 'vlm_place') {
+        var vims = r.images || {};
+        var vitems = Object.keys(vims).map(function (n) {
+          var v = vims[n], st = (r.registered || []).indexOf(n) >= 0 ? 'ok' : ((r.unverified || []).indexOf(n) >= 0 ? '' : 'warn');
+          var b = []; if (v.lifted) b.push('matches ' + v.lifted.matched + ', depth-consistent ' + v.lifted.kept + (v.lifted.inliers != null ? ', PnP inliers ' + v.lifted.inliers : ''));
+          if (v.support != null) b.push('support ' + v.support);
+          return h('div', { style: 'margin:2px 0' }, [h('span', { class: 'tag ' + st, text: n.replace(/\.(jpg|JPG|png|jpeg)$/, '') + (st === '' ? ' (unverified)' : '') }), ' ', h('span', { text: v.why || '' }), h('span', { class: 'muted mono', style: 'font-size:11px', text: b.length ? ' · ' + b.join(' · ') : '' })]);
+        });
+        row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['VLM place', h('small', { text: (r.group || []).length + ' leftover images' })]),
+          h('div', { class: 'body' }, [h('div', {}, [r.result ? r.result : ('the VLM picked ' + (r.picks || []).length + ' placed photos showing ' + (r.shared || 'the same structures') + '; +' + (r.registered || []).length + ' match-confirmed, +' + (r.unverified || []).length + ' unverified')]),
+            r.layout ? h('div', { class: 'says', style: 'font-size:13px;margin:4px 0', text: 'layout check: ' + r.layout.answer + (r.layout.confidence != null ? ' (' + r.layout.confidence + ')' : '') + ' · ' + (r.layout.reason || '') }) : null].concat(vitems))]);
       } else if (r.kind === 'split') {
         row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Split', h('small', { text: 'covisibility' })]),
           h('div', { class: 'body' }, [(r.scenes || []).length + ' scene' + ((r.scenes || []).length === 1 ? '' : 's') + ' of ' + JSON.stringify(r.scenes || []) + ' images · ' + (r.unassigned || 0) + ' unassigned · ' + (r.cuts || []).map(function (c) { return 'cut ' + JSON.stringify(c.sizes) + ' conductance ' + c.conductance + ': ' + c.decision; }).join(' · ')])]);

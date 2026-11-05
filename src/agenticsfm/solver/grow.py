@@ -99,6 +99,17 @@ class GrowConfig:
     ff_settle_support: bool = True   # settle feedforward-PnP disagreements with the match support of each pose
     ff_agree_focal: bool = True  # Pi3X and PnP agree only if PnP's own focal estimate is within ff_focal_ratio of Pi3X's
     ff_focal_ratio: float = 1.25
+    ff_rotation: bool = True     # attach an image to a registered co-located partner (shared centre, rotation from the homography)
+    rot_min_hfrac: float = 0.6   # ... the homography must fit this share of the pair's matches (undistorted coordinates)
+    rot_max_fratio: float = 1.1  # ... its two focal estimates agree within this ratio
+    rot_max_ortho: float = 0.1   # ... and the factored matrix is this close to a rotation
+    ff_vlm_place: bool = True    # after everything else: the VLM finds placed photos that share structures with each leftover group,
+                                 # Pi3X places the group with them; poses confirmed by depth-filtered matches register normally,
+                                 # the rest only on a plausible top-down layout check, unverified (no points, no bundle adjustment)
+    vlm_place_groups: int = 6    # at most this many leftover groups
+    vlm_place_refs: int = 16     # reference photos shown to the VLM
+    lift_thr: float = 0.05       # a match is kept when its two 3D points (model, lifted through Pi3X depth) agree within this share of the scene scale
+    vlm_place_unverified: bool = True  # register layout-checked poses without match confirmation (flagged)
     ff_sweep: bool = True        # after the final global refinement, retry every unregistered image once more
     ff_agree_deg: float = 10.0   # a feedforward placement and the independent PnP pose agree within this rotation ...
     ff_agree_frac: float = 0.05  # ... and this fraction of the scene span
@@ -179,6 +190,8 @@ class Solver:
         self._scale_cache: tuple[int, float] = (-1, 1.0)
         self.rng = np.random.default_rng(0)
         self._sweeping = False
+        self.unverified: set[int] = set()
+        self._rotfit: dict[tuple[int, int], dict[str, Any] | None] = {}
         self._last_corr = 0
         self.tries = {i: 0 for i in self.names}
         self.hard_tried = {i: 0 for i in self.names}
@@ -973,6 +986,63 @@ class Solver:
             else:
                 fr.reset_pose()
 
+    def rotation_fit(self, i: int, j: int) -> dict[str, Any] | None:
+        """Is image i taken from image j's centre (pure rotation)? A homography between the two images' undistorted,
+        normalised coordinates on the pair's verified matches factors as diag(a, a, 1) R for a rotation (a: i's focal
+        over its current focal); a plane-induced homography does not. Offline on GT (log step 5): no false positive in
+        2,000 distant pairs, rotation within about 1 degree. Cached per ordered pair."""
+        import cv2
+        if (i, j) in self._rotfit:
+            return self._rotfit[(i, j)]
+        a, b = (i, j) if i < j else (j, i)
+        m = self.pairs.get((a, b))
+        out = None
+        if m is not None and len(m) >= self.gc.strong_pair:
+            mi, mj = (m[:, 0], m[:, 1]) if a == i else (m[:, 1], m[:, 0])
+            cam_i = self.rec.cameras[self.rec.images[i].camera_id]
+            cam_j = self.rec.cameras[self.rec.images[j].camera_id]
+            xi = np.asarray(cam_i.cam_from_img(self.kp(i)[mi]), dtype=np.float64)
+            xj = np.asarray(cam_j.cam_from_img(self.kp(j)[mj]), dtype=np.float64)
+            fi = cam_i.mean_focal_length()
+            H, mask = cv2.findHomography(xj, xi, cv2.RANSAC, self.gc.epipolar_px / max(fi, 1e-9))
+            if H is not None and mask is not None:
+                sc = np.linalg.norm(H[2])
+                f1, f2 = np.linalg.norm(H[0]) / sc, np.linalg.norm(H[1]) / sc
+                af = 0.5 * (f1 + f2)
+                Rraw = np.stack([H[0] / (af * sc), H[1] / (af * sc), H[2] / sc])
+                if np.linalg.det(Rraw) < 0:
+                    Rraw = -Rraw
+                U, _, Vt = np.linalg.svd(Rraw)
+                out = {"R": U @ Vt, "f": float(af * fi), "h_frac": float(mask.mean()),
+                       "f_ratio": float(max(f1, f2) / max(min(f1, f2), 1e-12)), "ortho": float(np.abs(Rraw @ Rraw.T - np.eye(3)).max())}
+        self._rotfit[(i, j)] = out
+        return out
+
+    def rotation_attach(self, i: int) -> dict[str, Any] | None:
+        """Candidate pose of unregistered i from its most-matched registered co-located partner: the partner's centre,
+        the rotation from the pair's homography, and (for an unshared camera) the focal from it. The caller accepts it
+        only on match support."""
+        reg = self.reg()
+        for j, n in sorted(self.W.get(i, {}).items(), key=lambda x: -x[1]):
+            if j not in reg or n < self.gc.strong_pair:
+                continue
+            fit = self.rotation_fit(i, j)
+            if not fit or fit["h_frac"] < self.gc.rot_min_hfrac or fit["f_ratio"] > self.gc.rot_max_fratio or fit["ortho"] > self.gc.rot_max_ortho:
+                continue
+            Rj = self.rec.images[j].cam_from_world().rotation.matrix()
+            cj = self.rec.images[j].projection_center()
+            Ri = fit["R"] @ Rj
+            params = None
+            if not self.camera_shared(i):
+                cam = self.rec.camera(self.rec.images[i].camera_id)
+                params = np.array(cam.params, dtype=float)
+                params[0] = fit["f"]
+                if cam.model.name in ("PINHOLE", "OPENCV", "FULL_OPENCV", "OPENCV_FISHEYE"):
+                    params[1] = fit["f"]
+            return {"R": Ri, "t": -Ri @ cj, "params": params, "partner": self.names[j], "h_frac": round(fit["h_frac"], 3),
+                    "f_ratio": round(fit["f_ratio"], 3), "ortho": round(fit["ortho"], 3), "focal": round(fit["f"], 1)}
+        return None
+
     def ff_round(self, k: int) -> dict[str, Any] | None:
         """One round of the feedforward loop: pick the round's images, place them with the feedforward model next to
         anchors from the model, check each placement against an independent PnP pose (and render-and-compare where the
@@ -1097,6 +1167,13 @@ class Solver:
                     why = f"anchors did not align; PnP, render {jp['verdict']}"
             else:
                 why = "no placement"
+            if choice is None and self.gc.ff_rotation:
+                ra = self.rotation_attach(i)
+                if ra is not None:
+                    sr = self.support_pose(i, ra["R"], ra["t"], ra["params"])
+                    info["rotation"] = {kk: ra[kk] for kk in ("partner", "h_frac", "f_ratio", "ortho", "focal")} | {"support": rnd(sr)}
+                    if sup_ok(sr):
+                        choice, why = (ra["R"], ra["t"], ra["params"], None), f"rotation from co-located {Path(ra['partner']).stem}; matches support it"
             info["why"] = why
             if choice is not None:
                 accepted[i] = (*choice, why)
@@ -1603,6 +1680,219 @@ class Solver:
             self.global_refine(final=True)
         return k
 
+    def lifted_pnp(self, i: int, anchors: list[int], z, row: int, al: dict[str, Any], f: float | None) -> dict[str, Any] | None:
+        """PnP on the matches between i and the anchors' model points that the feedforward depth confirms: i's keypoint,
+        lifted through its Pi3X depth into the model frame, must land within lift_thr of the model point it is matched
+        to (lookalike matches on repeated structure do not). Pose from those with the Pi3X focal as the start."""
+        import pycolmap
+        depth = z["depth"][row].astype(np.float32); conf = z["conf"][row].astype(np.float32)
+        K = z["K"][row]; E = z["E"][row]; sx, sy, ox, oy = z["transforms"][row]
+        H, W = depth.shape
+        Rinv, c = E[:, :3].T, -E[:, :3].T @ E[:, 3]
+        kp_i = self.kp(i)
+        uv, X = [], []
+        for j in anchors:
+            if j not in self.reg():
+                continue
+            a, b = (i, j) if i < j else (j, i)
+            m = self.pairs.get((a, b))
+            if m is None:
+                continue
+            idx_i, idx_j = (m[:, 0], m[:, 1]) if i < j else (m[:, 1], m[:, 0])
+            p2s = self.rec.images[j].points2D
+            for ii, jj in zip(idx_i, idx_j):
+                p2 = p2s[int(jj)]
+                if p2.has_point3D():
+                    uv.append(kp_i[int(ii)]); X.append(self.rec.points3D[p2.point3D_id].xyz)
+        if len(uv) < 30:
+            return {"matched": len(uv), "kept": 0}
+        uv = np.asarray(uv, dtype=np.float64); X = np.asarray(X, dtype=np.float64)
+        mu, mv = uv[:, 0] * sx + ox, uv[:, 1] * sy + oy
+        iu, iv = np.clip(np.round(mu).astype(int), 0, W - 1), np.clip(np.round(mv).astype(int), 0, H - 1)
+        d = depth[iv, iu]; ok = (d > 0) & (conf[iv, iu] >= 0.1)
+        xc = np.stack([(mu - K[0, 2]) / K[0, 0] * d, (mv - K[1, 2]) / K[1, 1] * d, d], 1)
+        Y = al["s"] * ((xc @ Rinv.T + c) @ al["R"].T) + al["t"]
+        keep = ok & (np.linalg.norm(Y - X, axis=1) < self.gc.lift_thr * max(self.scene_scale(), 1e-9))
+        out = {"matched": len(uv), "kept": int(keep.sum())}
+        if keep.sum() < 30:
+            return out
+        cam = self.rec.cameras[self.rec.images[i].camera_id]
+        shared = self.camera_shared(i)
+        d_ = cam.todict()
+        if f and not shared:
+            p = np.array(d_["params"], dtype=float); p[0] = f
+            if cam.model.name in ("PINHOLE", "OPENCV", "FULL_OPENCV", "OPENCV_FISHEYE"):
+                p[1] = f
+            d_["params"] = p
+        test = pycolmap.Camera(d_)
+        eo = pycolmap.AbsolutePoseEstimationOptions(); eo.ransac.max_error = 12.0; eo.estimate_focal_length = False
+        ro = pycolmap.AbsolutePoseRefinementOptions(); ro.refine_focal_length = not shared; ro.refine_extra_params = False
+        res = pycolmap.estimate_and_refine_absolute_pose(uv[keep], X[keep], test, eo, ro)
+        if not res:
+            return out
+        ninl = int(np.sum(res["inlier_mask"]))
+        out["inliers"] = ninl
+        if ninl < 30 or ninl < 0.5 * keep.sum():
+            return out
+        P = res["cam_from_world"]
+        out.update({"R": P.rotation.matrix(), "t": P.translation, "params": None if shared else np.array(test.params, dtype=float)})
+        return out
+
+    def layout_figure(self, path: Path, refs: list[int], group: list[int], poses: dict[int, tuple[np.ndarray, np.ndarray]]) -> str:
+        """Top-down map in the model's gravity frame: points (grey), all placed cameras (small dots), the reference
+        photos (blue numbered arrows) and the proposed group poses (red numbered arrows)."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from agenticsfm.tools.frame import Frame, cameras_of
+        fr = Frame.build(cameras_of(self.rec))
+        pts = np.array([p.xyz for p in self.rec.points3D.values()]) if self.rec.num_points3D() else np.zeros((0, 3))
+        if len(pts) > 30000:
+            pts = pts[self.rng.choice(len(pts), 30000, replace=False)]
+        P = fr.apply(pts) if len(pts) else pts
+        fig, ax = plt.subplots(figsize=(9, 9), dpi=110)
+        if len(P):
+            lo, hi = np.percentile(P[:, :2], 1, axis=0), np.percentile(P[:, :2], 99, axis=0)
+            P = P[np.all((P[:, :2] >= lo - 0.2 * (hi - lo)) & (P[:, :2] <= hi + 0.2 * (hi - lo)), axis=1)]
+            ax.scatter(P[:, 0], P[:, 1], s=0.3, c="0.6", alpha=0.5, linewidths=0)
+        C = np.array([fr.apply(self.rec.images[j].projection_center()[None])[0] for j in self.reg()])
+        ax.scatter(C[:, 0], C[:, 1], s=6, c="0.25")
+        span = np.ptp(np.r_[C[:, :2], P[:, :2]] if len(P) else C[:, :2], axis=0).max() or 1.0
+        L = 0.06 * span
+
+        def arrow(cw, R, color, label):
+            c2 = fr.apply(cw[None])[0]
+            d = fr.apply_dir(R)[2]
+            v = d[:2] / max(np.linalg.norm(d[:2]), 1e-9)
+            ax.annotate("", xy=(c2[0] + L * v[0], c2[1] + L * v[1]), xytext=(c2[0], c2[1]), arrowprops=dict(arrowstyle="-|>", color=color, lw=2.2))
+            ax.text(c2[0] - 0.35 * L * v[0], c2[1] - 0.35 * L * v[1], label, color=color, fontsize=13, fontweight="bold", ha="center", va="center")
+
+        for a, j in enumerate(refs):
+            im = self.rec.images[j]
+            arrow(im.projection_center(), im.cam_from_world().rotation.matrix(), "#1f5fd6", str(a + 1))
+        for a, i in enumerate(group):
+            if i in poses:
+                R, t = poses[i]
+                arrow(-R.T @ t, R, "#d62728", str(a + 1))
+        ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title("top view: grey = 3D points, dots = placed photos, blue = reference photos, red = proposed")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, bbox_inches="tight"); plt.close(fig)
+        return str(path)
+
+    def vlm_place(self, k: int, exclude: set[int]) -> int:
+        """The last step for leftover images (Phase 3). Per leftover group (connected by strong matches):
+        - the VLM picks placed photos that show the same structures (possibly from another side);
+        - Pi3X runs on the group with those photos (plus the most matched ones) as anchors, aligned on points;
+        - each image's matches are filtered by the Pi3X depth (lifted 3D must land on the model point) and PnP runs on
+          the survivors: a supported pose registers normally;
+        - otherwise the whole group's Pi3X poses go to a top-down layout check; if the VLM finds them plausible they are
+          registered unverified: no triangulation, no bundle adjustment (they are placed after the last refinement)."""
+        left = [i for i in self.names if i not in self.reg() and i not in exclude and self.link_of(i)[0] > 0]
+        groups = [g for g in self.components(left)][: self.gc.vlm_place_groups]
+        if not groups:
+            return k
+        nan = lambda v: v != v  # noqa: E731
+        confirmed: dict[int, tuple] = {}
+        unverified: dict[int, tuple] = {}
+        for G in groups:
+            k += 1
+            G = sorted(G, key=lambda i: -sum(n for j, n in self.W.get(i, {}).items() if j in G))[:8]
+            names = lambda L: [self.names[x] for x in L]  # noqa: E731
+            reg = self.reg()
+            mw: dict[int, int] = {}
+            for i in G:
+                for j, n in self.W.get(i, {}).items():
+                    if j in reg:
+                        mw[j] = mw.get(j, 0) + n
+            top = sorted(mw, key=mw.get, reverse=True)[:6]
+            others = [j for j in reg if j not in top and self.rec.images[j].num_points3D >= 50] or [j for j in reg if j not in top]
+            refs = list(dict.fromkeys(top + self.fps(others, max(0, self.gc.vlm_place_refs - len(top)), top or list(reg)[:1])))
+            sd = self.workdir / "vlm_place"
+            gsheet = self.advisor.sheet(names(G), sd / f"g{k}_group.jpg", labels=[str(a + 1) for a in range(len(G))])
+            rsheet = self.advisor.sheet(names(refs), sd / f"g{k}_refs.jpg", labels=[str(a + 1) for a in range(len(refs))])
+            picks_idx, ans = self.advisor.overlap_pick(gsheet, rsheet, len(refs), {"round": k, "group": names(G)})
+            picks = [refs[a] for a in picks_idx]
+            row: dict[str, Any] = {"round": k, "kind": "vlm_place", "group": names(G), "picks": names(picks),
+                                   "shared": ans.get("shared") if isinstance(ans, dict) else None, "images": {}, "registered": [], "unverified": []}
+            if not picks:
+                row["result"] = "the VLM found no placed photo showing the same structures"
+                self.log.append(row); continue
+            A = list(dict.fromkeys(picks + top))[:8]
+            g = self.ff_groups([names(A) + names(G)], f"vlmplace{k}", save_depth=True)[0]
+            ff = {n: {"E": np.asarray(E, dtype=np.float64), "f": 0.5 * (K_[0][0] / tr[0] + K_[1][1] / tr[1])}
+                  for n, E, K_, tr in zip(g["names"], g["extrinsics"], g["intrinsics"], g["transforms"])}
+            al = self.align_points(g["depth_path"], A) if g.get("depth_path") else None
+            if not (al and al.get("ok")):
+                al = self.align_rot(ff, A)
+                if not (al and al.get("ok")):
+                    al = self.align(ff, A)
+            row["anchors"] = names(A)
+            row["align"] = None if al is None else {kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in al.items() if kk in ("ok", "resid", "used", "by", "point_inl", "rot_dev")}
+            if not (al and al.get("ok")):
+                row["result"] = "Pi3X did not align to the model with these anchors"
+                self.log.append(row); continue
+            z = np.load(g["depth_path"])
+            zidx = {str(n): r for r, n in enumerate(z["names"])}
+            poses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+            pending = []
+            for i in G:
+                n = self.names[i]
+                Rf, tf = self.transform_pose(ff[n]["E"], al)
+                poses[i] = (Rf, tf)
+                info: dict[str, Any] = {"ff_focal": round(ff[n]["f"], 1)}
+                lp = self.lifted_pnp(i, A, z, zidx[n], al, ff[n]["f"]) if n in zidx else None
+                if lp:
+                    info["lifted"] = {kk: lp[kk] for kk in ("matched", "kept", "inliers") if kk in lp}
+                if lp and "R" in lp:
+                    sp = self.support_pose(i, lp["R"], lp["t"], lp["params"])
+                    info["support"] = None if nan(sp) else round(float(sp), 3)
+                    if not nan(sp) and sp >= self.gc.min_support:
+                        confirmed[i] = (lp["R"], lp["t"], lp["params"], None)
+                        info["why"] = "depth-filtered matches give a supported PnP pose"
+                        row["images"][n] = info
+                        continue
+                pending.append(i)
+                info["why"] = "no match-confirmed pose; layout check"
+                row["images"][n] = info
+            if pending and self.gc.vlm_place_unverified:
+                fig = self.layout_figure(sd / f"g{k}_map.png", picks, G, poses)
+                lc = self.advisor.layout_check(fig, gsheet, self.advisor.sheet(names(picks), sd / f"g{k}_picks.jpg", labels=[str(a + 1) for a in range(len(picks))]),
+                                               {"round": k, "group": names(G), "pending": names(pending)})
+                row["layout"] = {kk: lc.get(kk) for kk in ("answer", "confidence", "reason")}
+                ok = str(lc.get("answer", "")).lower() == "plausible" and float(lc.get("confidence") or 0) >= 0.6
+                for i in pending:
+                    row["images"][self.names[i]]["why"] = "layout plausible; registered unverified" if ok else f"layout {lc.get('answer')}; left out"
+                    if ok:
+                        f_ = ff[self.names[i]]["f"]
+                        unverified[i] = (poses[i][0], poses[i][1], None if self.camera_shared(i) else f_)
+            self.log.append(row)
+        # match-confirmed poses join like any other image; then one refinement; unverified ones only after it
+        if confirmed:
+            for i, (R, t, params, _) in confirmed.items():
+                self.set_pose(i, np.c_[R, t])
+                if params is not None:
+                    self.rec.cameras[self.rec.images[i].camera_id].params = params
+                self.rec.register_frame(self.rec.images[i].frame_id)
+                self.status[i] = "placed"
+            self.attach_mapper()
+            for i in confirmed:
+                self.mapper.triangulate_image(self.tri, i)
+            self.global_refine(final=True)
+        for i, (R, t, f) in unverified.items():
+            if i in self.reg():
+                continue
+            self.set_pose(i, np.c_[R, t], f)
+            self.rec.register_frame(self.rec.images[i].frame_id)
+            self.unverified.add(i)
+            self.status[i] = "placed_unverified"
+        for r in self.log[::-1]:
+            if r.get("kind") == "vlm_place":
+                r["registered"] = [n for n in r["group"] if self.ids[n] in confirmed and self.ids[n] in self.reg()]
+                r["unverified"] = [n for n in r["group"] if self.ids[n] in self.unverified]
+        self.say(f"vlm place: {len(groups)} groups; +{sum(1 for i in confirmed if i in self.reg())} match-confirmed, +{len(self.unverified)} unverified")
+        return k
+
     def components(self, nodes: list[int]) -> list[list[int]]:
         nodes_set, seen, comps = set(nodes), set(), []
         for s in nodes:
@@ -1684,16 +1974,20 @@ class Solver:
                     d.mkdir(parents=True, exist_ok=True)
                     sub.rec.write(str(d))
                     models_out.append(d)
-                    extra.append({"model": tag, **sub.model_stats(), "component": len(comp), "same_scene": verdict})
+                    extra.append({"model": tag, **sub.model_stats(), "component": len(comp), "same_scene": verdict,
+                                  "names": [sub.names[i] for i in sub.reg()]})
                 else:
                     self.global_refine(final=True)
+        if self.gc.loop == "ff" and self.gc.ff_vlm_place and self.advisor is not None and self.advisor.enabled:
+            kept_elsewhere = {self.ids[n] for e in extra for n in e.get("names", []) if n in self.ids}
+            self.rounds = self.vlm_place(self.rounds, kept_elsewhere)
         out_dir.mkdir(parents=True, exist_ok=True)
         self.rec.write(str(out_dir))
         reg = self.reg()
         for i in self.names:
             if i in reg:
                 self.status[i] = "placed"
-            elif self.status[i] == "placed":
+            elif self.status[i] in ("placed", "placed_unverified"):
                 self.status[i] = "filtered"
         unplaced = [self.names[i] for i in self.names if i not in reg]
         hard_rows = [r for r in self.log if r.get("kind") == "hard" and "model" not in r]
@@ -1702,7 +1996,7 @@ class Solver:
                             "kept": len(seed_info["attempts"][seed_info["chosen"]]["kept"]), "size": self.gc.seed_size},
                    "rounds": self.rounds, "hard_rounds": len(hard_rows), "hard_placed": sum(len(r.get("registered", [])) for r in hard_rows),
                    "audit": next(({"verdicts": r["verdicts"], "dropped": r["dropped"]} for r in self.log if r.get("kind") == "audit" and "model" not in r), None),
-                   "held": len(self.held), "rejected_total": sum(len(r.get("rejected", {})) for r in self.log if r.get("kind") == "pnp"),
+                   "held": len(self.held), "unverified": [self.names[i] for i in self.unverified if i in reg], "rejected_total": sum(len(r.get("rejected", {})) for r in self.log if r.get("kind") == "pnp"),
                    "pnp_failed_total": sum(len(r.get("pnp_failed", [])) for r in self.log if r.get("kind") == "pnp"),
                    "extra_models": extra, "num_models": len(models_out),
                    "unplaced": unplaced[:30] + ([f"... {len(unplaced)} in all"] if len(unplaced) > 30 else []),
