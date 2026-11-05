@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from dataclasses import replace
 from agenticsfm.solver.grow import GrowConfig, Solver
 from agenticsfm.tools import ToolResult, cached_result, finish, register
 from agenticsfm.tools.reconstruct import model_summary
@@ -35,6 +36,9 @@ PARAMS = {
         "support_norm": {"type": "boolean", "default": True, "description": "pair consistency relative to the pair's own best two-view fit"},
         "loop": {"type": "string", "enum": ["ff", "pnp"], "default": "ff", "description": "ff: feedforward placement every round, checked by PnP; pnp: PnP rounds"},
         "select": {"type": "string", "enum": ["graph", "vlm"], "default": "graph", "description": "who picks each round's images"},
+        "ff_off": {"type": "string", "default": "", "description": "ff-loop features to switch off (ablations), comma separated: "
+                   "evidence (inliers in the VLM selection prompt), fill (fill VLM picks up to the round size), points (point-based alignment), "
+                   "settle (match support settles disagreements), sweep (final retry of unregistered images), anchors (matched anchors only)"},
         "scores_id": {"type": "string", "description": "FlexGlue covisibility scores of the database: the images are split into scenes first, "
                                                        "so feedforward calls never mix scenes; each scene gets its own solver run"},
     },
@@ -47,14 +51,15 @@ PARAMS = {
                         "against the matches and dropped when they disagree. Returns per-model statistics and the growth log.", PARAMS)
 def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str = "pi3x", seed_size: int = 12, group_size: int = 8,
                min_support: float = 0.5, hard: bool = True, vlm: str = "decide", multi_model: bool = True, scores_id: str | None = None,
-               support_pairs: int = 1000, support_norm: bool = True, loop: str = "ff", select: str = "graph") -> ToolResult:
+               support_pairs: int = 1000, support_norm: bool = True, loop: str = "ff", select: str = "graph", ff_off: str = "") -> ToolResult:
     from agenticsfm.solver.scenes import split_scenes
     from agenticsfm.tools.score_pairs import load_scores
 
     started = time.time()
     params = {"feedforward": feedforward, "seed_size": int(seed_size), "group_size": int(group_size),
-              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 17,
-              "support_pairs": int(support_pairs), "support_norm": bool(support_norm), "loop": loop, "select": select}
+              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 19,
+              "support_pairs": int(support_pairs), "support_norm": bool(support_norm), "loop": loop, "select": select,
+              "ff_off": ",".join(sorted(x for x in ff_off.split(",") if x.strip()))}
     inputs = {"db": db_id, **({"scores": scores_id} if scores_id else {})}
     id = ws.artifact_id("grow_model", params, inputs)
     if (r := cached_result(ws, id)) is not None:
@@ -65,6 +70,13 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
     gc = GrowConfig(feedforward=feedforward, seed_size=int(seed_size), group_size=int(group_size), min_support=float(min_support), hard=bool(hard),
                     vlm=vlm, multi_model=bool(multi_model), support_pairs=int(support_pairs),
                     support_norm=bool(support_norm), loop=loop, select=select)
+    off = {x.strip() for x in ff_off.split(",") if x.strip()}
+    unknown = off - {"evidence", "fill", "points", "settle", "sweep", "anchors"}
+    if unknown:
+        raise ValueError(f"unknown ff_off features: {sorted(unknown)}")
+    gc = replace(gc, select_evidence="evidence" not in off, select_fill="fill" not in off, ff_align_points="points" not in off,
+                 ff_settle_support="settle" not in off, ff_sweep="sweep" not in off,
+                 **({"ff_anchors_match": 6, "ff_anchors_diverse": 4} if "anchors" in off else {}))
     gpu = ws.gpus[0] if ws.gpus else None
     split = None
     scenes = [None]

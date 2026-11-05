@@ -420,13 +420,16 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
           if (v.agree_deg != null) bits.push('gap ' + v.agree_deg + '° rotation' + (v.agree_view_deg != null ? ' / ' + v.agree_view_deg + '° view' : ''));
           if (v.refined_agree_deg != null) bits.push('after refining ' + v.refined_agree_deg + '°' + (v.refined_agree_view_deg != null ? ' / ' + v.refined_agree_view_deg + '°' : ''));
           if (rtxt) bits.push('render: ' + rtxt);
+          if (v.support) bits.push('match support ' + Object.keys(v.support).filter(function (tg) { return tg !== 'align_good'; }).map(function (tg) { return (tg === 'ff' ? 'Pi3X' : 'PnP') + ' ' + (v.support[tg] == null ? '–' : v.support[tg]); }).join(', '));
           if (v.ba_drift_deg != null) bits.push('local BA moved it ' + v.ba_drift_deg + '°');
           return h('div', { style: 'margin:2px 0' }, [h('span', { class: 'tag ' + (ok ? 'ok' : 'warn'), text: n.replace(/\.(jpg|JPG|png|jpeg)$/, '') }), ' ', h('span', { text: v.why || '' }),
             h('span', { class: 'muted mono', style: 'font-size:11px', text: bits.length ? ' · ' + bits.join(' · ') : '' })]);
         });
-        var atxt = al.ok ? ('Pi3X aligned to the model on ' + al.used + ' anchors by ' + (al.by === 'rotations' ? 'rotations, then centres' : 'centres') + ' · residual ' + al.resid + (al.rot_dev != null ? ' · anchor rotation spread ' + al.rot_dev + '°' : '') + ((al.dropped || []).length ? ' · ' + al.dropped.length + ' anchors dropped' : ''))
+        var atxt = al.ok ? (al.by === 'points' ? ('Pi3X aligned to the model on ' + al.points + ' anchor points lifted through its depth · ' + Math.round(100 * al.point_inl) + '% fit')
+            : ('Pi3X aligned to the model on ' + al.used + ' anchors by ' + (al.by === 'rotations' ? 'rotations, then centres' : 'centres') + ' · residual ' + al.resid + (al.rot_dev != null ? ' · anchor rotation spread ' + al.rot_dev + '°' : '') + ((al.dropped || []).length ? ' · ' + al.dropped.length + ' anchors dropped' : '') + (r.align_points ? ' (point alignment: ' + Math.round(100 * (r.align_points.point_inl || 0)) + '% fit, not used)' : '')))
+          + (r.align_good === false ? ' · weak: Pi3X cannot veto PnP this round' : '')
           : ('Pi3X did not align to the model' + (al.why ? ': ' + al.why : '') + '; PnP only');
-        row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, ['Round ' + r.round, h('small', { text: 'Pi3X + ' + (r.anchors || []).length + ' anchors' + (r.model ? ' · ' + r.model : '') })]),
+        row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, [(r.sweep ? 'Sweep ' : 'Round ') + r.round, h('small', { text: 'Pi3X + ' + (r.anchors || []).length + ' anchors' + (r.model ? ' · ' + r.model : '') })]),
           h('div', { class: 'body' }, [h('div', {}, ['+' + freg.length + ' of ' + (r.batch || []).length + ' · ' + (r.deferred || []).length + ' deferred · chosen by ' + (sel.by === 'vlm' ? 'the VLM' : 'the match graph') + ' from ' + (sel.pool || r.candidates) + ' candidates · ' + r.num_registered + ' in model · ' + r.num_points + ' points · reproj ' + r.reproj]),
             h('div', { class: 'muted', style: 'font-size:12px;margin:2px 0' }, [atxt])].concat(fitems))]);
       } else if (r.kind === 'split') {

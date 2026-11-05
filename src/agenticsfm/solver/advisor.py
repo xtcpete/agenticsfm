@@ -182,15 +182,24 @@ class Advisor:
         canvas.save(out, quality=90)
         return str(out)
 
-    def select_next(self, model_sheet: str, cand_sheet: str, num: int, pick: int, context: dict[str, Any] | None = None) -> tuple[list[int], dict[str, Any]]:
-        """Which candidates should join the reconstruction next. Returns 0-based candidate indices (best first) and the answer."""
+    def select_next(self, model_sheet: str, cand_sheet: str, num: int, pick: int, context: dict[str, Any] | None = None,
+                    evidence: list[str] | None = None) -> tuple[list[int], dict[str, Any]]:
+        """Which candidates should join the reconstruction next. Returns 0-based candidate indices (best first) and the answer.
+        ``evidence``: one line per candidate (its feature matches to the reconstruction), shown with the question."""
         parts = [("Images already reconstructed (the part of the 3D model the candidates connect to):", [model_sheet]),
                  (f"Candidate images, numbered 1 to {num} (yellow labels):", [cand_sheet])]
-        q = (f"The reconstruction grows a few images at a time; each new image is placed next to the reconstructed images it overlaps. Pick up to {pick} "
-             "candidates to add next: images that clearly show part of the same place as the reconstructed images, with plenty of overlap, so their "
-             "placement will be reliable. Skip candidates that show a different place that only looks similar (a repeated facade, a twin building, "
-             "a different street), and candidates with little usable content (mostly sky, water, blur, or a featureless close-up); they are tried "
-             "later, when more of the model exists. Answer {\"pick\": [candidate numbers, best first], \"skip\": [{\"n\": number, \"why\": \"<a few words>\"}, ...]}")
+        ev = ""
+        if evidence:
+            ev = ("Feature matches between each candidate and the reconstructed images (verified inliers in total, and over how many "
+                  "reconstructed images). More matches usually mean a more reliable placement, but matches can also come from a "
+                  "repeated pattern on a different, similar-looking place:\n" + "\n".join(evidence) + "\n")
+        q = (f"The reconstruction grows a few images at a time; each new image is placed next to the reconstructed images it overlaps. "
+             + ev +
+             f"Pick up to {pick} candidates to add next: images that clearly show part of the same place as the reconstructed images, with plenty "
+             "of overlap, so their placement will be reliable. Prefer candidates with many matches; skip a candidate only when the photo shows a "
+             "different place that only looks similar (a repeated facade, a twin building, a different street), or has little usable content "
+             "(mostly sky, water, blur, or a featureless close-up). Skipped candidates are tried later, when more of the model exists. "
+             "Answer {\"pick\": [candidate numbers, best first], \"skip\": [{\"n\": number, \"why\": \"<a few words>\"}, ...]}")
         a = self.ask("select_next", parts, q, context, max_side=1440)
         out: list[int] = []
         if isinstance(a, dict) and isinstance(a.get("pick"), list):

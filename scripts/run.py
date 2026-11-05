@@ -52,7 +52,7 @@ def run_scene(args, cfg, run, scene, gpu, gt_dir):
                                        threshold=args.threshold, optimize=not args.no_optimize, seed_size=args.seed_size,
                                        group_size=args.group_size, min_support=args.min_support, hard=not args.no_hard, vlm=args.vlm, multi_model=not args.no_multi_model,
                                        support_pairs=args.support_pairs, support_norm=not args.raw_support,
-                                       loop=args.loop, select=args.select))
+                                       loop=args.loop, select=args.select, ff_off=args.ff_off))
         elif args.controller == "agent":
             from agenticsfm.agent import Agent
 
@@ -93,6 +93,7 @@ def main() -> None:
     parser.add_argument("--support-pairs", type=int, default=1000, help="incremental: match support from each image's strongest pairs only")
     parser.add_argument("--loop", default="ff", choices=["ff", "pnp"], help="incremental: feedforward placement every round (checked by PnP), or PnP rounds")
     parser.add_argument("--select", default="graph", choices=["graph", "vlm"], help="incremental: who picks each round's images")
+    parser.add_argument("--ff-off", default="", help="incremental ff loop: features to switch off, comma separated (evidence,fill,points,settle,sweep,anchors)")
     parser.add_argument("--raw-support", action="store_true", help="incremental: raw match support (fixed pixel threshold, not normalised by the pair's own best fit)")
     parser.add_argument("--no-hard", action="store_true", help="incremental: no feedforward placement of hard images")
     parser.add_argument("--vlm", default="decide", choices=["off", "log", "decide"], help="incremental: the VLM advisor mode")

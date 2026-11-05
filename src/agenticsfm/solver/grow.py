@@ -87,8 +87,19 @@ class GrowConfig:
     loop: str = "ff"             # ff: every round places its images with the feedforward model, checked against an independent PnP; pnp: COLMAP-style PnP rounds
     select: str = "graph"        # graph: the match-graph ranking picks each round's images; vlm: the VLM picks them from a pool of the top ranked
     select_pool: int = 3         # pool for the VLM selector: select_pool x group_size top-ranked candidates
-    ff_anchors_match: int = 6    # registered images most matched to the round's images, fed to the feedforward model with them ...
-    ff_anchors_diverse: int = 4  # ... plus farthest-point-sampled registered cameras, for a well-conditioned alignment
+    select_evidence: bool = True # show the VLM each candidate's match inliers to the model
+    select_fill: bool = True     # fill the round up to group_size with unskipped candidates in match order
+    ff_anchors_match: int = 8    # registered images most matched to the round's images, fed to the feedforward model with them ...
+    ff_anchors_diverse: int = 0  # ... plus farthest-point-sampled registered cameras (far anchors pulled in other altitudes on A08)
+    ff_anchors_min: int = 4      # fill up with farthest-point samples only when fewer matched anchors exist
+    ff_align_points: bool = True # align the feedforward frame on 3D points (anchor keypoints lifted through its depth), not centres
+    ff_points_min_inl: float = 0.3   # ... used when this share of the lifted points fits; otherwise centres + rotations
+    ff_points_thr: float = 0.02  # ... point inlier threshold, fraction of the scene scale
+    ff_good_rot_dev: float = 5.0 # a centres + rotations alignment counts as good when the anchors' rotations agree this well
+    ff_settle_support: bool = True   # settle feedforward-PnP disagreements with the match support of each pose
+    ff_agree_focal: bool = True  # Pi3X and PnP agree only if PnP's own focal estimate is within ff_focal_ratio of Pi3X's
+    ff_focal_ratio: float = 1.25
+    ff_sweep: bool = True        # after the final global refinement, retry every unregistered image once more
     ff_agree_deg: float = 10.0   # a feedforward placement and the independent PnP pose agree within this rotation ...
     ff_agree_frac: float = 0.05  # ... and this fraction of the scene span
     ff_global_growth: float = 1.25   # in the ff loop: global bundle adjustment after each 25% growth (local BA every round)
@@ -166,6 +177,8 @@ class Solver:
         self.kps: dict[int, np.ndarray] = {}
         self._best: dict[tuple[int, int], tuple[float, float]] = {}
         self._scale_cache: tuple[int, float] = (-1, 1.0)
+        self.rng = np.random.default_rng(0)
+        self._sweeping = False
         self._last_corr = 0
         self.tries = {i: 0 for i in self.names}
         self.hard_tried = {i: 0 for i in self.names}
@@ -733,7 +746,8 @@ class Solver:
         cam.params = before
         X0 = np.median(pts3d, axis=0) if len(pts3d) else -R.T @ t + R[2]
         return {"R": R, "t": t, "params": params, "inliers": ninl, "of": len(pts3d), "X0": X0, "start": "mapper",
-                "focal": round(float(np.mean(params[:1])), 1)}
+                "focal": round(float(np.mean(params[:1])), 1),
+                "focal_estimated": bool(abs(float(params[0]) - float(before[0])) > 0.01 * max(abs(float(before[0])), 1e-9))}
 
     def pnp_pose(self, i: int, f_alt: float | None = None) -> dict[str, Any] | None:
         r = self.mapper_pose(i)
@@ -860,8 +874,104 @@ class Solver:
                 if j in reg:
                     match_w[j] = match_w.get(j, 0) + n
         ms = sorted(match_w, key=match_w.get, reverse=True)[: self.gc.ff_anchors_match]
+        n_div = max(self.gc.ff_anchors_diverse, self.gc.ff_anchors_min - len(ms))
+        if n_div <= 0:
+            return ms
         good = [j for j in reg if self.rec.images[j].num_points3D >= 50 and j not in ms] or [j for j in reg if j not in ms]
-        return list(dict.fromkeys(ms + self.fps(good, self.gc.ff_anchors_diverse, ms or list(reg)[:1])))
+        return list(dict.fromkeys(ms + self.fps(good, n_div, ms or list(reg)[:1])))
+
+    def align_points(self, depth_path: str, anchors: list[int]) -> dict[str, Any] | None:
+        """Similarity from the feedforward frame to the model on 3D points: each anchor keypoint with a model point is
+        lifted through the feedforward depth (confidence >= 0.1) and paired with the model point; RANSAC on 4-point
+        similarities, threshold ``ff_points_thr`` of the scene scale, refit on the inliers."""
+        z = np.load(depth_path)
+        idx = {str(n): k for k, n in enumerate(z["names"])}
+        src, dst = [], []
+        for a in anchors:
+            n = self.names[a]
+            if n not in idx or a not in self.reg():
+                continue
+            k = idx[n]
+            depth = z["depth"][k].astype(np.float32); conf = z["conf"][k].astype(np.float32)
+            K = z["K"][k]; E = z["E"][k]; sx, sy, ox, oy = z["transforms"][k]
+            H, W = depth.shape
+            Rinv, c = E[:, :3].T, -E[:, :3].T @ E[:, 3]
+            im = self.rec.images[a]
+            uv, xyz = [], []
+            for p2 in im.points2D:
+                if p2.has_point3D():
+                    uv.append(p2.xy); xyz.append(self.rec.points3D[p2.point3D_id].xyz)
+            if not uv:
+                continue
+            uv = np.asarray(uv); xyz = np.asarray(xyz)
+            mu, mv = uv[:, 0] * sx + ox, uv[:, 1] * sy + oy
+            iu, iv = np.round(mu).astype(int), np.round(mv).astype(int)
+            ok = (iu >= 0) & (iu < W) & (iv >= 0) & (iv < H)
+            iu, iv, mu, mv, xyz = iu[ok], iv[ok], mu[ok], mv[ok], xyz[ok]
+            d = depth[iv, iu]; cf = conf[iv, iu]
+            ok = (d > 0) & (cf >= 0.1)
+            d, mu, mv, xyz = d[ok], mu[ok], mv[ok], xyz[ok]
+            xc = np.stack([(mu - K[0, 2]) / K[0, 0] * d, (mv - K[1, 2]) / K[1, 1] * d, d], 1)
+            src.append(xc @ Rinv.T + c); dst.append(xyz)
+        if not src:
+            return None
+        src, dst = np.concatenate(src), np.concatenate(dst)
+        if len(src) < 30:
+            return None
+        if len(src) > 20000:
+            sel = self.rng.choice(len(src), 20000, replace=False); src, dst = src[sel], dst[sel]
+        thr = self.gc.ff_points_thr * max(self.scene_scale(), 1e-9)
+        best = None
+        for _ in range(300):
+            pick = self.rng.choice(len(src), 4, replace=False)
+            try:
+                s_, R_, t_ = umeyama(src[pick], dst[pick])
+            except Exception:
+                continue
+            if not np.isfinite(s_) or s_ <= 0:
+                continue
+            inl = np.linalg.norm((s_ * (R_ @ src.T)).T + t_ - dst, axis=1) < thr
+            if best is None or inl.sum() > best.sum():
+                best = inl
+        if best is None or best.sum() < 10:
+            return None
+        s_, R_, t_ = umeyama(src[best], dst[best])
+        for _ in range(2):
+            inl = np.linalg.norm((s_ * (R_ @ src.T)).T + t_ - dst, axis=1) < thr
+            if inl.sum() < 10:
+                break
+            s_, R_, t_ = umeyama(src[inl], dst[inl])
+        frac = float(inl.mean())
+        return {"ok": frac >= self.gc.ff_points_min_inl, "s": s_, "R": R_, "t": t_, "resid": round(1 - frac, 4), "used": len(anchors),
+                "dropped": [], "by": "points", "points": int(len(src)), "point_inl": round(frac, 3)}
+
+    def support_pose(self, i: int, R: np.ndarray, t: np.ndarray, params: np.ndarray | None = None) -> float:
+        """Match support (as for PnP growth) of a candidate pose of an unregistered image, without registering it:
+        the pose and intrinsics are set temporarily and restored. NaN when the image has no strong pair to the model."""
+        import pycolmap
+        im = self.rec.images[i]
+        fr = self.rec.frame(im.frame_id)
+        old_pose = fr.rig_from_world if fr.has_pose() else None
+        cam = self.rec.camera(im.camera_id)
+        old_params = np.array(cam.params, dtype=float)
+        try:
+            fr.rig_from_world = pycolmap.Rigid3d(pycolmap.Rotation3d(R), t)
+            if params is not None:
+                cam.params = params
+            reg = self.reg()
+            num = den = 0.0
+            strong = sorted(((n, j) for j, n in self.W.get(i, {}).items() if n >= self.gc.strong_pair and j in reg), reverse=True)
+            with self.timer("support"):
+                for n, j in strong[: self.gc.support_pairs]:
+                    num += n * self.pair_consistency(i, j)
+                    den += n
+            return num / den if den > 0 else float("nan")
+        finally:
+            cam.params = old_params
+            if old_pose is not None:
+                fr.rig_from_world = old_pose
+            else:
+                fr.reset_pose()
 
     def ff_round(self, k: int) -> dict[str, Any] | None:
         """One round of the feedforward loop: pick the round's images, place them with the feedforward model next to
@@ -874,7 +984,7 @@ class Solver:
         pool = cand[: gs * self.gc.select_pool]
         select_info: dict[str, Any] = {"by": "graph"}
         batch = pool[:gs]
-        if self.gc.select == "vlm" and self.advisor is not None and self.advisor.enabled and len(pool) > gs:
+        if self.gc.select == "vlm" and not self._sweeping and self.advisor is not None and self.advisor.enabled and len(pool) > gs:
             with self.timer("vlm_select"):
                 picks, select_info = self.vlm_select(k, pool, gs)
             if picks:
@@ -888,10 +998,22 @@ class Solver:
         g = self.ff_groups([names(A) + names(batch)], f"ff{k}", save_depth=True)[0]
         ff = {n: {"E": np.asarray(E, dtype=np.float64), "f": 0.5 * (K[0][0] / tr[0] + K[1][1] / tr[1])}
               for n, E, K, tr in zip(g["names"], g["extrinsics"], g["intrinsics"], g["transforms"])}
-        al = self.align_rot(ff, A)
-        if not (al and al.get("ok")):
-            al = self.align(ff, A)
+        al, alp = None, None
+        if self.gc.ff_align_points and g.get("depth_path"):
+            with self.timer("align_points"):
+                alp = self.align_points(g["depth_path"], A)
+            if alp and alp.get("ok"):
+                al = alp
+        if al is None:
+            al = self.align_rot(ff, A)
+            if not (al and al.get("ok")):
+                al = self.align(ff, A)
         aligned = bool(al and al.get("ok"))
+        # a well-conditioned alignment: on points, or on rotations that agree; only then may the feedforward pose veto PnP
+        al_good = aligned and (al.get("by") == "points" or (al.get("by") == "rotations" and (al.get("rot_dev") if al.get("rot_dev") is not None else 99) <= self.gc.ff_good_rot_dev))
+        nan = lambda v: v != v  # noqa: E731
+        rnd = lambda v: None if nan(v) else round(float(v), 3)  # noqa: E731
+        sup_ok = lambda v: (not nan(v)) and v >= self.gc.min_support  # noqa: E731
         per: dict[str, dict[str, Any]] = {}
         accepted: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray | None, float | None, str]] = {}
         for i in batch:
@@ -911,15 +1033,33 @@ class Solver:
             if prior is not None and pnp is not None:
                 ang, dist = self.view_gap(pnp["R"], pnp["t"], prior[0], prior[1], pnp["X0"])
                 info.update({"agree_deg": round(ang, 1), "agree_view_deg": round(dist, 1)})
-                if ang < self.gc.ff_agree_deg and dist < self.gc.ff_agree_deg:
+                # agreement includes the focal length when PnP estimated its own: a pose that matches in rotation with
+                # half the focal length is a weak PnP fit (BLH image 32: 39/328 inliers, f 2431 vs 4932, 12 deg off)
+                f_ok = True
+                if self.gc.ff_agree_focal and pnp.get("focal_estimated", True) and pnp.get("focal") and prior[2]:
+                    fr = float(pnp["focal"]) / float(prior[2])
+                    f_ok = 1 / self.gc.ff_focal_ratio <= fr <= self.gc.ff_focal_ratio
+                    if not f_ok:
+                        info["focal_disagree"] = round(fr, 2)
+                if f_ok and ang < self.gc.ff_agree_deg and dist < self.gc.ff_agree_deg:
                     choice, why = (pnp["R"], pnp["t"], pnp["params"], None), "feedforward and PnP agree"
                 else:
                     r = self.refine_pose_2d3d(i, prior[0], prior[1])
                     ang2, dist2 = self.view_gap(pnp["R"], pnp["t"], r["R"], r["t"], pnp["X0"])
                     info.update({"refined_agree_deg": round(ang2, 1), "refined_agree_view_deg": round(dist2, 1)})
-                    if ang2 < self.gc.ff_agree_deg and dist2 < self.gc.ff_agree_deg:
+                    if f_ok and ang2 < self.gc.ff_agree_deg and dist2 < self.gc.ff_agree_deg:
                         choice, why = (pnp["R"], pnp["t"], pnp["params"], None), "agree after refining the feedforward placement"
-                    else:
+                    elif self.gc.ff_settle_support:
+                        # settle with the raw matches: PnP wins when its pose fits the matches, unless a well-aligned
+                        # feedforward pose fits them too (a real conflict, left to render-and-compare)
+                        sp = self.support_pose(i, pnp["R"], pnp["t"], None if self.camera_shared(i) else pnp["params"])
+                        sf = self.support_pose(i, r["R"], r["t"], None)
+                        info["support"] = {"pnp": rnd(sp), "ff": rnd(sf), "align_good": al_good}
+                        if sup_ok(sp) and not (al_good and sup_ok(sf)):
+                            choice, why = (pnp["R"], pnp["t"], pnp["params"], None), "disagree; matches support PnP" + ("" if al_good else " (alignment weak)")
+                        elif sup_ok(sf) and not sup_ok(sp):
+                            choice, why = (r["R"], r["t"], None, None), "disagree; matches support feedforward"
+                    if choice is None and not (f_ok and ang2 < self.gc.ff_agree_deg and dist2 < self.gc.ff_agree_deg):
                         jp = self.judge_pose(i, pnp["R"], pnp["t"], "pnp")
                         jf = self.judge_pose(i, r["R"], r["t"], "ff")
                         info["render"] = {"pnp": {kk: jp.get(kk) for kk in ("score", "margin", "verdict")}, "ff": {kk: jf.get(kk) for kk in ("score", "margin", "verdict")}}
@@ -934,14 +1074,24 @@ class Solver:
                 r = self.refine_pose_2d3d(i, prior[0], prior[1])
                 jf = self.judge_pose(i, r["R"], r["t"], "ff")
                 info["render"] = {"ff": {kk: jf.get(kk) for kk in ("score", "margin", "verdict")}}
+                sf = self.support_pose(i, r["R"], r["t"], None) if self.gc.ff_settle_support else float("nan")
+                if self.gc.ff_settle_support:
+                    info["support"] = {"ff": rnd(sf)}
                 if jf["verdict"] == "consistent" and r.get("inliers", 0) >= 15:
                     choice, why = (r["R"], r["t"], None, None), "no PnP; feedforward placement, render consistent"
+                elif sup_ok(sf) and r.get("inliers", 0) >= 15:
+                    choice, why = (r["R"], r["t"], None, None), "no PnP; feedforward placement, matches support it"
                 else:
                     why = f"no PnP; feedforward placement, render {jf['verdict']}"
             elif pnp is not None:
                 jp = self.judge_pose(i, pnp["R"], pnp["t"], "pnp")
                 info["render"] = {"pnp": {kk: jp.get(kk) for kk in ("score", "margin", "verdict")}}
-                if jp["verdict"] == "consistent":
+                sp = self.support_pose(i, pnp["R"], pnp["t"], None if self.camera_shared(i) else pnp["params"]) if self.gc.ff_settle_support else float("nan")
+                if self.gc.ff_settle_support:
+                    info["support"] = {"pnp": rnd(sp)}
+                if sup_ok(sp):
+                    choice, why = (pnp["R"], pnp["t"], pnp["params"], None), "anchors did not align; matches support PnP"
+                elif jp["verdict"] == "consistent":
                     choice, why = (pnp["R"], pnp["t"], pnp["params"], None), "anchors did not align; PnP, render consistent"
                 else:
                     why = f"anchors did not align; PnP, render {jp['verdict']}"
@@ -979,7 +1129,8 @@ class Solver:
         if self.rec.num_reg_images() >= self.gc.ff_global_growth * max(self.last_global, 1):
             self.global_refine()
         row = {"round": k, "kind": "ff", "candidates": len(cand), "select": select_info, "batch": names(batch), "anchors": names(A),
-               "align": None if al is None else {kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in al.items() if kk in ("ok", "resid", "used", "dropped", "rot_dev", "by")},
+               "align": None if al is None else {kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in al.items() if kk in ("ok", "resid", "used", "dropped", "rot_dev", "by", "points", "point_inl")},
+               "align_good": al_good, "align_points": None if alp is None or alp is al else {kk: alp.get(kk) for kk in ("ok", "points", "point_inl")},
                "images": per, "registered": names(placed), "deferred": [self.names[i] for i in batch if i not in placed], **self.model_stats()}
         whys: dict[str, int] = {}
         for v in per.values():
@@ -1000,12 +1151,30 @@ class Solver:
         sheet_dir = self.workdir / "select"
         model_sheet = self.advisor.sheet([self.names[j] for j in ctx_imgs], sheet_dir / f"round{k}_model.jpg", labels=None)
         cand_sheet = self.advisor.sheet([self.names[i] for i in pool], sheet_dir / f"round{k}_candidates.jpg", labels=[str(a + 1) for a in range(len(pool))])
-        links = {str(a + 1): self.link_of(i)[0] for a, i in enumerate(pool)}
+        lk = [self.link_of(i) for i in pool]
+        links = {str(a + 1): lk[a][0] for a in range(len(pool))}
+        evidence = [f"{a + 1}: {lk[a][0]} inliers over {lk[a][1]} images" for a in range(len(pool))] if self.gc.select_evidence else None
         picks_idx, answer = self.advisor.select_next(model_sheet, cand_sheet, len(pool), n,
-                                                     {"round": k, "registered": len(reg), "pool": [self.names[i] for i in pool], "match_inliers": links})
+                                                     {"round": k, "registered": len(reg), "pool": [self.names[i] for i in pool], "match_inliers": links},
+                                                     evidence=evidence)
         picks = [pool[a] for a in picks_idx if 0 <= a < len(pool)][:n]
-        return picks, {"by": "vlm", "pool": len(pool), "picked": [self.names[i] for i in picks],
-                       "graph_top": [self.names[i] for i in pool[:n]], "skipped": answer.get("skip") if isinstance(answer, dict) else None}
+        skipped = set()
+        if isinstance(answer, dict):
+            for sk in answer.get("skip") or []:
+                try:
+                    skipped.add(pool[int(sk["n"]) - 1])
+                except (TypeError, ValueError, KeyError, IndexError):
+                    pass
+        filled = []
+        if picks and self.gc.select_fill:
+            # the VLM vetoes; it does not shrink the round: fill up with the next unskipped candidates in match order
+            for i in pool:
+                if len(picks) + len(filled) >= n:
+                    break
+                if i not in picks and i not in skipped:
+                    filled.append(i)
+        return picks + filled, {"by": "vlm", "pool": len(pool), "picked": [self.names[i] for i in picks], "filled": [self.names[i] for i in filled],
+                                "graph_top": [self.names[i] for i in pool[:n]], "skipped": answer.get("skip") if isinstance(answer, dict) else None}
 
     def pose_neighbours(self, R: np.ndarray, t: np.ndarray, k: int = 4, exclude: set[int] = frozenset()) -> list[int]:
         return self.nearest_registered(-R.T @ t, R[2], k, exclude)
@@ -1397,6 +1566,9 @@ class Solver:
         for r in self.repair_fold(k):
             self.log.append(r)
         self.global_refine(final=True)
+        if self.gc.loop == "ff" and self.gc.ff_sweep:
+            k = self.sweep(k)
+            self.rounds = k
         if self.held or self.hard_placed:
             self.log.append({"round": k, "kind": "held", "images": self.rerefine_held()})
         if self.gc.audit:
@@ -1404,6 +1576,32 @@ class Solver:
             if row:
                 self.log.append(row)
         return seed_info
+
+    def sweep(self, k: int) -> int:
+        """After the final global refinement the model is at its largest and most accurate: every unregistered image
+        gets one more attempt (match-ranked rounds, no VLM selection), until a round adds nothing; then refine again."""
+        before = self.rec.num_reg_images()
+        for i in self.names:
+            if i not in self.reg():
+                self.tries[i] = min(self.tries[i], self.gc.max_tries - 1)
+        self._sweeping = True
+        try:
+            while k < self.gc.max_rounds:
+                k += 1
+                row = self.ff_round(k)
+                if row is None:
+                    break
+                row["sweep"] = True
+                self.log.append(row)
+                if not row.get("registered"):
+                    break
+        finally:
+            self._sweeping = False
+        added = self.rec.num_reg_images() - before
+        self.say(f"sweep: +{added} -> {self.rec.num_reg_images()}/{len(self.names)} registered")
+        if added:
+            self.global_refine(final=True)
+        return k
 
     def components(self, nodes: list[int]) -> list[list[int]]:
         nodes_set, seen, comps = set(nodes), set(), []
