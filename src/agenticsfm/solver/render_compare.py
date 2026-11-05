@@ -18,8 +18,9 @@ PERTURB = (("yaw5", 5.0, 0.0), ("yaw15", 15.0, 0.0), ("shift5", 0.0, 0.05), ("sh
 
 
 class RenderCompare:
-    def __init__(self, rec, images_dir: Path):
+    def __init__(self, rec, images_dir: Path, min_conf: float = 0.0):
         self.rec = rec
+        self.min_conf = min_conf   # feedforward depth below this confidence is dropped (Pi3X: sky and far background)
         self.images_dir = images_dir
         self.gray_cache: dict[tuple[str, int], np.ndarray] = {}
         self.depth: dict[str, tuple[np.ndarray, np.ndarray]] = {}   # name -> (depth in model pixels, transform original -> model pixels)
@@ -67,7 +68,10 @@ class RenderCompare:
             n = str(n)
             if n in self.depth or not self.rec.find_image_with_name(n) or not self.image(n).has_pose:
                 continue
-            self.depth[n] = (z["depth"][k].astype(np.float32), z["transforms"][k])
+            d = z["depth"][k].astype(np.float32)
+            if self.min_conf > 0 and "conf" in z.files:
+                d = np.where(z["conf"][k].astype(np.float32) >= self.min_conf, d, 0.0).astype(np.float32)
+            self.depth[n] = (d, z["transforms"][k])
 
     def invalidate(self) -> None:
         """After a refinement or normalisation the model's scale changed: recompute depth scales on demand."""

@@ -112,6 +112,10 @@ class GrowConfig:
     vlm_place_unverified: bool = True  # register layout-checked poses without match confirmation (flagged)
     vlm_place_stable: bool = True      # ... only when Pi3X places the image the same way with two disjoint halves of the VLM's picks
     vlm_place_stable_deg: float = 5.0  # ... rotation within this, centre within ff_agree_frac of the scene scale
+    ff_coloc: bool = True        # co-location guard: Pi3X puts a candidate on a registered anchor's centre -> its pose must sit there
+    coloc_tau: float = 0.03      # Pi3X centres within this fraction of the group's camera spread = co-located (offline: precision 0.96)
+    coloc_eps: float = 0.10      # accepted centre farther than this x scene depth from the partner's = conflict (correct pairs <= 0.08)
+    rac_min_conf: float = 0.1    # render-and-compare ignores feedforward depth below this confidence (Pi3X sky); 0 = use all
     ff_sweep: bool = True        # after the final global refinement, retry every unregistered image once more
     ff_agree_deg: float = 10.0   # a feedforward placement and the independent PnP pose agree within this rotation ...
     ff_agree_frac: float = 0.05  # ... and this fraction of the scene span
@@ -210,7 +214,7 @@ class Solver:
         self.ff_seconds = 0.0
         self.log: list[dict[str, Any]] = []
         self.timer = Timer()
-        self.rac = RenderCompare(self.rec, ws.images_dir)
+        self.rac = RenderCompare(self.rec, ws.images_dir, min_conf=self.gc.rac_min_conf)
         if advisor is not None:
             self.advisor = advisor
             self.advisor.log = self.log
@@ -1045,6 +1049,76 @@ class Solver:
                     "f_ratio": round(fit["f_ratio"], 3), "ortho": round(fit["ortho"], 3), "focal": round(fit["f"], 1)}
         return None
 
+    def coloc_partners(self, ff: dict[str, dict[str, Any]], A: list[int], batch: list[int]) -> dict[int, tuple[int, float]]:
+        """Batch images that Pi3X puts on the centre of a registered anchor (same camera position, rotated view):
+        image -> (closest such anchor, centre gap / the group's camera spread)."""
+        names = [self.names[j] for j in A + batch if self.names[j] in ff]
+        if len(names) < 4:
+            return {}
+        C = {n: -ff[n]["E"][:, :3].T @ ff[n]["E"][:, 3] for n in names}
+        M = np.array(list(C.values()))
+        spread = float(np.median(np.linalg.norm(M - np.median(M, 0), axis=1)))
+        if spread <= 0:
+            return {}
+        reg = self.reg()
+        out = {}
+        for i in batch:
+            n = self.names[i]
+            if n not in C:
+                continue
+            best = min(((float(np.linalg.norm(C[n] - C[self.names[j]])) / spread, j) for j in A if j in reg and self.names[j] in C), default=None)
+            if best is not None and best[0] < self.gc.coloc_tau:
+                out[i] = (best[1], best[0])
+        return out
+
+    def coloc_guard(self, i: int, partner: tuple[int, float], choice, why: str, prior, info: dict[str, Any]):
+        """Pi3X says image i shares anchor j's position. A pose whose centre is far from j's is replaced by the best
+        fixed-centre pose (j's centre; rotation from Pi3X, from the chosen pose, or from the pair's homography) when the
+        matches support it; otherwise the image waits. A rejected image gets the same fixed-centre candidates."""
+        j, gap = partner
+        cj = self.rec.images[j].projection_center()
+        scale = max(self.scene_scale(), 1e-9)
+        ci = {"partner": self.names[j], "ff_gap": round(gap, 4)}
+        if choice is not None:
+            d = float(np.linalg.norm(-choice[0].T @ choice[1] - cj)) / scale
+            ci["centre_gap"] = round(d, 3)
+            if d <= self.gc.coloc_eps:
+                info["coloc"] = ci
+                return choice, why
+        Rs: list[tuple[str, np.ndarray, Any]] = []
+        if prior is not None:
+            Rs.append(("feedforward", prior[0], None))
+        if choice is not None:
+            Rs.append(("chosen", choice[0], choice[2]))
+        fit = self.rotation_fit(i, j)
+        if fit:
+            params = None
+            if not self.camera_shared(i):
+                cam = self.rec.camera(self.rec.images[i].camera_id)
+                params = np.array(cam.params, dtype=float)
+                params[0] = fit["f"]
+                if cam.model.name in ("PINHOLE", "OPENCV", "FULL_OPENCV", "OPENCV_FISHEYE"):
+                    params[1] = fit["f"]
+            Rs.append(("homography", fit["R"] @ self.rec.images[j].cam_from_world().rotation.matrix(), params))
+        best = None
+        for src, R, params in Rs:
+            s = self.support_pose(i, R, -R @ cj, params)
+            ci.setdefault("support", {})[src] = None if s != s else round(float(s), 3)
+            if s == s and (best is None or s > best[0]):
+                best = (s, src, R, params)
+        sc = float("nan")
+        if choice is not None:
+            sc = self.support_pose(i, choice[0], choice[1], choice[2] if not self.camera_shared(i) else None)
+            ci["support_chosen"] = None if sc != sc else round(float(sc), 3)
+        info["coloc"] = ci
+        stem = Path(self.names[j]).stem
+        if best is not None and best[0] >= self.gc.min_support and not (sc == sc and sc > best[0] + 0.1):
+            R = best[2]
+            return (R, -R @ cj, best[3], None), f"co-located with {stem} (Pi3X); centre fixed, rotation from {best[1]}"
+        if choice is not None:
+            return None, f"{why}; but Pi3X puts it at {stem} and the pose is elsewhere: deferred"
+        return None, why
+
     def ff_round(self, k: int) -> dict[str, Any] | None:
         """One round of the feedforward loop: pick the round's images, place them with the feedforward model next to
         anchors from the model, check each placement against an independent PnP pose (and render-and-compare where the
@@ -1088,6 +1162,7 @@ class Solver:
         sup_ok = lambda v: (not nan(v)) and v >= self.gc.min_support  # noqa: E731
         per: dict[str, dict[str, Any]] = {}
         accepted: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray | None, float | None, str]] = {}
+        coloc = self.coloc_partners(ff, A, batch) if self.gc.ff_coloc else {}
         for i in batch:
             n = self.names[i]
             info: dict[str, Any] = {}
@@ -1176,6 +1251,8 @@ class Solver:
                     info["rotation"] = {kk: ra[kk] for kk in ("partner", "h_frac", "f_ratio", "ortho", "focal")} | {"support": rnd(sr)}
                     if sup_ok(sr):
                         choice, why = (ra["R"], ra["t"], ra["params"], None), f"rotation from co-located {Path(ra['partner']).stem}; matches support it"
+            if i in coloc:
+                choice, why = self.coloc_guard(i, coloc[i], choice, why, prior, info)
             info["why"] = why
             if choice is not None:
                 accepted[i] = (*choice, why)

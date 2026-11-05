@@ -430,6 +430,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
           if (rtxt) bits.push('render: ' + rtxt);
           if (v.support) bits.push('match support ' + Object.keys(v.support).filter(function (tg) { return tg !== 'align_good'; }).map(function (tg) { return (tg === 'ff' ? 'Pi3X' : 'PnP') + ' ' + (v.support[tg] == null ? '–' : v.support[tg]); }).join(', '));
           if (v.rotation) bits.push('co-located with ' + String(v.rotation.partner).replace(/\.(jpg|JPG|png|jpeg)$/, '') + ' (homography fits ' + Math.round(100 * v.rotation.h_frac) + '%, support ' + (v.rotation.support == null ? '–' : v.rotation.support) + ')');
+          if (v.coloc) bits.push('Pi3X puts it at ' + String(v.coloc.partner).replace(/\.(jpg|JPG|png|jpeg)$/, '') + ' (gap ' + v.coloc.ff_gap + ')' + (v.coloc.centre_gap != null ? ', accepted centre ' + v.coloc.centre_gap + ' scene depth away' : '') + (v.coloc.support ? ', fixed-centre support ' + Object.keys(v.coloc.support).map(function (k) { return k + ' ' + (v.coloc.support[k] == null ? '–' : v.coloc.support[k]); }).join(', ') : ''));
           if (v.focal_disagree != null) bits.push('PnP focal ' + v.focal_disagree + '× Pi3X');
           if (v.ba_drift_deg != null) bits.push('local BA moved it ' + v.ba_drift_deg + '°');
           return h('div', { style: 'margin:2px 0' }, [h('span', { class: 'tag ' + (ok ? 'ok' : 'warn'), text: n.replace(/\.(jpg|JPG|png|jpeg)$/, '') }), ' ', h('span', { text: v.why || '' }),
