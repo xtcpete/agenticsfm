@@ -57,7 +57,7 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
 
     started = time.time()
     params = {"feedforward": feedforward, "seed_size": int(seed_size), "group_size": int(group_size),
-              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 22,
+              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 23,
               "support_pairs": int(support_pairs), "support_norm": bool(support_norm), "loop": loop, "select": select,
               "ff_off": ",".join(sorted(x for x in ff_off.split(",") if x.strip()))}
     inputs = {"db": db_id, **({"scores": scores_id} if scores_id else {})}
@@ -71,12 +71,13 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
                     vlm=vlm, multi_model=bool(multi_model), support_pairs=int(support_pairs),
                     support_norm=bool(support_norm), loop=loop, select=select)
     off = {x.strip() for x in ff_off.split(",") if x.strip()}
-    unknown = off - {"evidence", "fill", "points", "settle", "sweep", "anchors", "rotation", "vlmplace", "sky", "coloc"}
+    unknown = off - {"evidence", "fill", "points", "settle", "sweep", "anchors", "rotation", "vlmplace", "sky", "coloc", "rsrc", "backface", "cover"}
     if unknown:
         raise ValueError(f"unknown ff_off features: {sorted(unknown)}")
     gc = replace(gc, select_evidence="evidence" not in off, select_fill="fill" not in off, ff_align_points="points" not in off,
                  ff_settle_support="settle" not in off, ff_sweep="sweep" not in off, ff_rotation="rotation" not in off,
-                 ff_vlm_place="vlmplace" not in off, rac_min_conf=0.0 if "sky" in off else gc.rac_min_conf, ff_coloc="coloc" not in off,
+                 ff_vlm_place="vlmplace" not in off, rac_min_conf=0.0 if "sky" in off else gc.rac_min_conf, ff_coloc="coloc" not in off, rac_sources_match="rsrc" not in off, rac_backface="backface" not in off,
+                 rac_min_cover=0.0 if "cover" in off else gc.rac_min_cover,
                  **({"ff_anchors_match": 6, "ff_anchors_diverse": 4} if "anchors" in off else {}))
     gpu = ws.gpus[0] if ws.gpus else None
     split = None

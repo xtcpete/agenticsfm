@@ -18,8 +18,11 @@ PERTURB = (("yaw5", 5.0, 0.0), ("yaw15", 15.0, 0.0), ("shift5", 0.0, 0.05), ("sh
 
 
 class RenderCompare:
-    def __init__(self, rec, images_dir: Path, min_conf: float = 0.0):
+    def __init__(self, rec, images_dir: Path, min_conf: float = 0.0, backface: bool = False, min_cover: float = 0.0):
         self.rec = rec
+        self.backface = backface     # drop source points whose surface faces away from the target camera
+        self.min_cover = min_cover   # a render covering less of the photo than this is "no evidence", not "inconsistent"
+        self.normals: dict[str, np.ndarray] = {}   # name -> unit surface normals in the source camera frame (H, W, 3); 0 = unknown
         self.min_conf = min_conf   # feedforward depth below this confidence is dropped (Pi3X: sky and far background)
         self.images_dir = images_dir
         self.gray_cache: dict[tuple[str, int], np.ndarray] = {}
@@ -73,6 +76,43 @@ class RenderCompare:
                 d = np.where(z["conf"][k].astype(np.float32) >= self.min_conf, d, 0.0).astype(np.float32)
             self.depth[n] = (d, z["transforms"][k])
 
+    def normal_map(self, name: str) -> np.ndarray:
+        """Surface normals of a source's depth map in its camera frame (scale-free, so cached), oriented to the camera.
+        Pixels at depth edges or without depth get a zero normal and count as facing."""
+        if name not in self.normals:
+            depth, tr = self.depth[name]
+            K, _, _ = self.K(name)
+            sx, sy, ox, oy = tr
+            H, W = depth.shape
+            vs, us = np.mgrid[0:H, 0:W]
+            x = ((us - ox) / sx - K[0, 2]) / K[0, 0]
+            y = ((vs - oy) / sy - K[1, 2]) / K[1, 1]
+            X = np.stack([x * depth, y * depth, depth], -1)
+            du = np.zeros_like(X); dv = np.zeros_like(X)
+            du[:, 1:-1] = X[:, 2:] - X[:, :-2]
+            dv[1:-1] = X[2:] - X[:-2]
+            n = np.cross(du, dv)
+            ln = np.linalg.norm(n, axis=-1, keepdims=True)
+            n = np.where(ln > 0, n / np.maximum(ln, 1e-12), 0.0)
+            n = np.where((np.sum(n * X, -1, keepdims=True) > 0), -n, n)       # towards the camera
+            ok = depth > 0
+            ok[:, 1:-1] &= (depth[:, 2:] > 0) & (depth[:, :-2] > 0)
+            ok[1:-1] &= (depth[2:] > 0) & (depth[:-2] > 0)
+            # depth edges: neighbouring depths differ by more than 20% -> normal unreliable
+            edge = np.zeros_like(ok)
+            edge[:, 1:-1] |= np.abs(depth[:, 2:] - depth[:, :-2]) > 0.2 * np.maximum(depth[:, 1:-1], 1e-6)
+            edge[1:-1] |= np.abs(depth[2:] - depth[:-2]) > 0.2 * np.maximum(depth[1:-1], 1e-6)
+            n[~ok | edge] = 0.0
+            self.normals[name] = n.astype(np.float32)
+        return self.normals[name]
+
+    def facing(self, name: str, vs, us, Xw: np.ndarray, Rw: np.ndarray, c_t: np.ndarray) -> np.ndarray:
+        """Which source points (pixels vs, us of source name; world points Xw) face the target camera centre c_t."""
+        if not self.backface:
+            return np.ones(len(Xw), dtype=bool)
+        nw = self.normal_map(name)[vs, us] @ Rw.T
+        return np.sum(nw * (c_t - Xw), -1) >= 0
+
     def invalidate(self) -> None:
         """After a refinement or normalisation the model's scale changed: recompute depth scales on demand."""
         self.scales = {}
@@ -109,6 +149,9 @@ class RenderCompare:
         g_t = self.gray(target)
         s_t = LOW / W_t
         R_t, t_t = P_t.rotation.matrix(), P_t.translation
+        c_t = -R_t.T @ t_t
+        cells: set[int] = set()
+        self.last_cover = 0.0
         va, vb, nvalid, ntotal = [], [], 0, 0
         for j in nbs:
             if j not in self.depth or self.scale(j) is None:
@@ -130,11 +173,12 @@ class RenderCompare:
             Xw = Xc @ Rw.T + tw
             Xt = Xw @ R_t.T + t_t
             z = Xt[:, 2]
-            front = z > 1e-6
+            front = (z > 1e-6) & self.facing(j, vs[ok], us[ok], Xw, Rw, c_t)
             zz = np.where(front, z, 1.0)
             u_t = K_t[0, 0] * Xt[:, 0] / zz + K_t[0, 2]
             v_t = K_t[1, 1] * Xt[:, 1] / zz + K_t[1, 2]
             inb = front & (u_t >= 0) & (u_t < W_t - 1) & (v_t >= 0) & (v_t < H_t - 1)
+            cells.update(((v_t[inb] * s_t).astype(int) * LOW + (u_t[inb] * s_t).astype(int)).tolist())
             ntotal += len(z)
             nvalid += int(inb.sum())
             if inb.sum() < 50:
@@ -144,6 +188,7 @@ class RenderCompare:
             b = g_t[(v_t[inb] * s_t).astype(int).clip(0, g_t.shape[0] - 1), (u_t[inb] * s_t).astype(int).clip(0, LOW - 1)]
             va.append(a)
             vb.append(b)
+        self.last_cover = len(cells) / float(LOW * max(1, int(round(H_t * s_t))))
         if not va:
             return None, 0.0
         a = np.concatenate(va)
@@ -168,12 +213,13 @@ class RenderCompare:
         P = P or self.image(name).cam_from_world()
         nbs = self.usable(nbs or self.neighbours(name))
         s0, ov = self.score(name, P, nbs)
+        cover = self.last_cover
         if s0 is None:
-            return {"image": name, "score": None, "verdict": "no evidence", "neighbours": nbs}
+            return {"image": name, "score": None, "verdict": "no evidence", "neighbours": nbs, "cover": round(cover, 3)}
         pert = {lab: self.score(name, self.perturbed(P, yaw, sh), nbs)[0] for lab, yaw, sh in PERTURB}
         best = max(v for v in pert.values() if v is not None) if any(v is not None for v in pert.values()) else None
         margin = None if best is None else s0 - best
-        if margin is None:
+        if margin is None or cover < self.min_cover:   # the sources show too little of what this photo sees
             verdict = "no evidence"
         elif margin > 0.05:          # calibrated on 5 scenes (docs/EXAMINE.md): keeps 88% of GT-correct poses, passes 2-4% of 10-20 deg errors
             verdict = "consistent"
@@ -182,7 +228,7 @@ class RenderCompare:
         else:
             verdict = "ambiguous"
         return {"image": name, "score": round(s0, 3), "overlap": round(ov, 3), "perturbed": {k: (None if v is None else round(v, 3)) for k, v in pert.items()},
-                "margin": None if margin is None else round(margin, 3), "verdict": verdict, "neighbours": nbs}
+                "margin": None if margin is None else round(margin, 3), "verdict": verdict, "neighbours": nbs, "cover": round(cover, 3)}
 
     # -- the figure the VLM reads ----------------------------------------------------------------
     def figure(self, name: str, P, nbs: list[str], out_path: Path, width: int = 480) -> str | None:
@@ -214,9 +260,10 @@ class RenderCompare:
             x = ((us - ox) / sx - K_j[0, 2]) / K_j[0, 0]
             y = ((vs - oy) / sy - K_j[1, 2]) / K_j[1, 1]
             Xc = np.stack([x * d, y * d, d], -1)[ok]
-            Xt = (Xc @ Rw.T + tw) @ R_t.T + t_t
+            Xw = Xc @ Rw.T + tw
+            Xt = Xw @ R_t.T + t_t
             z = Xt[:, 2]
-            front = z > 1e-6
+            front = (z > 1e-6) & self.facing(j, vs[ok], us[ok], Xw, Rw, -R_t.T @ t_t)
             zz = np.where(front, z, 1.0)
             u = ((K_t[0, 0] * Xt[:, 0] / zz + K_t[0, 2]) * s).astype(int)
             v = ((K_t[1, 1] * Xt[:, 1] / zz + K_t[1, 2]) * s).astype(int)

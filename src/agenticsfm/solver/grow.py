@@ -115,6 +115,11 @@ class GrowConfig:
     ff_coloc: bool = True        # co-location guard: Pi3X puts a candidate on a registered anchor's centre -> its pose must sit there
     coloc_tau: float = 0.03      # Pi3X centres within this fraction of the group's camera spread = co-located (offline: precision 0.96)
     coloc_eps: float = 0.10      # accepted centre farther than this x scene depth from the partner's = conflict (correct pairs <= 0.08)
+    rac_sources_match: bool = True   # render sources: registered images sharing matches with the candidate first (same for every candidate pose)
+    rac_min_matches: int = 15        # ... with at least this many verified matches
+    rac_min_cos: float = 0.0         # sources looking the opposite way from the candidate (angle >= 90 deg) are never used
+    rac_backface: bool = True        # drop source points whose surface faces away from the candidate camera
+    rac_min_cover: float = 0.1       # render covers less than this fraction of the photo -> verdict "no evidence"
     rac_min_conf: float = 0.1    # render-and-compare ignores feedforward depth below this confidence (Pi3X sky); 0 = use all
     ff_sweep: bool = True        # after the final global refinement, retry every unregistered image once more
     ff_agree_deg: float = 10.0   # a feedforward placement and the independent PnP pose agree within this rotation ...
@@ -214,7 +219,7 @@ class Solver:
         self.ff_seconds = 0.0
         self.log: list[dict[str, Any]] = []
         self.timer = Timer()
-        self.rac = RenderCompare(self.rec, ws.images_dir, min_conf=self.gc.rac_min_conf)
+        self.rac = RenderCompare(self.rec, ws.images_dir, min_conf=self.gc.rac_min_conf, backface=self.gc.rac_backface, min_cover=self.gc.rac_min_cover)
         if advisor is not None:
             self.advisor = advisor
             self.advisor.log = self.log
@@ -1335,6 +1340,19 @@ class Solver:
     def pose_neighbours(self, R: np.ndarray, t: np.ndarray, k: int = 4, exclude: set[int] = frozenset()) -> list[int]:
         return self.nearest_registered(-R.T @ t, R[2], k, exclude)
 
+    def render_sources(self, i: int, R: np.ndarray, t: np.ndarray, k: int = 4) -> list[int]:
+        """Registered images to render candidate pose (R, t) of image i from. Images that share matches with i see the
+        same surfaces, so they come first (strongest first; the same set for every candidate pose of i); nearby cameras
+        fill up. A source looking the opposite way from the candidate shows the far side of the scene and is never used."""
+        if not self.gc.rac_sources_match:
+            return self.pose_neighbours(R, t, k, {i})
+        d = R[2]
+        reg = self.reg()
+        facing = lambda j: float(np.dot(self.rec.images[j].viewing_direction(), d)) > self.gc.rac_min_cos  # noqa: E731
+        matched = [j for j, n in sorted(self.W.get(i, {}).items(), key=lambda x: -x[1]) if j in reg and j != i and n >= self.gc.rac_min_matches and facing(j)]
+        near = [j for j in self.pose_neighbours(R, t, 3 * k, {i}) if facing(j)]
+        return list(dict.fromkeys(matched[:k] + near))[:k]
+
     def judge_pose(self, i: int, R: np.ndarray, t: np.ndarray, tag: str, figure: bool = False) -> dict[str, Any]:
         with self.timer("render_compare"):
             return self._judge_pose(i, R, t, tag, figure)
@@ -1345,7 +1363,7 @@ class Solver:
 
         n = self.names[i]
         P = pycolmap.Rigid3d(pycolmap.Rotation3d(R), t)
-        nbs = [self.names[j] for j in self.pose_neighbours(R, t, 4, {i})]
+        nbs = [self.names[j] for j in self.render_sources(i, R, t, 4)]
         j = self.rac.judge(n, P, nbs)
         if figure and self.rac.usable(nbs):
             j["figure"] = self.rac.figure(n, P, nbs, self.workdir / "rac" / f"{Path(n).stem}_{tag}.jpg")
@@ -1355,7 +1373,7 @@ class Solver:
         """Dense depth for the registered neighbours of the given candidate poses, in one backend call."""
         groups, seen = [], set()
         for i, R, t in wants:
-            nbs = self.pose_neighbours(R, t, 4, {i})
+            nbs = self.render_sources(i, R, t, 4)
             need = [j for j in nbs if self.names[j] not in self.rac.depth]
             if need:
                 g = tuple([self.names[i]] + [self.names[j] for j in nbs])
@@ -1561,7 +1579,7 @@ class Solver:
         wants = []
         for i in reg:
             R, t = self.pose_of(i)
-            nb_of[i] = self.pose_neighbours(R, t, 4, {i})
+            nb_of[i] = self.render_sources(i, R, t, 4)
             wants.append((i, R, t))
         self.ensure_depth(wants, "audit")
         rows = {}
