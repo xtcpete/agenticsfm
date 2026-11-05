@@ -604,3 +604,56 @@ The user noted that in both render-choose figures (28 in hard round 7, 33 in har
   1. Choose render sources by shared matches with the candidate, not by pose distance.
   2. Drop back-facing points, using normals from the Pi3X depth.
   3. Report "no evidence" instead of "inconsistent" when the sources share little content with the photo.
+
+### Step 22 (2026-11-05): render fixes (commit `65cdcc0`, cache v23)
+- **Sources** (`render_sources`): registered images sharing at least 15 verified matches with the candidate come first, strongest first, so every candidate pose of an image is rendered from the same images. Nearby cameras fill up to 4. A source whose viewing direction is 90° or more from the candidate's is never used. `--ff-off rsrc` reverts.
+- **Back-face culling:** surface normals come from each source's Pi3X depth, in the camera frame and cached. Points whose surface faces away from the target camera are dropped from the score and the figure. Depth edges (more than 20% jump) get no normal and are kept. `--ff-off backface` reverts.
+- **Coverage:** the fraction of the target's comparison grid that receives a rendered point. Below 0.10 the verdict is "no evidence", not "inconsistent". `--ff-off cover` reverts.
+- **Offline GT check** (`scripts/analysis/rac_check.py`: correct cameras < 3° judged at their pose and rotated 12°):
+  - Verdicts on correct poses are unchanged on BLH and PTZ s01. A08 improves, with wrongly inconsistent going 5 → 4.
+  - Rotated poses are caught as before.
+  - The median coverage of a correct pose is 0.33–0.51.
+- **BLH back cameras 28, 33, 13 at their correct poses:**
+  - Before: "inconsistent", rendered from 4 front-side images (coverage 0.12–0.14, nearly all of it the far side of the buildings).
+  - After: one source faces the same way, coverage 0.02–0.08, verdict "no evidence". The figure shows only the sliver of real overlap.
+- **Launched:** `p5_vlm_dev` (GPU 6: BLH, s02, A08; GPU 5: s00, s01, M07).
+
+### Step 23 (2026-11-05): reproducing the 68.5 BLH run (exact code `3facb08`, cache v20; git worktree `../agenticsfm_p123`; 5 reruns made distinct with `--support-pairs 995–999`)
+
+| Run | auc@10 | Registered | VLM placement | Cameras > 10° |
+|---|---|---|---|---|
+| `p123_vlm_dev` (original) | 68.5 | 39/39 | group {33, 28, 13, 32}, 6 picks, layout plausible 0.7 → 4 unverified | none |
+| rep998 | 63.5 | 39/39 | the same group and picks → the same 4 unverified | 12 (12°) |
+| rep996 | 66.6 | 39/39 | group {2, 32, 38, 36, 28, 33}, 3 picks, plausible 0.7 → 6 unverified | 13 (16°) |
+| rep997 | 44.3 | 34/39 | group {13} only → 1 unverified | 32 (22°) |
+| rep995 | 42.5 | 34/39 | 5 images, 3 picks, layout **implausible** 0.6 | 36 (21°) |
+| rep999 | 42.0 | 32/39 | 7 images, **1 pick**, layout **implausible** 0.6 | none |
+
+- **68.5 reproduces about 2 runs in 5.** The outcome is decided by whether the VLM placement step admits the back group.
+- **Every unverified placement admitted on BLH in any run is correct:** 15 placements at 1.1–3.6°.
+- **The failures come from the VLM layout check, plus one hard-path admission at 21–22°:**
+  - The check rejects correct layouts with confidence 0.6, giving reasons about the wall standing between camera and yard.
+  - On s02 it accepted 4 wrong placements at 0.7.
+  - **So the VLM layout check is not a usable gate in either direction.**
+- **Next:** test the geometric alternative from step 16 on all of these groups: halves of all anchors, rotation gap only (`scripts/analysis/ff_stability.py --halves anchors`).
+
+### Step 24 (2026-11-05): which gate can admit VLM placements? (offline, GT only for scoring)
+Test set: every leftover-group placement with known GT, 19 images.
+- **BLH, correct:** 11 images (1–4°), from `p123_vlm_dev` and rep996.
+- **PTZ, wrong:** 8 images, from `p123_vlm_dev` (s02: 13, 139, 145, 156; s01: 85, 93, 145, 174) at 9–41°.
+- **One borderline image:** s02 155 at 5°.
+
+| Gate | Correct BLH admitted | Wrong PTZ admitted |
+|---|---|---|
+| VLM layout check ("plausible" ≥ 0.6) | 11 in the runs where it said plausible; it said implausible in 2 of 5 BLH reruns | 8/8 (all "plausible 0.7") |
+| Stability, halves of the VLM picks (Phase 3b, 5° and 5%) | 0 (centre test) | 0 |
+| Stability, halves of all anchors, rotation gap < 10° | 4/11 (rep996: all 6 at 18–24°, because one half's anchors pull the group off) | 4/8 (s02 139, 156, 13 and s01 93 are consistently wrong: gap 4.5–7.4°) |
+| New render (step 22), veto only "inconsistent" | 10/11 (all "no evidence"; 32 vetoed, whose centre is 18% off along its view) | 3/8 (s02 13, 145 and s01 93 are "no evidence") |
+
+- **None separates cleanly. The best is the new render as a veto: about 77% precision on admissions (10/13).**
+- Wrong placements that are consistently wrong (Pi3X makes the same mistake with any anchors) defeat any self-consistency test.
+- Views of unmodelled surfaces defeat any render test: there is nothing to compare against.
+- **Decision for the user:** the policy for unverified VLM placements.
+  - (a) Keep Phase 3b: admits nothing, 100% precision; BLH stays at 42–45.
+  - (b) Render veto instead of stability and layout: BLH back group in most runs, but about 1 in 4 admissions wrong on PTZ, flagged unverified.
+  - (c) (b) restricted to groups where Pi3X aligns on points and the render says "no evidence" for the whole group.

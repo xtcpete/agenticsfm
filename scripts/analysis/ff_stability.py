@@ -42,6 +42,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True); ap.add_argument("--scenes", nargs="+", required=True)
     ap.add_argument("--gpu", type=int, default=5); ap.add_argument("--out")
+    ap.add_argument("--halves", choices=["picks", "anchors"], default="picks", help="split the VLM picks (Phase 3b) or all the solver anchors")
     a = ap.parse_args()
     from agenticsfm.config import load_config
     from agenticsfm.backends import run_backend
@@ -67,12 +68,13 @@ def main():
             if not pend:
                 continue
             picks = r["picks"]
-            sets = {"full": [x for x in r["anchors"] if x in by], "h0": [x for x in picks[0::2] if x in by], "h1": [x for x in picks[1::2] if x in by]}
+            src = picks if a.halves == "picks" else r["anchors"]
+            sets = {"full": [x for x in r["anchors"] if x in by], "h0": [x for x in src[0::2] if x in by], "h1": [x for x in src[1::2] if x in by]}
             res = {}
             for tag, A in sets.items():
                 if len(A) < 2:
                     continue
-                wd = ROOT / "outputs/analysis/ff_stability" / a.run / scene / f"r{r['round']}_{tag}"
+                wd = ROOT / "outputs/analysis/ff_stability" / a.run / scene / f"r{r['round']}_{a.halves}_{tag}"
                 spec = {"images_dir": images_dir, "groups": [A + pend], "model": "pi3x", "points_per_image": 0, "save_depth": True,
                         "repos": cfg.get("repos", {})}
                 gr = run_backend(cfg, "feedforward", "pi3x", spec, wd, gpu=a.gpu)["groups"][0]
