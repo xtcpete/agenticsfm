@@ -57,7 +57,7 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
 
     started = time.time()
     params = {"feedforward": feedforward, "seed_size": int(seed_size), "group_size": int(group_size),
-              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 20,
+              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 21,
               "support_pairs": int(support_pairs), "support_norm": bool(support_norm), "loop": loop, "select": select,
               "ff_off": ",".join(sorted(x for x in ff_off.split(",") if x.strip()))}
     inputs = {"db": db_id, **({"scores": scores_id} if scores_id else {})}

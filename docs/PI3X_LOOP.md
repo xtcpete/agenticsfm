@@ -348,3 +348,23 @@ What `vlm_place` did:
 - **Result:** all 4 were registered unverified, with no points and no bundle adjustment. All 4 are within 5° of GT.
 
 The hard fallback also behaved better on this model: 7 "placements agree, render inconsistent" images, median 1.91°, none > 5°. Phase 2's rotation attach was not needed here.
+
+### Step 11 (2026-11-05): Phase 2–3 smoke run on PTZ s02, and a precision problem with unverified placements
+**PTZ s02: auc@10 57.0** (Phase 1: 55.8). 174/174 images, 25 > 5° and 6 > 10° from GT.
+
+Results:
+- **Sweep:** +2 images.
+- **`vlm_place`:** one leftover group {145, 155, 139, 156, 13}. The VLM picked 6 overlapping photos and judged the layout plausible (0.7): "each proposed camera sits on the surrounding embankment and looks inward across the flooded pond".
+- **Unverified poses vs GT:** 0013 12.7°, 0139 25.2°, 0145 38.6°, 0155 5.5°, 0156 29.5°. **4 of 5 are wrong.**
+- The score still rose, because an unregistered image already counts as wrong in auc_all. But this breaks the correctness-over-coverage rule. On BLH the same check, with the same confidence of 0.7, admitted 4 correct poses, so the layout check cannot separate the two cases.
+- **Phase 2:** `rotation_attach` was never triggered on s02 (0 attempts). No deferred image had a registered co-located partner that passed the homography test. Offline, the test passed only 4% of s02's co-located pairs.
+
+**Fix (Phase 3b, applied after the running passes finish):** an unverified placement must be *stable*.
+- Pi3X runs again with each half of the VLM's picks as the only anchors: two disjoint sets of at least 3.
+- Each image must land within 5° and 5% of the scene scale in both runs.
+- A guess that depends on which anchors Pi3X sees is left out.
+- Cost: two extra Pi3X calls per leftover group.
+
+Passes in flight on commit `3facb08`:
+- `p123_vlm_dev`: GPU 4 (s00, A08), GPU 6 (s01, M07); GPU 5 reused the smoke results for s02 and BLH.
+- `p123_graph_dev`: GPU 5, all six scenes with match-graph selection, as a control for the VLM selection.

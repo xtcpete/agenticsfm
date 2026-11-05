@@ -110,6 +110,8 @@ class GrowConfig:
     vlm_place_refs: int = 16     # reference photos shown to the VLM
     lift_thr: float = 0.05       # a match is kept when its two 3D points (model, lifted through Pi3X depth) agree within this share of the scene scale
     vlm_place_unverified: bool = True  # register layout-checked poses without match confirmation (flagged)
+    vlm_place_stable: bool = True      # ... only when Pi3X places the image the same way with two disjoint halves of the VLM's picks
+    vlm_place_stable_deg: float = 5.0  # ... rotation within this, centre within ff_agree_frac of the scene scale
     ff_sweep: bool = True        # after the final global refinement, retry every unregistered image once more
     ff_agree_deg: float = 10.0   # a feedforward placement and the independent PnP pose agree within this rotation ...
     ff_agree_frac: float = 0.05  # ... and this fraction of the scene span
@@ -1855,6 +1857,38 @@ class Solver:
                 pending.append(i)
                 info["why"] = "no match-confirmed pose; layout check"
                 row["images"][n] = info
+            if pending and self.gc.vlm_place_unverified and self.gc.vlm_place_stable:
+                # stability: Pi3X again with each half of the VLM's picks as the only anchors; the image must land in the
+                # same place both times (a placement that depends on which anchors Pi3X sees is a guess)
+                halves = [picks[0::2], picks[1::2]]
+                if min(len(h_) for h_ in halves) >= 3:
+                    hp: list[dict[int, tuple[np.ndarray, np.ndarray]]] = []
+                    for hi, H_ in enumerate(halves):
+                        gh = self.ff_groups([names(H_) + names(pending)], f"vlmplace{k}h{hi}", save_depth=True)[0]
+                        ffh = {n: {"E": np.asarray(E, dtype=np.float64), "f": 0.5 * (K_[0][0] / tr[0] + K_[1][1] / tr[1])}
+                               for n, E, K_, tr in zip(gh["names"], gh["extrinsics"], gh["intrinsics"], gh["transforms"])}
+                        alh = self.align_points(gh["depth_path"], H_) if gh.get("depth_path") else None
+                        if not (alh and alh.get("ok")):
+                            alh = self.align_rot(ffh, H_)
+                            if not (alh and alh.get("ok")):
+                                alh = self.align(ffh, H_)
+                        hp.append({i: self.transform_pose(ffh[self.names[i]]["E"], alh) for i in pending} if alh and alh.get("ok") else {})
+                    stable = []
+                    for i in pending:
+                        inf = row["images"][self.names[i]]
+                        if i in hp[0] and i in hp[1]:
+                            d, m = self.pose_gap(*hp[0][i], *hp[1][i])
+                            d0, m0 = self.pose_gap(*poses[i], *hp[0][i])
+                            inf["halves_gap"] = {"deg": round(d, 1), "frac": round(m, 3), "deg_full": round(d0, 1)}
+                            if d < self.gc.vlm_place_stable_deg and m < self.gc.ff_agree_frac:
+                                stable.append(i)
+                                continue
+                        inf["why"] = "Pi3X placement not stable across anchor halves; left out"
+                    pending = stable
+                else:
+                    for i in pending:
+                        row["images"][self.names[i]]["why"] = "too few picked anchors for the stability check; left out"
+                    pending = []
             if pending and self.gc.vlm_place_unverified:
                 fig = self.layout_figure(sd / f"g{k}_map.png", picks, G, poses)
                 lc = self.advisor.layout_check(fig, gsheet, self.advisor.sheet(names(picks), sd / f"g{k}_picks.jpg", labels=[str(a + 1) for a in range(len(picks))]),
