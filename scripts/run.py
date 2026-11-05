@@ -50,7 +50,8 @@ def run_scene(args, cfg, run, scene, gpu, gt_dir):
 
             row.update(run_incremental(ws, cfg, dataset=None if args.folder else args.dataset, feedforward=args.feedforward,
                                        threshold=args.threshold, optimize=not args.no_optimize, seed_size=args.seed_size,
-                                       group_size=args.group_size, min_support=args.min_support, hard=not args.no_hard, vlm=args.vlm, multi_model=not args.no_multi_model))
+                                       group_size=args.group_size, min_support=args.min_support, hard=not args.no_hard, vlm=args.vlm, multi_model=not args.no_multi_model,
+                                       support_pairs=args.support_pairs))
         elif args.controller == "agent":
             from agenticsfm.agent import Agent
 
@@ -88,6 +89,7 @@ def main() -> None:
     parser.add_argument("--seed-size", type=int, default=12)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--min-support", type=float, default=0.5)
+    parser.add_argument("--support-pairs", type=int, default=1000, help="incremental: match support from each image's strongest pairs only")
     parser.add_argument("--no-hard", action="store_true", help="incremental: no feedforward placement of hard images")
     parser.add_argument("--vlm", default="decide", choices=["off", "log", "decide"], help="incremental: the VLM advisor mode")
     parser.add_argument("--no-multi-model", action="store_true", help="incremental: do not reconstruct leftover image sets as further models")

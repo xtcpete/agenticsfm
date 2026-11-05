@@ -87,7 +87,8 @@ class GrowConfig:
     min_support: float = 0.5     # inlier-weighted share of consistent matches an image needs (strong pairs only)
     support_low: float = 0.25    # between support_low and min_support, render-and-compare gives the second opinion
     persistent_ff: bool = True   # keep the feedforward model loaded in a worker per GPU (2.8 s per call instead of 20 to 60)
-    support_pairs: int = 12      # match support from each image's strongest pairs only
+    support_pairs: int = 1000    # match support from each image's strongest pairs (12 admitted more on PTZ but folded PTZ s02; all pairs is the safe default)
+    refocus: bool = True         # before rejecting on support, re-estimate the image's pose with its focal length free and re-check
     round_gate: bool = True      # the VLM between rounds: suspects of each round (borderline admits and rejects) judged on their figures
     gate_admit_support: float = 0.65   # an admitted image below this support (or with no strong pair) is a suspect
     gate_max: int = 6            # suspects per round shown to the VLM (one batched call)
@@ -311,6 +312,53 @@ class Solver:
                 break
         return out
 
+    def correspondences_2d3d(self, i: int) -> tuple[np.ndarray, np.ndarray]:
+        reg = self.reg()
+        kp_i = self.kp(i)
+        pts2d, pts3d = [], []
+        for j, n in self.W.get(i, {}).items():
+            if j not in reg:
+                continue
+            a, b = (i, j) if i < j else (j, i)
+            m = self.pairs[(a, b)]
+            idx_i, idx_j = (m[:, 0], m[:, 1]) if i < j else (m[:, 1], m[:, 0])
+            p2s = self.rec.images[j].points2D
+            for ii, jj in zip(idx_i, idx_j):
+                p2 = p2s[int(jj)]
+                if p2.has_point3D():
+                    pts2d.append(kp_i[int(ii)])
+                    pts3d.append(self.rec.points3D[p2.point3D_id].xyz)
+        return np.array(pts2d, dtype=np.float64).reshape(-1, 2), np.array(pts3d, dtype=np.float64).reshape(-1, 3)
+
+    def refocus_image(self, i: int) -> dict[str, Any] | None:
+        """PnP with the focal length as an unknown (P4Pf + refinement): an image of another zoom level enters with the
+        shared focal prior, fails the support test because of it, and would be rejected before bundle adjustment could
+        correct the focal. Sets the new pose and focal when the estimate has enough inliers; returns what changed."""
+        import pycolmap
+
+        pts2d, pts3d = self.correspondences_2d3d(i)
+        if len(pts3d) < 30:
+            return None
+        cam = self.rec.cameras[self.rec.images[i].camera_id]
+        f0 = cam.mean_focal_length()
+        eo = pycolmap.AbsolutePoseEstimationOptions()
+        eo.estimate_focal_length = True
+        eo.ransac.max_error = 12.0
+        ro = pycolmap.AbsolutePoseRefinementOptions()
+        ro.refine_focal_length = True
+        ro.refine_extra_params = False
+        test = pycolmap.Camera(cam.todict())
+        res = pycolmap.estimate_and_refine_absolute_pose(pts2d, pts3d, test, eo, ro)
+        if not res or int(np.sum(res["inlier_mask"])) < 30:
+            return None
+        f1 = test.mean_focal_length()
+        if not (0.25 * f0 < f1 < 4 * f0):
+            return None
+        pose = res["cam_from_world"]
+        cam.params = test.params
+        self.rec.frame(self.rec.images[i].frame_id).rig_from_world = pose
+        return {"focal_before": round(f0, 1), "focal_after": round(f1, 1), "inliers": int(np.sum(res["inlier_mask"])), "of": len(pts3d)}
+
     def _refine_pose_2d3d(self, i: int, R: np.ndarray, t: np.ndarray, max_px: float = 12.0) -> dict[str, Any]:
         """Refine a placement from the 2D-3D correspondences that agree with it (reprojection under the given pose below
         ``max_px``): the lookalike correspondences project elsewhere and are left out. Returns the refined pose and counts."""
@@ -527,6 +575,21 @@ class Solver:
                 self.mapper.iterative_local_refinement(2, 0.001, self.mo, self.ba, self.tri, i)
             newly.append(i)
         sup = self.support(newly)
+        refocused: dict[int, dict[str, Any]] = {}
+        if self.gc.refocus:
+            low = [i for i in newly if sup.get(i, float("nan")) == sup.get(i, float("nan")) and sup[i] < self.gc.min_support]
+            for i in low:
+                with self.timer("refocus"):
+                    r = self.refocus_image(i)
+                if r is None:
+                    continue
+                with self.timer("local_ba"):
+                    self.mapper.triangulate_image(self.tri, i)
+                    self.mapper.iterative_local_refinement(2, 0.001, self.mo, self.ba, self.tri, i)
+                new_sup = self.support([i]).get(i, float("nan"))
+                r["support_before"], r["support_after"] = round(sup[i], 3), (None if new_sup != new_sup else round(new_sup, 3))
+                refocused[i] = r
+                sup[i] = new_sup
         nan = lambda i: sup.get(i, float("nan")) != sup.get(i, float("nan"))  # noqa: E731
         border = [i for i in newly if not nan(i) and self.gc.support_low <= sup[i] < self.gc.min_support]          # would be rejected
         weak_in = [i for i in newly if nan(i) or self.gc.min_support <= sup[i] < self.gc.gate_admit_support]   # admitted on thin evidence
@@ -584,10 +647,12 @@ class Solver:
                "rejected": {self.names[i]: round(sup[i], 3) for i in rejected}, "pnp_failed": [self.names[i] for i in failed],
                "render_second_opinion": {self.names[i]: {kk: j.get(kk) for kk in ("score", "margin", "verdict")} for i, j in second.items()},
                "vlm_gate": {self.names[i]: v for i, v in vlm.items()}, "readmitted": [self.names[i] for i in readmitted],
+               "refocused": {self.names[i]: r for i, r in refocused.items()},
                "removed": [self.names[i] for i in removed],
                "support": {self.names[i]: (None if sup.get(i) != sup.get(i) else round(sup[i], 3)) for i in newly}, **self.model_stats()}
         self.say(f"round {k}: +{len(kept)} (rejected {len(rejected)}, pnp failed {len(failed)}"
-                 + (f", VLM on {len(vlm)}: readmitted {len(readmitted)}, removed {len(removed)}" if vlm else "") + ") -> "
+                 + (f", VLM on {len(vlm)}: readmitted {len(readmitted)}, removed {len(removed)}" if vlm else "")
+                 + (f", refocused {len(refocused)}: kept {sum(1 for i in refocused if i in kept)}" if refocused else "") + ") -> "
                  f"{self.rec.num_reg_images()}/{len(self.names)} registered, {row['num_points']} pts, reproj {row['reproj']}")
         return row
 

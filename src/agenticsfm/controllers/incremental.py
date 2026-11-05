@@ -17,7 +17,7 @@ from agenticsfm.workspace import Workspace
 
 def run_incremental(ws: Workspace, cfg: dict[str, Any], verbose: bool = True, dataset: str | None = None,
                     feedforward: str | None = None, threshold: float | None = None, optimize: bool = True,
-                    seed_size: int = 12, group_size: int = 8, min_support: float = 0.5, hard: bool = True, vlm: str = "decide", multi_model: bool = True) -> dict[str, Any]:
+                    seed_size: int = 12, group_size: int = 8, min_support: float = 0.5, hard: bool = True, vlm: str = "decide", multi_model: bool = True, support_pairs: int = 1000) -> dict[str, Any]:
     n = len(ws.image_names())
     step = make_step(ws, cfg, "incremental", verbose)
     rc = recipe_of(cfg, dataset)
@@ -29,7 +29,7 @@ def run_incremental(ws: Workspace, cfg: dict[str, Any], verbose: bool = True, da
         db = step("filter_edges", db_id=db, scores_id=scores, threshold=float(threshold)).artifact
         scores = step("score_pairs", db_id=db, method="flexglue_covis").artifact
     m = step("grow_model", db_id=db, feedforward=ff, seed_size=seed_size, group_size=group_size, min_support=min_support, hard=hard, vlm=vlm,
-             multi_model=multi_model, scores_id=scores)
+             multi_model=multi_model, scores_id=scores, support_pairs=support_pairs)
     e = step("examine", model_id=m.artifact).summary
     best = m.artifact
     grow = m.summary.get("grow", {})
