@@ -211,7 +211,7 @@ class RenderCompare:
     def judge(self, name: str, P=None, nbs: list[str] | None = None) -> dict[str, Any]:
         """Score of the pose against its perturbations. margin = score - best perturbed score; verdict by margin."""
         P = P or self.image(name).cam_from_world()
-        nbs = self.usable(nbs or self.neighbours(name))
+        nbs = self.usable(self.neighbours(name) if nbs is None else nbs)   # an explicit empty list = no sources: "no evidence"
         s0, ov = self.score(name, P, nbs)
         cover = self.last_cover
         if s0 is None:

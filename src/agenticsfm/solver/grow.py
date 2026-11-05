@@ -110,7 +110,10 @@ class GrowConfig:
     vlm_place_refs: int = 16     # reference photos shown to the VLM
     lift_thr: float = 0.05       # a match is kept when its two 3D points (model, lifted through Pi3X depth) agree within this share of the scene scale
     vlm_place_unverified: bool = True  # register layout-checked poses without match confirmation (flagged)
-    vlm_place_stable: bool = True      # ... only when Pi3X places the image the same way with two disjoint halves of the VLM's picks
+    vlm_place_render: bool = True      # ... gate by render-and-compare of the Pi3X poses (Phase 3c): the group's placement is joint, so
+                                       # if at least half of its pending members are "inconsistent" the whole group is left out;
+                                       # otherwise every member not "inconsistent" registers unverified (the layout check is advisory)
+    vlm_place_stable: bool = False     # Phase 3b gate (instead of 3c): Pi3X places the image the same way with two disjoint halves of the picks
     vlm_place_stable_deg: float = 5.0  # ... rotation within this, centre within ff_agree_frac of the scene scale
     ff_coloc: bool = True        # co-location guard: Pi3X puts a candidate on a registered anchor's centre -> its pose must sit there
     coloc_tau: float = 0.03      # Pi3X centres within this fraction of the group's camera spread = co-located (offline: precision 0.96)
@@ -1984,17 +1987,44 @@ class Solver:
                     for i in pending:
                         row["images"][self.names[i]]["why"] = "too few picked anchors for the stability check; left out"
                     pending = []
-            if pending and self.gc.vlm_place_unverified:
+            render_ok = None
+            if pending and self.gc.vlm_place_unverified and self.gc.vlm_place_render and not self.gc.vlm_place_stable:
+                # Phase 3c: render-and-compare of each pending Pi3X pose. Pi3X places the group jointly, so a group whose
+                # members are mostly "inconsistent" has a wrong layout and its "no evidence" members cannot be trusted either.
+                self.ensure_depth([(i, *poses[i]) for i in pending], f"vlmplace{k}r")
+                verd = {}
+                for i in pending:
+                    jr = self.judge_pose(i, *poses[i], f"vlmplace{k}")
+                    verd[i] = jr["verdict"]
+                    row["images"][self.names[i]]["render"] = {kk: jr.get(kk) for kk in ("verdict", "score", "margin", "cover")}
+                n_inc = sum(v == "inconsistent" for v in verd.values())
+                row["render_gate"] = {"inconsistent": n_inc, "pending": len(pending)}
+                if n_inc and 2 * n_inc >= len(pending):
+                    for i in pending:
+                        row["images"][self.names[i]]["why"] = f"render: {n_inc} of {len(pending)} pending members inconsistent; group layout wrong; left out"
+                    render_ok = []
+                else:
+                    for i in pending:
+                        if verd[i] == "inconsistent":
+                            row["images"][self.names[i]]["why"] = "render inconsistent; left out"
+                    render_ok = [i for i in pending if verd[i] != "inconsistent"]
+            if pending and self.gc.vlm_place_unverified and (render_ok is None or render_ok):
                 fig = self.layout_figure(sd / f"g{k}_map.png", picks, G, poses)
                 lc = self.advisor.layout_check(fig, gsheet, self.advisor.sheet(names(picks), sd / f"g{k}_picks.jpg", labels=[str(a + 1) for a in range(len(picks))]),
                                                {"round": k, "group": names(G), "pending": names(pending)})
                 row["layout"] = {kk: lc.get(kk) for kk in ("answer", "confidence", "reason")}
                 ok = str(lc.get("answer", "")).lower() == "plausible" and float(lc.get("confidence") or 0) >= 0.6
-                for i in pending:
-                    row["images"][self.names[i]]["why"] = "layout plausible; registered unverified" if ok else f"layout {lc.get('answer')}; left out"
-                    if ok:
+                if render_ok is not None:   # 3c: the layout check is advisory only (it accepted wrong PTZ layouts, rejected correct BLH ones)
+                    for i in render_ok:
+                        row["images"][self.names[i]]["why"] = f"render {verd[i]} (group not vetoed); layout {lc.get('answer')} (advisory); registered unverified"
                         f_ = ff[self.names[i]]["f"]
                         unverified[i] = (poses[i][0], poses[i][1], None if self.camera_shared(i) else f_)
+                else:
+                    for i in pending:
+                        row["images"][self.names[i]]["why"] = "layout plausible; registered unverified" if ok else f"layout {lc.get('answer')}; left out"
+                        if ok:
+                            f_ = ff[self.names[i]]["f"]
+                            unverified[i] = (poses[i][0], poses[i][1], None if self.camera_shared(i) else f_)
             self.log.append(row)
         # match-confirmed poses join like any other image; then one refinement; unverified ones only after it
         if confirmed:
