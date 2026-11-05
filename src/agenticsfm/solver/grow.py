@@ -1940,7 +1940,8 @@ class Solver:
                 n = self.names[i]
                 Rf, tf = self.transform_pose(ff[n]["E"], al)
                 poses[i] = (Rf, tf)
-                info: dict[str, Any] = {"ff_focal": round(ff[n]["f"], 1)}
+                info: dict[str, Any] = {"ff_focal": round(ff[n]["f"], 1),   # the Pi3X pose in the model frame, for offline checks
+                                        "ff_pose": {"R": np.round(Rf, 6).tolist(), "t": np.round(tf, 6).tolist()}}
                 lp = self.lifted_pnp(i, A, z, zidx[n], al, ff[n]["f"]) if n in zidx else None
                 if lp:
                     info["lifted"] = {kk: lp[kk] for kk in ("matched", "kept", "inliers") if kk in lp}
