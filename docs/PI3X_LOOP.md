@@ -491,3 +491,33 @@ On s00 the VLM layout check rejected the one leftover (149) as "implausible": "t
   2. Tighten the BLH hard fallback "placements agree, render inconsistent" (8–13° admissions).
   3. Multi-seed runs: 3 per scene before quoting any change smaller than about 3 points.
   4. Isolated "agree" failures (0160 at 164°, s02 at 24–30°), which come from Pi3X and PnP agreeing on the same wrong pose.
+
+### Step 17 (2026-11-05): GT check of the BLH render_choose figures in `p123_vlm_dev` (68.5 run)
+The user noted that in both render-choose figures (28 in hard round 7, 33 in hard round 9) both candidate renders look wrong.
+
+- **Method:** recompute both candidate Pi3X placements from the saved results (`_work/scene0/ff_hard{7,9}`), align them to the model on their anchors, and score them against GT (`scripts/analysis/hard_candidates_blh.py`).
+- **Units:** centre error is a fraction of the GT scene scale. These cameras are 3.4–4.5 scene scales from the scene centre.
+
+| Image | Candidate A | Candidate B | VLM's pick | Final (VLM placement, unverified) |
+|---|---|---|---|---|
+| 28 | 5.5° / 0.39 | **3.2° / 0.075** | B (right) | 3.3° / 0.055 |
+| 33 | 4.5° / 0.35 | **1.2° / 0.074** | A (wrong) | 2.6° / 0.053 |
+
+- **B was close to right both times, and A was off in position by about 10% of the camera's distance.** Both figures still look wrong, for two reasons:
+  - The camera stands outside the perimeter wall. The model has no points on the outside of the wall, so nothing occludes the towers and building behind it; the render shows them over the wall.
+  - Pi3X sky depth adds blurred sky "points".
+- **What the figures show is the model's coverage, not pose error.** Render-and-compare cannot verify a viewpoint whose visible surface is not in the model; the VLM can only guess (one of two right here).
+- **Effect on this run:** none. In `--vlm log` mode the answer was not used; the solver rejected both images ("placements disagree"), and `vlm_place` registered them later, correctly (centre error 1.6% of distance).
+- **Far cameras of the final model (GT):**
+  - Rotations are fine, but several cameras about 4.5 scene scales out are misplaced along their viewing axis:
+
+    | Image | Centre error (scene scale) | Fraction of the camera's distance |
+    |---|---|---|
+    | 002 | 1.22 | 27% |
+    | 032 | 0.82 | 18% |
+    | 038 | 0.54 | |
+    | 036 | 0.47 | |
+    | 034 | 0.47 | |
+
+  - Images 22 and 12 (0.27) came in through the hard path.
+  - Of the VLM placements, 13, 28 and 33 are good. Image 32 has a good rotation (3.2°) but a depth error along its viewing axis. Narrow-view distant cameras are poorly constrained in depth by Pi3X and by few matches.
