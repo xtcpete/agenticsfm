@@ -657,3 +657,56 @@ Test set: every leftover-group placement with known GT, 19 images.
   - (a) Keep Phase 3b: admits nothing, 100% precision; BLH stays at 42–45.
   - (b) Render veto instead of stability and layout: BLH back group in most runs, but about 1 in 4 admissions wrong on PTZ, flagged unverified.
   - (c) (b) restricted to groups where Pi3X aligns on points and the render says "no evidence" for the whole group.
+
+**User's choice: (c).**
+
+### Step 25 (2026-11-05): p5 pass (render fixes) and Phase 3c, render veto only
+- **p5_vlm_dev** (commit 65cdcc0, still Phase 3b): A08 43.6, M07 82.8, s00 55.6, s01 58.8, s02 55.0. All within run noise of p4 (45.1, 82.6, 57.4, 58.9, 56.8). No co-located group was split (`colocated.py`).
+  - BLH crashed: when no registered image faced the candidate, `render_sources` returned an empty list. `RenderCompare.judge` then fell back to the neighbours of the (unregistered) candidate itself ("Frame does not have a valid pose").
+  - Fix: an explicit empty source list now gives "no evidence".
+- **Phase 3c, first version** (eb9366f):
+  - Every pending (not match-confirmed) image of a VLM-placed group is judged by the fixed render.
+  - If at least half the pending members are "inconsistent", the whole group is left out (Pi3X places the group jointly).
+  - Otherwise every member that isn't "inconsistent" registers unverified.
+  - The layout check is advisory only. `--ff-off rgate` restores 3b.
+- **Results:**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p6_vlm_dev | 44.6 | 82.1 | 51.1 | 56.9 | 57.2 | 59.4 | **58.6** |
+  | p6_vlm_rep2 | 42.8 | 81.5 | 59.9 | 58.2 | 59.0 | 56.1 | **59.6** |
+
+  - BLH repeats: 43.8 (2 models) and 65.1.
+- **GT check of every pending image** (`scripts/analysis/vlm_place_gt.py`; the Pi3X pose of each pending image is now logged as `ff_pose`, 1570227):
+  - BLH admissions: all rotations 1–3°.
+  - rep2 also admitted 5 wrong placements:
+    - A08: a group of 3 at 11–19°, all "no evidence", layout "plausible";
+    - s01 63: 61°, a single image, "no evidence";
+    - s02 139: 11°, render "consistent".
+  - The render-only rule cannot separate a BLH back group from A08's wrong group: both are all "no evidence".
+- **BLH back cameras:** their rotations are right, but their centres sit 0.2–1.0 camera-spreads off along the viewing direction (Pi3X misjudges distance from a far side). The step-24 "correct" label was rotation only. They still raise auc@10 (relative rotations, and translation directions from far away).
+
+### Step 26 (2026-11-05): Phase 3c with an alignment requirement
+- **What separates the groups:** Pi3X's point alignment to the model on the group's anchors (`point_inl` = share of lifted anchor points within 2% of scene scale after the similarity). Over every vlm_place group since p123:
+  - groups whose admitted placements are correct: 0.92–0.98 (residual ≤ 0.08), 9 groups, all BLH;
+  - groups with wrong placements: ≤ 0.85, typically 0.4–0.7.
+  - Two older PTZ groups (p3b runs) aligned at 0.95 and 0.99, but their poses were not logged. The offline rerun (`ff_stability.py`) aligns them only on rotations, so it is not conclusive.
+- **Rule** (1bf88ce): unverified placements need `by == "points"` and `point_inl >= 0.9`. Then the step-25 render rule applies. `--ff-off ainl` drops the requirement. Cache v26.
+- **Results:**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p7_vlm_dev | 43.9 | 82.7 | 41.7 | 59.9 | 57.6 | 56.7 | **57.1** |
+
+  - BLH repeats: rep999 69.1 (38 registered) and rep998 39.9 (37, 2 models; the back group never became a leftover group, only image 39, match-confirmed).
+- **GT check:**
+  - **Admitted:** 6 images, all BLH rep999 at 2.4–3.6° rotation (5 of 6 within 0.5 camera-spread).
+  - **Left out:** 17, all wrong or degraded:
+    - PTZ and A08: 8–23°;
+    - the p7 BLH group: aligned at 0.70, centres 1.2–1.5 spreads off, 3 of 8 above 5°.
+  - **No wrong admission on any scene**, and the layout check (advisory) said "implausible" on the correct rep999 group.
+- **Reading:**
+  - 3c with alignment keeps 3b's precision and admits the BLH back group whenever Pi3X places it cleanly. In 4 BLH runs since step 25 the clean case happened twice (69.1, 65.1), against 0 of 4 for 3b.
+  - The mean is within noise of the render-only version, which bought +1–2 points with wrong admissions. We keep the alignment requirement (correctness over coverage).
+  - BLH still ranges 40–69, set upstream: whether the back group stays together as one leftover group and how cleanly Pi3X places it.
+  - The 0.9 threshold sits in the gap 0.85–0.92 of about 25 groups. It is a general "the frame agrees with the model" test, but it was chosen on this data.
