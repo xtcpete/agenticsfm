@@ -443,6 +443,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
           var v = vims[n], st = (r.registered || []).indexOf(n) >= 0 ? 'ok' : ((r.unverified || []).indexOf(n) >= 0 ? '' : 'warn');
           var b = []; if (v.lifted) b.push('matches ' + v.lifted.matched + ', depth-consistent ' + v.lifted.kept + (v.lifted.inliers != null ? ', PnP inliers ' + v.lifted.inliers : ''));
           if (v.support != null) b.push('support ' + v.support);
+          if (v.halves_gap) b.push('Pi3X with each half of the picks: ' + v.halves_gap.deg + '° apart, centres ' + v.halves_gap.frac + ' of scene scale');
           return h('div', { style: 'margin:2px 0' }, [h('span', { class: 'tag ' + st, text: n.replace(/\.(jpg|JPG|png|jpeg)$/, '') + (st === '' ? ' (unverified)' : '') }), ' ', h('span', { text: v.why || '' }), h('span', { class: 'muted mono', style: 'font-size:11px', text: b.length ? ' · ' + b.join(' · ') : '' })]);
         });
         row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['VLM place', h('small', { text: (r.group || []).length + ' leftover images' })]),

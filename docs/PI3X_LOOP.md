@@ -368,3 +368,126 @@ Results:
 Passes in flight on commit `3facb08`:
 - `p123_vlm_dev`: GPU 4 (s00, A08), GPU 6 (s01, M07); GPU 5 reused the smoke results for s02 and BLH.
 - `p123_graph_dev`: GPU 5, all six scenes with match-graph selection, as a control for the VLM selection.
+
+### Step 12 (2026-11-05): full pass with Phases 1–3 (`p123_vlm_dev`, commit `3facb08`)
+| Scene | auc@3 | auc@10 | registered | Phase 1 | baseline ff_vlm | v1.3 | scripted |
+|---|---|---|---|---|---|---|---|
+| A08 | 18.3 | 44.7 | 149/150 | 44.8 | 27.7 | 43.1 | 44.3 |
+| M07 | 40.6 | 82.2 | 50/50 | 82.0 | 82.1 | 81.6 | 81.0 |
+| BLH | 30.0 | **68.5** | 39/39 | 39.9 | 60.2 | 50.7 | 49.0 |
+| PTZ s00 | 15.6 | 52.8 | 197/198 (2 models) | 59.0 | 48.5 | 56.1 | 61.6 |
+| PTZ s01 | 17.2 | 57.2 | 182/182 | 56.6 | 52.0 | 55.3 | 61.5 |
+| PTZ s02 | 17.2 | 57.0 | 174/174 | 55.8 | 45.3 | 52.3 | 60.9 |
+| **mean** | 23.2 | **60.4** | | 56.4 | 52.6 | 56.5 | 59.7 |
+
+The first open-solver mean above the scripted COLMAP controller (59.7) and the best earlier open solver (57.4).
+
+**Run-to-run variation from VLM selection:**
+- PTZ s00 fell from 59.0 (Phase 1) to 52.8. Phases 2–3 act only at the end, and rotation attach never triggered, so both runs used the same code up to the leftovers.
+- The difference is the VLM's choices. They are not deterministic, so a different batch order led to a different growth history: 8 cameras > 10° instead of 3, including one from the new path "disagree; matches support feedforward" at 24°.
+- The match-graph control (`p123_graph_dev`, deterministic order) scored **56.4** on s00 with 198/198 images. It was stopped after s00 to apply Phase 3b; the remaining scenes rerun in `p3b_graph_dev`.
+- Single-run differences of a few points on PTZ are therefore within noise. Later comparisons use the graph-selection control and, time permitting, repeated VLM runs.
+
+On s00 the VLM layout check rejected the one leftover (149) as "implausible": "the photo depicts an open field with a parked white car … not the building edge". That was correct; the pose was not registered.
+
+### Step 13 (2026-11-05, 02:40): Phase 3b passes launched (commit `8ec1f66`, cache version 21)
+- `p3b_vlm_dev`: GPU 4 (BLH, s00, A08), GPU 6 (s02, s01, M07).
+- `p3b_graph_dev`: GPU 5, all six scenes, match-graph selection (the control).
+
+### Step 14 (2026-11-05, 03:35): Phase 3b VLM pass (`p3b_vlm_dev`)
+| Scene | auc@3 | auc@10 | registered | Phases 1–3 (`p123`) | Phase 1 (`p1`) |
+|---|---|---|---|---|---|
+| A08 | 18.2 | 45.0 | 149/150 | 44.7 | 44.8 |
+| M07 | 41.2 | 82.4 | 50/50 | 82.2 | 82.0 |
+| BLH | 21.6 | 44.5 | 34/39 | 68.5 | 39.9 |
+| PTZ s00 | 17.4 | 56.3 | 196/198 (2 models) | 52.8 | 59.0 |
+| PTZ s01 | 17.8 | 59.9 | 182/182 | 57.2 | 56.6 |
+| PTZ s02 | 16.1 | 55.4 | 174/174 | 57.0 | 55.8 |
+
+| **mean** | | **57.3** | | 60.4 | 56.4 |
+
+- **PTZ s00 crashed at start:** `grow_model failed: RuntimeError: No registered database factory succeeded` (pycolmap could not open the database; 0.6 s in). This is transient, not a code error; the scene reran on GPU 4 (`p3b_vlm_dev_g4b.log`) and scored 56.3.
+- **Phase 3 added nothing on any scene this time:**
+  - s01 and s02 had no leftover group with matches to the model (s02's 5 leftovers formed a separate model and are excluded).
+  - On A08 the one leftover (149) was rejected by the stability check: the halves gave placements 14.3° apart.
+  - On BLH the leftover group was {32, 2, 38, 28, 33}. The VLM picked only 2 overlapping photos (36, 13), but the stability check needs at least 3 per half, so all 5 were left out. The depth filter again kept 0 of 30–224 matches (the back of the building is only seen from the back).
+- **BLH fell back to 44.5 because growth took a different path, not because of Phase 3b:**
+  - In this run 13, 22, 12, 34 and 32 entered through the hard fallback "placements agree, render inconsistent".
+  - 28 and 33 also entered that way, but were then filtered out in bundle adjustment.
+  - The 4 hard-path images have a median error of 7.1° (22 at 11°).
+  - BLH scores across three runs of nearly the same code: 39.9, 68.5, 44.5. With 39 images, a few cameras move auc@10 by 10–20 points.
+- **Path audit (ff_paths.py, GT only for scoring):**
+  - "feedforward and PnP agree" stays precise: median errors 0.7–1.9°, and only 2 of 92 A08 images > 10°.
+  - "disagree; matches support PnP" is about as good.
+  - The weak paths are the hard fallback "placements agree, render inconsistent" (BLH) and "disagree; render confirms PnP" on s02 (2 images, one at 20°).
+
+### Step 15 (2026-11-05, morning): match-graph control and repeat runs (run-to-run variation)
+`p3b_graph_dev` is the same code with match-graph selection; `p3b_vlm_rep2` repeats the VLM pass (run with `--support-pairs 999`, which only changes the cache key: no image has more than 197 pairs).
+
+| Scene | `p1_vlm` | `p123_vlm` | `p3b_vlm` | `p3b_vlm_rep2` | `p123_graph` | `p3b_graph` | v1.3 | scripted |
+|---|---|---|---|---|---|---|---|---|
+| A08 | 44.8 | 44.7 | 45.0 | running | | 43.8 | 43.1 | 44.3 |
+| M07 | 82.0 | 82.2 | 82.4 | 82.9 | | 82.1 | 81.6 | 81.0 |
+| BLH | 39.9 | 68.5 | 44.5 | running | | 40.7 | 50.7 | 49.0 |
+| PTZ s00 | 59.0 | 52.8 | 56.3 | running | 56.4 | 59.0 | 56.1 | 61.6 |
+| PTZ s01 | 56.6 | 57.2 | 59.9 | 59.1 | | 58.0 | 55.3 | 61.5 |
+| PTZ s02 | 55.8 | 57.0 | 55.4 | 53.8 | | 50.4 | 52.3 | 60.9 |
+| **mean** | 56.4 | 60.4 | 57.3 | | | 55.6 | 56.5 | 59.7 |
+
+- **The match-graph control is not deterministic either.** s00 scored 56.4 in `p123_graph` and 59.0 in `p3b_graph`, and the code differs only after the last refinement. Other sources of variation remain: render-and-compare VLM answers, RANSAC, and Pi3X on GPU.
+- **The spread per scene across runs of near-identical code:**
+  - PTZ: 3–6 points (s00 52.8–59.0, s02 50.4–57.0).
+  - BLH: 39.9–68.5. With 39 images, the back-of-building group (13/28/33, plus 2/32/38) is all or nothing, and the hard fallback "placements agree, render inconsistent" sometimes admits 8–13° poses there (0012 = 13° in `p3b_graph`, 0022 = 11° in `p3b_vlm`).
+  - A08 and M07 are stable (±1).
+- **What is robust:**
+  - Phase 1 lifted A08 from 27.7 to 44–45 in every run.
+  - Every Pi3X-loop run of PTZ s01 and s02 is at or above v1.3, except one graph s02 run.
+  - The 60.4 of `p123_vlm_dev` was the top of the distribution, not the expected value. The fair summary of the current code is about 57 ± 2 mean auc@10 with VLM selection, against 56.5 for v1.3 and 59.7 for the scripted COLMAP controller.
+- **Path audit of `p3b_graph` (GT only for scoring):**
+  - "feedforward and PnP agree" stays the precise workhorse (median 0.7–1.7°).
+  - The errors > 10° are spread thinly over the weak paths: "disagree; render confirms PnP/feedforward", hard placements, and "agree after refining" (0066 = 45° on s02).
+  - Isolated large failures also occur inside "agree": 0160 = 164° on s00, and 0102/0073/0105 = 24–30° on s02.
+
+### Step 16 (2026-11-05, morning): offline test of the Phase 3b stability check (`scripts/analysis/ff_stability.py`)
+- **Method:** for the two `p123_vlm_dev` leftover groups whose unverified poses we know are right (BLH) or wrong (s02), rerun Pi3X three times: with the solver's anchors, and with each half of the VLM's picks. Align each run to the final model and score it against GT. Alignment fell back to rotations and centres for all runs, because no point alignment passed 30%. Output: `outputs/analysis/ff_stability_p123.json`.
+
+| Scene | Image | Error, all anchors | Error, half 0 / half 1 | Rotation gap between halves | Centre gap / scene scale |
+|---|---|---|---|---|---|
+| BLH | 0013 | 2.9° | 2.9° / 4.1° | 6.1° | 7.6 |
+| BLH | 0028 | 4.1° | 0.9° / 4.9° | 4.6° | 7.9 |
+| BLH | 0032 | 2.3° | 2.9° / 1.6° | 1.6° | 0.65 |
+| BLH | 0033 | 3.4° | 1.2° / 4.0° | 4.7° | 7.9 |
+| s02 | 0013 | 21.0° | 46.1° / 18.7° | 28.9° | 0.50 |
+| s02 | 0139 | 14.4° | 11.1° / 11.9° | 21.9° | 0.50 |
+| s02 | 0145 | 28.3° | 58.7° / 26.1° | 34.7° | 0.39 |
+| s02 | 0155 | 15.0° | 50.6° / 14.0° | 46.1° | 0.37 |
+| s02 | 0156 | 20.1° | 7.0° / 15.5° | 14.7° | 0.77 |
+
+- **The rotation gap separates the two groups:**
+  - The correct BLH poses have gaps of 1.6–6.1°.
+  - The wrong s02 poses have gaps of 14.7–46°.
+  - So the check has the right signal, and it would have stopped all of s02's wrong admissions.
+- **The centre test is useless here.** With only 3 anchors, aligning by rotations and centres puts the camera centres several scene scales apart even when the rotation is right. The online rule (5° and 5% of scene scale) would therefore also reject the correct BLH poses.
+- **Rotation alone at 5° would reject BLH 0013 (6.1°).** The sample is 9 images on 2 scenes, too small to set a threshold. Any change (rotation gap only, a threshold near 10°) needs more leftover groups first, per the no-overfitting rule.
+- **Phase 3b as run also needs 6 picks.** On `p3b_vlm` BLH the VLM picked only 2 overlapping photos, so the check could not run. Splitting all of the solver's anchors (picks plus matched anchors) into halves would make it applicable.
+- **Status:** Phase 3b stays as committed: conservative, admitting nothing wrong but also nothing right. The proposed change (rotation-gap-only test on halves of all anchors) is listed under next steps and not applied.
+
+### Where things stand (2026-11-05 morning)
+- **Implemented:** every item of the plan.
+  - Phase 1: inliers in the prompt, matched anchors, point alignment P1, match support settling disagreements, focal check, final sweep.
+  - Phase 2: rotation attach.
+  - Phase 3: VLM overlap pick, Pi3X with the picks, depth-filtered PnP, layout check, unverified registration.
+  - Phase 3b: the stability check.
+  - Point-map tests: P1 kept, P2 dropped, P5 (depth in bundle adjustment) dropped.
+- **Measured:** about 57 ± 2 mean auc@10, against 52.6 for the Pi3X-loop baseline and 56.5 for v1.3. The best single run was 60.4.
+- **Kept:**
+  - P1: A08 +17 every run, PTZ +3..+10.
+  - Settle by match support and the focal check: removed the 11.8° BLH image 32.
+- **Inert so far:**
+  - Rotation attach: 0 triggers.
+  - VLM placement: correct on BLH once; after Phase 3b it admits nothing.
+- **Next, ranked:**
+  1. Halves of all anchors, with a rotation-gap-only stability test, checked on more leftover groups.
+  2. Tighten the BLH hard fallback "placements agree, render inconsistent" (8–13° admissions).
+  3. Multi-seed runs: 3 per scene before quoting any change smaller than about 3 points.
+  4. Isolated "agree" failures (0160 at 164°, s02 at 24–30°), which come from Pi3X and PnP agreeing on the same wrong pose.
