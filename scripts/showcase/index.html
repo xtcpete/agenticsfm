@@ -235,15 +235,19 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
     cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'ETH3D, 13 dev scenes · colmap_auc @1 / 3 / 5' }), h('div', { class: 'big', text: '66.1 / 86.8 / 91.8' }), h('div', { class: 'muted', text: 'open solver v1.3 · scripted COLMAP controller 66.7 / 87.1 / 91.9 · best fixed pipeline 60.4 / 83.5 / 89.5' })]));
     cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'ETH3D, 12 test scenes' }), h('div', { class: 'big', text: '65.2 / 84.3 / 88.6' }), h('div', { class: 'muted', text: 'scripted 70.5 / 89.3 / 93.5: the gap is old_computer (a mirrored block of 17 cameras, visible in its GT alignment) and lounge (precision)' })]));
     cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · auc_all @10 / @3' }), h('div', { class: 'big', text: '56.5 / 21.5' }), h('div', { class: 'muted', text: 'scripted 59.7 / 22.5 · fixed 58.9 / 19.5 · the loss is the three PTZ scenes; BLH0001 and M07 are above both baselines' })]));
+    if (INDEX.groups.some(function (g) { return g.id === 'solver-ffvlm'; }))
+      cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · Pi3X every round, VLM picks the images · auc_all @10 / @3' }), h('div', { class: 'big', text: '52.6 / 21.1' }), h('div', { class: 'muted', text: 'BLH0001 60.2, the best of any method; A08 27.7 (Pi3X stops aligning once the model mixes altitudes); PTZ 45–52' })]));
     v.appendChild(cards);
     INDEX.groups.forEach(function (g) {
       var sec = h('div', { class: 'section' }, [h('h2', { text: g.title })]);
       var ds0 = INDEX.episodes[g.episodes[0]].dataset;
       var hasEth = g.episodes.some(function (id) { return INDEX.episodes[id].dataset === 'eth3d'; });
       var hasWr = g.episodes.some(function (id) { return INDEX.episodes[id].dataset === 'wriva'; });
+      var hasSolver = g.episodes.some(function (id) { var e = INDEX.episodes[id]; return e.refs && e.refs.solver; });
+      if (g.id === 'solver-ffvlm') sec.appendChild(h('p', { text: 'Pi3X loop: every round, the VLM looks at the images already in the model and the remaining candidates and picks the next batch; Pi3X places the batch with matched anchors from the model, and each image is kept when its Pi3X pose and its PnP pose agree (or render-and-compare confirms one of them), then triangulated and refined locally; global bundle adjustment runs as the model grows by a quarter. Each round row lists every image with its reason.' }));
       sec.appendChild(h('p', { text: 'Same matches as the baseline controllers; the score is the submitted model (grown, then shared-intrinsics refinement). GT columns: median per-camera rotation error after alignment and the number of cameras more than 10 degrees off.' }));
       var head = h('tr', {}, [h('th', { text: 'Scene' }), h('th', { class: 'num', text: 'Images' }), h('th', { class: 'num', text: 'Registered' }),
-        h('th', { class: 'num', text: hasEth && !hasWr ? 'AUC@1°' : (hasWr && !hasEth ? 'AUC@10°' : 'Primary') }), h('th', { class: 'num', text: 'vs scripted' }), h('th', { class: 'num', text: 'vs fixed' }),
+        h('th', { class: 'num', text: hasEth && !hasWr ? 'AUC@1°' : (hasWr && !hasEth ? 'AUC@10°' : 'Primary') }), h('th', { class: 'num', text: 'vs scripted' }), h('th', { class: 'num', text: 'vs fixed' }), hasSolver ? h('th', { class: 'num', text: 'vs solver v1.3' }) : null,
         h('th', { class: 'num', text: 'GT median °' }), h('th', { class: 'num', text: 'GT > 10°' }), h('th', { class: 'num', text: 'Rounds · hard' }), h('th', { class: 'num', text: 'Wall s' })]);
       var tb = h('tbody');
       g.episodes.forEach(function (id) {
@@ -252,7 +256,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
         tb.appendChild(h('tr', { class: 'link', onclick: function () { location.hash = id; } }, [
           h('td', { text: ep.title + (ep.dataset === 'eth3d' ? '' : '') }), h('td', { class: 'num', text: ep.num_images == null ? '–' : ep.num_images }),
           h('td', { class: 'num', text: ep.score ? ep.score.registered : '–' }), h('td', { class: 'num', text: fmt(s) }),
-          h('td', { class: 'num' }, [delta(s, sc)]), h('td', { class: 'num' }, [delta(s, fx)]),
+          h('td', { class: 'num' }, [delta(s, sc)]), h('td', { class: 'num' }, [delta(s, fx)]), hasSolver ? h('td', { class: 'num' }, [delta(s, ep.refs && ep.refs.solver ? ep.refs.solver[m] : null)]) : null,
           h('td', { class: 'num', text: ep.gt_align ? fmt(ep.gt_align.median_rot_deg, 2) : '–' }), h('td', { class: 'num' }, [ep.gt_align ? h('span', { class: 'delta ' + (ep.gt_align.over_10 ? 'down' : 'flat'), text: String(ep.gt_align.over_10) + (ep.gt_align.unregistered ? ' +' + ep.gt_align.unregistered + ' missing' : '') }) : '–']),
           h('td', { class: 'num', text: ((ep.grow ? ep.grow.rounds : '–') + ' · ' + (ep.grow ? (ep.grow.hard_placed != null ? ep.grow.hard_placed : ep.grow.joins) : '–')) }),
           h('td', { class: 'num', text: ep.wall == null ? '–' : Math.round(ep.wall) })]));
@@ -276,6 +280,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
     var ms = metricsFor(ep.dataset);
     var head = h('tr', {}, [h('th', { text: 'Model' })].concat(ms.map(function (m) { return h('th', { class: 'num', text: m[1] }); })).concat([h('th', { class: 'num', text: 'Registered' })]));
     var rows = [['this episode (' + ep.controller + ')', ep.score], ['scripted controller, same tools', ep.refs && ep.refs.scripted], ['best fixed pipeline', ep.refs && ep.refs.fixed]];
+    if (ep.refs && ep.refs.solver) rows.splice(1, 0, ['open solver ' + (ep.refs.solver_run === 'incremental_v13' ? 'v1.3 (PnP growth)' : ep.refs.solver_run), ep.refs.solver]);
     var tb = h('tbody');
     rows.forEach(function (r, i) {
       if (!r[1]) return;
@@ -373,12 +378,25 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
   function growthBlock(log, summary) {
     var box = h('div', { class: 'rounds' });
     box.appendChild(h('div', { class: 'eyebrow', text: 'Growth, round by round · click a round to show the model at that point' }));
-    var rounds = log.filter(function (r) { return ['seed', 'pnp', 'join', 'hard'].indexOf(r.kind) >= 0 && !r.model; });
+    var rounds = log.filter(function (r) { return ['seed', 'pnp', 'join', 'hard', 'ff'].indexOf(r.kind) >= 0 && !r.model; });
     var counts = rounds.map(function (r) { return r.kind === 'seed' ? (r.attempts && r.attempts[r.chosen] ? r.attempts[r.chosen].num_registered : 0) : (r.num_registered || 0); });
     var total = summary && summary.num_images ? summary.num_images : Math.max.apply(null, counts);
     box.appendChild(growthChart(counts, total, rounds));
     log.forEach(function (r) {
       var row;
+      if (r.kind === 'vlm' && r.question === 'select_next') {
+        var sa = (r.answer && typeof r.answer === 'object') ? r.answer : {}, pool = (r.context && r.context.pool) || [];
+        var nm = function (n) { return pool[n - 1] ? String(pool[n - 1]).replace(/\.(jpg|JPG|png|jpeg)$/, '') : '#' + n; };
+        var sfigs = []; Object.keys(r.images || {}).forEach(function (label) { (r.images[label] || []).forEach(function (im) { if (im.src) sfigs.push({ src: im.src, name: label.replace(/[:(].*$/, '').trim(), w: 0, h: 0 }); }); });
+        box.appendChild(h('div', { class: 'round vlm' }, [h('div', { class: 'lab' }, ['VLM', h('small', { text: 'next images · round ' + (r.context ? r.context.round : '') })]),
+          h('div', { class: 'body' }, [h('span', { text: 'Picked ' + (sa.pick || []).length + ' of ' + pool.length + ' candidates for the next Pi3X round' }), ' ', h('span', { class: 'muted', text: (r.context ? r.context.registered + ' images in the model · ' : '') + (r.seconds || '') + ' s' }),
+            r.error ? h('div', { class: 'err', text: String(r.error).slice(0, 300) }) : null,
+            h('div', { class: 'tags' }, tags((sa.pick || []).map(nm), 'ok')),
+            (sa.skip || []).length ? h('div', { style: 'font-size:13px;margin:4px 0' }, (sa.skip || []).map(function (k) { return h('div', {}, [h('span', { class: 'tag warn', text: 'skip ' + nm(k.n) }), ' ', h('span', { class: 'says', text: k.why || '' })]); })) : null,
+            r.reasoning ? h('details', { class: 'thinking' }, [h('summary', { text: 'Thinking · last ' + r.reasoning.length + ' chars' }), h('div', { class: 'body', text: r.reasoning })]) : null,
+            sfigs.length ? h('div', { class: 'thumbs' }, sfigs.map(function (im) { return h('div', {}, [h('button', { type: 'button', onclick: function () { openImage(im); } }, [h('img', { src: im.src, alt: im.name, loading: 'lazy' })]), h('div', { class: 'cap', text: im.name })]); })) : null])]));
+        return;
+      }
       if (r.kind === 'vlm') {
         var ans = (r.answer && typeof r.answer === 'object') ? r.answer : {};
         var figs = [];
@@ -392,7 +410,29 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
             figs.length ? h('div', { class: 'thumbs' }, figs.map(function (im) { return h('div', {}, [h('button', { type: 'button', onclick: function () { openImage(im); } }, [h('img', { src: im.src, alt: im.name, loading: 'lazy' })]), h('div', { class: 'cap', text: im.name })]); })) : null])]);
         box.appendChild(row); return;
       }
-      if (r.kind === 'hard') {
+      if (r.kind === 'ff') {
+        var fims = r.images || {}, sel = r.select || {}, al = r.align || {}, freg = r.registered || [];
+        var fitems = Object.keys(fims).map(function (n) {
+          var v = fims[n], ok = freg.indexOf(n) >= 0, rd = v.render || {}, bits = [];
+          var rtxt = Object.keys(rd).map(function (tg) { return (tg === 'ff' ? 'Pi3X' : 'PnP') + ' ' + rd[tg].verdict + (rd[tg].score == null ? '' : ' (' + rd[tg].score + ')'); }).join(', ');
+          if (v.ff_focal != null) bits.push('Pi3X f ' + Math.round(v.ff_focal));
+          if (v.pnp_inliers) bits.push('PnP ' + v.pnp_inliers + ' inliers' + (v.pnp_focal ? ', f ' + Math.round(v.pnp_focal) : ''));
+          if (v.agree_deg != null) bits.push('gap ' + v.agree_deg + '° rotation' + (v.agree_view_deg != null ? ' / ' + v.agree_view_deg + '° view' : ''));
+          if (v.refined_agree_deg != null) bits.push('after refining ' + v.refined_agree_deg + '°' + (v.refined_agree_view_deg != null ? ' / ' + v.refined_agree_view_deg + '°' : ''));
+          if (rtxt) bits.push('render: ' + rtxt);
+          if (v.ba_drift_deg != null) bits.push('local BA moved it ' + v.ba_drift_deg + '°');
+          return h('div', { style: 'margin:2px 0' }, [h('span', { class: 'tag ' + (ok ? 'ok' : 'warn'), text: n.replace(/\.(jpg|JPG|png|jpeg)$/, '') }), ' ', h('span', { text: v.why || '' }),
+            h('span', { class: 'muted mono', style: 'font-size:11px', text: bits.length ? ' · ' + bits.join(' · ') : '' })]);
+        });
+        var atxt = al.ok ? ('Pi3X aligned to the model on ' + al.used + ' anchors by ' + (al.by === 'rotations' ? 'rotations, then centres' : 'centres') + ' · residual ' + al.resid + (al.rot_dev != null ? ' · anchor rotation spread ' + al.rot_dev + '°' : '') + ((al.dropped || []).length ? ' · ' + al.dropped.length + ' anchors dropped' : ''))
+          : ('Pi3X did not align to the model' + (al.why ? ': ' + al.why : '') + '; PnP only');
+        row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, ['Round ' + r.round, h('small', { text: 'Pi3X + ' + (r.anchors || []).length + ' anchors' + (r.model ? ' · ' + r.model : '') })]),
+          h('div', { class: 'body' }, [h('div', {}, ['+' + freg.length + ' of ' + (r.batch || []).length + ' · ' + (r.deferred || []).length + ' deferred · chosen by ' + (sel.by === 'vlm' ? 'the VLM' : 'the match graph') + ' from ' + (sel.pool || r.candidates) + ' candidates · ' + r.num_registered + ' in model · ' + r.num_points + ' points · reproj ' + r.reproj]),
+            h('div', { class: 'muted', style: 'font-size:12px;margin:2px 0' }, [atxt])].concat(fitems))]);
+      } else if (r.kind === 'split') {
+        row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Split', h('small', { text: 'covisibility' })]),
+          h('div', { class: 'body' }, [(r.scenes || []).length + ' scene' + ((r.scenes || []).length === 1 ? '' : 's') + ' of ' + JSON.stringify(r.scenes || []) + ' images · ' + (r.unassigned || 0) + ' unassigned · ' + (r.cuts || []).map(function (c) { return 'cut ' + JSON.stringify(c.sizes) + ' conductance ' + c.conductance + ': ' + c.decision; }).join(' · ')])]);
+      } else if (r.kind === 'hard') {
         var ims = r.images || {};
         var items = Object.keys(ims).map(function (n) {
           var v = ims[n], ok = (r.registered || []).indexOf(n) >= 0;

@@ -57,7 +57,8 @@ class Advisor:
     def enabled(self) -> bool:
         return self.mode != "off"
 
-    def ask(self, kind: str, parts: list[tuple[str, list[str]]], question: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    def ask(self, kind: str, parts: list[tuple[str, list[str]]], question: str, context: dict[str, Any] | None = None,
+            max_side: int | None = None) -> dict[str, Any]:
         """parts: [(label, [image names]), ...]; the question ends with the JSON schema expected."""
         content: list[dict[str, Any]] = []
         shown = []
@@ -65,7 +66,7 @@ class Advisor:
             content.append({"type": "text", "text": label})
             for n in names:
                 path = Path(n) if Path(n).is_absolute() else self.images_dir / n
-                content.append(encode_image(str(path), self.max_side))
+                content.append(encode_image(str(path), max_side or self.max_side))
                 shown.append(n)
         content.append({"type": "text", "text": question})
         t0 = time.time()
@@ -153,3 +154,51 @@ class Advisor:
              'or of different sites? Answer {"answer": "same" | "different" | "unsure", "confidence": 0-1, "reason": "<one sentence>"}')
         a = self.ask("same_scene", parts, q, context)
         return str(a.get("answer", "unsure")).strip().lower() if isinstance(a, dict) else "unsure"
+
+    def sheet(self, names: list[str], out: Path, labels: list[str] | None = None, tile: int = 360, cols: int = 4) -> str:
+        """Contact sheet of images (numbered when labels are given), so many images reach the VLM in one picture."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        rows = (len(names) + cols - 1) // cols
+        th = int(tile * 0.75)
+        canvas = Image.new("RGB", (cols * tile, rows * th), (20, 20, 20))
+        try:
+            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
+        except OSError:
+            font = ImageFont.load_default()
+        for a, n in enumerate(names):
+            im = Image.open(self.images_dir / n)
+            im.draft("RGB", (tile * 2, th * 2))
+            im = im.convert("RGB")
+            im.thumbnail((tile - 6, th - 6))
+            x, y = (a % cols) * tile + (tile - im.width) // 2, (a // cols) * th + (th - im.height) // 2
+            canvas.paste(im, (x, y))
+            if labels:
+                d = ImageDraw.Draw(canvas)
+                lx, ly = (a % cols) * tile + 6, (a // cols) * th + 6
+                d.rectangle([lx, ly, lx + 58, ly + 42], fill=(255, 210, 0))
+                d.text((lx + 6, ly + 2), labels[a], fill=(0, 0, 0), font=font)
+        canvas.save(out, quality=90)
+        return str(out)
+
+    def select_next(self, model_sheet: str, cand_sheet: str, num: int, pick: int, context: dict[str, Any] | None = None) -> tuple[list[int], dict[str, Any]]:
+        """Which candidates should join the reconstruction next. Returns 0-based candidate indices (best first) and the answer."""
+        parts = [("Images already reconstructed (the part of the 3D model the candidates connect to):", [model_sheet]),
+                 (f"Candidate images, numbered 1 to {num} (yellow labels):", [cand_sheet])]
+        q = (f"The reconstruction grows a few images at a time; each new image is placed next to the reconstructed images it overlaps. Pick up to {pick} "
+             "candidates to add next: images that clearly show part of the same place as the reconstructed images, with plenty of overlap, so their "
+             "placement will be reliable. Skip candidates that show a different place that only looks similar (a repeated facade, a twin building, "
+             "a different street), and candidates with little usable content (mostly sky, water, blur, or a featureless close-up); they are tried "
+             "later, when more of the model exists. Answer {\"pick\": [candidate numbers, best first], \"skip\": [{\"n\": number, \"why\": \"<a few words>\"}, ...]}")
+        a = self.ask("select_next", parts, q, context, max_side=1440)
+        out: list[int] = []
+        if isinstance(a, dict) and isinstance(a.get("pick"), list):
+            for v in a["pick"]:
+                try:
+                    k = int(v) - 1
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= k < num and k not in out:
+                    out.append(k)
+        return out[:pick], a

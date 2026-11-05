@@ -32,6 +32,9 @@ PARAMS = {
                 "description": "the VLM advisor: decide = arbitrate disagreeing placements and judge whether extra models are the same scene; log = ask but never act"},
         "multi_model": {"type": "boolean", "default": True, "description": "reconstruct leftover connected image sets as further models (separate scenes)"},
         "support_pairs": {"type": "integer", "default": 1000, "description": "match support from each image's strongest pairs only"},
+        "support_norm": {"type": "boolean", "default": True, "description": "pair consistency relative to the pair's own best two-view fit"},
+        "loop": {"type": "string", "enum": ["ff", "pnp"], "default": "ff", "description": "ff: feedforward placement every round, checked by PnP; pnp: PnP rounds"},
+        "select": {"type": "string", "enum": ["graph", "vlm"], "default": "graph", "description": "who picks each round's images"},
         "scores_id": {"type": "string", "description": "FlexGlue covisibility scores of the database: the images are split into scenes first, "
                                                        "so feedforward calls never mix scenes; each scene gets its own solver run"},
     },
@@ -44,14 +47,14 @@ PARAMS = {
                         "against the matches and dropped when they disagree. Returns per-model statistics and the growth log.", PARAMS)
 def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str = "pi3x", seed_size: int = 12, group_size: int = 8,
                min_support: float = 0.5, hard: bool = True, vlm: str = "decide", multi_model: bool = True, scores_id: str | None = None,
-               support_pairs: int = 1000) -> ToolResult:
+               support_pairs: int = 1000, support_norm: bool = True, loop: str = "ff", select: str = "graph") -> ToolResult:
     from agenticsfm.solver.scenes import split_scenes
     from agenticsfm.tools.score_pairs import load_scores
 
     started = time.time()
     params = {"feedforward": feedforward, "seed_size": int(seed_size), "group_size": int(group_size),
-              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 13,
-              "support_pairs": int(support_pairs)}
+              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 17,
+              "support_pairs": int(support_pairs), "support_norm": bool(support_norm), "loop": loop, "select": select}
     inputs = {"db": db_id, **({"scores": scores_id} if scores_id else {})}
     id = ws.artifact_id("grow_model", params, inputs)
     if (r := cached_result(ws, id)) is not None:
@@ -60,7 +63,8 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir(parents=True)
     gc = GrowConfig(feedforward=feedforward, seed_size=int(seed_size), group_size=int(group_size), min_support=float(min_support), hard=bool(hard),
-                    vlm=vlm, multi_model=bool(multi_model), support_pairs=int(support_pairs))
+                    vlm=vlm, multi_model=bool(multi_model), support_pairs=int(support_pairs),
+                    support_norm=bool(support_norm), loop=loop, select=select)
     gpu = ws.gpus[0] if ws.gpus else None
     split = None
     scenes = [None]

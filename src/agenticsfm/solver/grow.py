@@ -84,11 +84,20 @@ class GrowConfig:
     seed_size: int = 12          # images in the feedforward seed group
     seed_attempts: int = 3       # seed centres to try before giving up
     group_size: int = 8          # PnP registrations per round before verification
+    loop: str = "ff"             # ff: every round places its images with the feedforward model, checked against an independent PnP; pnp: COLMAP-style PnP rounds
+    select: str = "graph"        # graph: the match-graph ranking picks each round's images; vlm: the VLM picks them from a pool of the top ranked
+    select_pool: int = 3         # pool for the VLM selector: select_pool x group_size top-ranked candidates
+    ff_anchors_match: int = 6    # registered images most matched to the round's images, fed to the feedforward model with them ...
+    ff_anchors_diverse: int = 4  # ... plus farthest-point-sampled registered cameras, for a well-conditioned alignment
+    ff_agree_deg: float = 10.0   # a feedforward placement and the independent PnP pose agree within this rotation ...
+    ff_agree_frac: float = 0.05  # ... and this fraction of the scene span
+    ff_global_growth: float = 1.25   # in the ff loop: global bundle adjustment after each 25% growth (local BA every round)
     min_support: float = 0.5     # inlier-weighted share of consistent matches an image needs (strong pairs only)
     support_low: float = 0.25    # between support_low and min_support, render-and-compare gives the second opinion
+    support_norm: bool = True    # pair consistency relative to the pair's own best two-view fit under the same intrinsics (cancels lens/focal error)
     persistent_ff: bool = True   # keep the feedforward model loaded in a worker per GPU (2.8 s per call instead of 20 to 60)
     support_pairs: int = 1000    # match support from each image's strongest pairs (12 admitted more on PTZ but folded PTZ s02; all pairs is the safe default)
-    refocus: bool = True         # before rejecting on support, re-estimate the image's pose with its focal length free and re-check
+    refocus: bool = False         # before rejecting on support, re-estimate the image's pose with its focal length free and re-check
     round_gate: bool = True      # the VLM between rounds: suspects of each round (borderline admits and rejects) judged on their figures
     gate_admit_support: float = 0.65   # an admitted image below this support (or with no strong pair) is a suspect
     gate_max: int = 6            # suspects per round shown to the VLM (one batched call)
@@ -155,6 +164,9 @@ class Solver:
             self.W.setdefault(i, {})[j] = n
             self.W.setdefault(j, {})[i] = n
         self.kps: dict[int, np.ndarray] = {}
+        self._best: dict[tuple[int, int], tuple[float, float]] = {}
+        self._scale_cache: tuple[int, float] = (-1, 1.0)
+        self._last_corr = 0
         self.tries = {i: 0 for i in self.names}
         self.hard_tried = {i: 0 for i in self.names}
         self.status = {i: "unplaced" for i in self.names}
@@ -221,7 +233,32 @@ class Solver:
         t = t / tn
         E = np.array([[0, -t[2], t[1]], [t[2], 0, -t[0]], [-t[1], t[0], 0]]) @ R
         frac_epi = float((sampson(E, x0, x1) * f < self.gc.epipolar_px).mean())
-        return max(frac_epi, frac_rot)
+        pose = max(frac_epi, frac_rot)
+        if not self.gc.support_norm:
+            return pose
+        best = self.best_fit(a, b, x0, x1, f)
+        return min(1.0, pose / best) if best > 0.05 else pose
+
+    def best_fit(self, a: int, b: int, x0: np.ndarray, x1: np.ndarray, f: float) -> float:
+        """Share of the pair's matches the best essential matrix fits within ``epipolar_px`` under the current intrinsics:
+        what the pair can achieve on its own, so a lens or focal error lowers both numerator and denominator.
+        Cached per pair until either focal length moves by more than 2%."""
+        key = (a, b)
+        hit = self._best.get(key)
+        if hit is not None and abs(hit[1] - f) < 0.02 * f:
+            return hit[0]
+        import cv2
+        best = 0.0
+        try:
+            E, _ = cv2.findEssentialMat(np.ascontiguousarray(x0, np.float64), np.ascontiguousarray(x1, np.float64), np.eye(3),
+                                        cv2.RANSAC, 0.999, self.gc.epipolar_px / f)
+            if E is not None:
+                for k in range(0, E.shape[0], 3):
+                    best = max(best, float((sampson(E[k:k + 3], x0, x1) * f < self.gc.epipolar_px).mean()))
+        except cv2.error:
+            best = 0.0
+        self._best[key] = (best, f)
+        return best
 
     def support(self, image_ids: list[int]) -> dict[int, float]:
         with self.timer("support"):
@@ -656,6 +693,320 @@ class Solver:
                  f"{self.rec.num_reg_images()}/{len(self.names)} registered, {row['num_points']} pts, reproj {row['reproj']}")
         return row
 
+    # -- the feedforward loop ------------------------------------------------------------------
+    def link_of(self, i: int) -> tuple[int, int]:
+        """Inliers to registered images in all, and the number of such pairs."""
+        reg = self.reg()
+        ns = [n for j, n in self.W.get(i, {}).items() if j in reg]
+        return sum(ns), len(ns)
+
+    def ranked_candidates(self) -> list[int]:
+        """Unregistered images in the order the match graph suggests: pycolmap's next-image ranking (visible
+        triangulated points, spread over the image) first, then images linked by matches but seeing few points."""
+        reg = self.reg()
+        nxt = [i for i in self.mapper.find_next_images(self.mo, False) if i not in reg and self.tries[i] < self.gc.max_tries]
+        seen = set(nxt)
+        rest = []
+        for i in self.names:
+            if i in reg or i in seen or self.tries[i] >= self.gc.max_tries:
+                continue
+            link, npairs = self.link_of(i)
+            if link >= self.gc.hard_min_link:
+                rest.append((link, i))
+        return nxt + [i for _, i in sorted(rest, reverse=True)]
+
+    def mapper_pose(self, i: int) -> dict[str, Any] | None:
+        """The mapper's own PnP (its correspondence bookkeeping, focal handling and thresholds), read off and undone:
+        the image is deregistered again and its camera restored, so the round decides with both placements in hand."""
+        cam = self.rec.cameras[self.rec.images[i].camera_id]
+        before = np.array(cam.params, dtype=float)
+        with self.timer("pnp"):
+            ok = self.mapper.register_next_image(self.mo, i)
+        if not ok:
+            cam.params = before
+            return None
+        R, t = self.pose_of(i)
+        params = np.array(cam.params, dtype=float)
+        ninl = int(self.rec.images[i].num_points3D)
+        pts2d, pts3d = self.correspondences_2d3d(i)
+        self.deregister(i)
+        cam.params = before
+        X0 = np.median(pts3d, axis=0) if len(pts3d) else -R.T @ t + R[2]
+        return {"R": R, "t": t, "params": params, "inliers": ninl, "of": len(pts3d), "X0": X0, "start": "mapper",
+                "focal": round(float(np.mean(params[:1])), 1)}
+
+    def pnp_pose(self, i: int, f_alt: float | None = None) -> dict[str, Any] | None:
+        r = self.mapper_pose(i)
+        if r is not None:
+            return r
+        return self.own_pnp_pose(i, f_alt)
+
+    def own_pnp_pose(self, i: int, f_alt: float | None = None) -> dict[str, Any] | None:
+        """Independent absolute pose from the 2D-3D correspondences, as the mapper would do it (RANSAC, focal length
+        estimated when the camera has no prior and is not shared, then refined), on a copy of the camera. When that fails
+        and another focal length is offered (the feedforward model's), it is tried as the start. None: no pose."""
+        import pycolmap
+
+        pts2d, pts3d = self.correspondences_2d3d(i)
+        self._last_corr = len(pts3d)
+        if len(pts3d) < 30:
+            return None
+        cam = self.rec.cameras[self.rec.images[i].camera_id]
+        shared = self.camera_shared(i)
+        f0 = cam.mean_focal_length()
+        starts = [(cam.todict(), not shared and not cam.has_prior_focal_length, "camera")]
+        if f_alt and not shared and not (0.8 < f_alt / max(f0, 1e-9) < 1.25):
+            d = cam.todict()
+            p = np.array(d["params"], dtype=float)
+            p[0] = f_alt
+            if cam.model.name in ("PINHOLE", "OPENCV", "FULL_OPENCV", "OPENCV_FISHEYE"):
+                p[1] = f_alt
+            d["params"] = p
+            starts.append((d, False, "feedforward"))
+        best = None
+        for d, est_f, tag in starts:
+            eo = pycolmap.AbsolutePoseEstimationOptions()
+            eo.ransac.max_error = 12.0
+            eo.estimate_focal_length = est_f
+            ro = pycolmap.AbsolutePoseRefinementOptions()
+            ro.refine_focal_length = not shared
+            ro.refine_extra_params = not shared
+            test = pycolmap.Camera(d)
+            with self.timer("pnp"):
+                res = pycolmap.estimate_and_refine_absolute_pose(pts2d, pts3d, test, eo, ro)
+            if not res:
+                continue
+            ninl = int(np.sum(res["inlier_mask"]))
+            if ninl < 30 or ninl < 0.25 * len(pts3d) or not (0.25 * f0 < test.mean_focal_length() < 4 * f0):
+                continue
+            if best is None or ninl > best["inliers"]:
+                P = res["cam_from_world"]
+                X0 = np.median(pts3d[np.asarray(res["inlier_mask"], bool)], axis=0)
+                best = {"R": P.rotation.matrix(), "t": P.translation, "params": np.array(test.params, dtype=float), "inliers": ninl,
+                        "of": len(pts3d), "X0": X0, "start": tag, "focal": round(test.mean_focal_length(), 1)}
+            if tag == "camera" and best is not None:
+                break
+        return best
+
+    def camera_shared(self, i: int) -> bool:
+        cid = self.rec.images[i].camera_id
+        return any(self.rec.images[j].camera_id == cid for j in self.reg() if j != i)
+
+    @staticmethod
+    def view_gap(R0, t0, R1, t1, X0: np.ndarray) -> tuple[float, float]:
+        """Rotation difference and the angle between the two camera centres seen from the scene point the image looks
+        at (degrees). Moving along the viewing ray (the focal/distance trade-off of a long lens) does not count."""
+        c0, c1 = -R0.T @ t0, -R1.T @ t1
+        a, b = c0 - X0, c1 - X0
+        cosang = float(np.dot(a, b) / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-12))
+        return rot_angle(R0 @ R1.T), float(np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0))))
+
+    def align_rot(self, ff: dict[str, dict[str, Any]], anchors: list[int]) -> dict[str, Any] | None:
+        """Similarity from the feedforward frame to the model using the anchors' rotations (chordal mean) as well as their
+        centres: well conditioned for a tight cluster of distant cameras, where the centres alone fix the rotation poorly.
+        Trims up to two anchors whose rotation disagrees by more than 10 degrees."""
+        use = [a for a in anchors if self.names[a] in ff and a in self.reg()]
+        dropped = []
+        while len(use) >= 3:
+            Ms = [self.rec.images[a].cam_from_world().rotation.matrix().T @ ff[self.names[a]]["E"][:, :3] for a in use]
+            U, _, Vt = np.linalg.svd(sum(Ms))
+            R = U @ np.diag([1, 1, np.linalg.det(U @ Vt)]) @ Vt
+            dev = [rot_angle(M @ R.T) for M in Ms]
+            if max(dev) <= 10.0 or len(dropped) >= 2 or len(use) <= 3:
+                break
+            w = int(np.argmax(dev))
+            dropped.append(self.names[use[w]])
+            use.pop(w)
+        if len(use) < 3:
+            return None
+        src = np.array([-ff[self.names[a]]["E"][:, :3].T @ ff[self.names[a]]["E"][:, 3] for a in use])
+        dst = np.array([self.rec.images[a].projection_center() for a in use])
+        ms, md = src.mean(0), dst.mean(0)
+        Rs = (R @ (src - ms).T).T
+        s_ = float(np.sum((dst - md) * Rs) / max(np.sum(Rs * Rs), 1e-12))
+        t_ = md - s_ * R @ ms
+        resid = np.linalg.norm((s_ * (R @ src.T)).T + t_ - dst, axis=1) / max(self.scene_scale(), 1e-9)
+        ok = s_ > 0 and float(resid.mean()) <= self.gc.max_alignment_frac
+        return {"ok": ok, "s": s_, "R": R, "t": t_, "resid": float(resid.mean()), "used": len(use), "dropped": dropped,
+                "rot_dev": round(float(np.median(dev)), 2), "by": "rotations"}
+
+    def pose_gap(self, R0, t0, R1, t1) -> tuple[float, float]:
+        """Rotation difference (degrees) and centre distance relative to the scene scale (the larger of the camera
+        span and the typical camera-to-scene distance: a tight cluster of distant aerial cameras has a small span)."""
+        return rot_angle(R0 @ R1.T), float(np.linalg.norm((-R0.T @ t0) - (-R1.T @ t1))) / max(self.scene_scale(), 1e-9)
+
+    def scene_scale(self) -> float:
+        n = self.rec.num_reg_images()
+        if self._scale_cache[0] != n:
+            depths = []
+            reg = sorted(self.reg())
+            for j in reg[:: max(1, len(reg) // 20)]:
+                im = self.rec.images[j]
+                ids = [p.point3D_id for p in im.points2D if p.has_point3D()][::10][:200]
+                if not ids:
+                    continue
+                X = np.array([self.rec.points3D[q].xyz for q in ids])
+                cfw = im.cam_from_world()
+                z = (X @ cfw.rotation.matrix().T + cfw.translation)[:, 2]
+                depths.append(float(np.median(z)))
+            self._scale_cache = (n, max(self.span(), float(np.median(depths)) if depths else 0.0))
+        return self._scale_cache[1]
+
+    def ff_anchors(self, batch: list[int]) -> list[int]:
+        reg = self.reg()
+        match_w: dict[int, int] = {}
+        for i in batch:
+            for j, n in self.W.get(i, {}).items():
+                if j in reg:
+                    match_w[j] = match_w.get(j, 0) + n
+        ms = sorted(match_w, key=match_w.get, reverse=True)[: self.gc.ff_anchors_match]
+        good = [j for j in reg if self.rec.images[j].num_points3D >= 50 and j not in ms] or [j for j in reg if j not in ms]
+        return list(dict.fromkeys(ms + self.fps(good, self.gc.ff_anchors_diverse, ms or list(reg)[:1])))
+
+    def ff_round(self, k: int) -> dict[str, Any] | None:
+        """One round of the feedforward loop: pick the round's images, place them with the feedforward model next to
+        anchors from the model, check each placement against an independent PnP pose (and render-and-compare where the
+        two disagree or one is missing), register the accepted ones, triangulate, local bundle adjustment."""
+        cand = self.ranked_candidates()
+        if not cand or len(self.reg()) < 3:
+            return None
+        gs = self.gc.group_size
+        pool = cand[: gs * self.gc.select_pool]
+        select_info: dict[str, Any] = {"by": "graph"}
+        batch = pool[:gs]
+        if self.gc.select == "vlm" and self.advisor is not None and self.advisor.enabled and len(pool) > gs:
+            with self.timer("vlm_select"):
+                picks, select_info = self.vlm_select(k, pool, gs)
+            if picks:
+                batch = picks
+        for i in batch:
+            self.tries[i] += 1
+        names = lambda L: [self.names[i] for i in L]  # noqa: E731
+        A = self.ff_anchors(batch)
+        if len(A) < 3:
+            return {"round": k, "kind": "ff", "error": "too few anchors", "batch": names(batch), "registered": []}
+        g = self.ff_groups([names(A) + names(batch)], f"ff{k}", save_depth=True)[0]
+        ff = {n: {"E": np.asarray(E, dtype=np.float64), "f": 0.5 * (K[0][0] / tr[0] + K[1][1] / tr[1])}
+              for n, E, K, tr in zip(g["names"], g["extrinsics"], g["intrinsics"], g["transforms"])}
+        al = self.align_rot(ff, A)
+        if not (al and al.get("ok")):
+            al = self.align(ff, A)
+        aligned = bool(al and al.get("ok"))
+        per: dict[str, dict[str, Any]] = {}
+        accepted: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray | None, float | None, str]] = {}
+        for i in batch:
+            n = self.names[i]
+            info: dict[str, Any] = {}
+            prior = None
+            if aligned:
+                Rf, tf = self.transform_pose(ff[n]["E"], al)
+                prior = (Rf, tf, ff[n]["f"])
+                info["ff_focal"] = round(ff[n]["f"], 1)
+            pnp = self.pnp_pose(i, prior[2] if prior is not None else None)
+            if pnp is not None:
+                info.update({"pnp_inliers": f"{pnp['inliers']}/{pnp['of']}", "pnp_start": pnp["start"], "pnp_focal": pnp["focal"]})
+            else:
+                info["corr_2d3d"] = self._last_corr
+            choice, why = None, ""
+            if prior is not None and pnp is not None:
+                ang, dist = self.view_gap(pnp["R"], pnp["t"], prior[0], prior[1], pnp["X0"])
+                info.update({"agree_deg": round(ang, 1), "agree_view_deg": round(dist, 1)})
+                if ang < self.gc.ff_agree_deg and dist < self.gc.ff_agree_deg:
+                    choice, why = (pnp["R"], pnp["t"], pnp["params"], None), "feedforward and PnP agree"
+                else:
+                    r = self.refine_pose_2d3d(i, prior[0], prior[1])
+                    ang2, dist2 = self.view_gap(pnp["R"], pnp["t"], r["R"], r["t"], pnp["X0"])
+                    info.update({"refined_agree_deg": round(ang2, 1), "refined_agree_view_deg": round(dist2, 1)})
+                    if ang2 < self.gc.ff_agree_deg and dist2 < self.gc.ff_agree_deg:
+                        choice, why = (pnp["R"], pnp["t"], pnp["params"], None), "agree after refining the feedforward placement"
+                    else:
+                        jp = self.judge_pose(i, pnp["R"], pnp["t"], "pnp")
+                        jf = self.judge_pose(i, r["R"], r["t"], "ff")
+                        info["render"] = {"pnp": {kk: jp.get(kk) for kk in ("score", "margin", "verdict")}, "ff": {kk: jf.get(kk) for kk in ("score", "margin", "verdict")}}
+                        cons = [tg for tg, j in (("pnp", jp), ("ff", jf)) if j["verdict"] == "consistent"]
+                        if cons == ["pnp"]:
+                            choice, why = (pnp["R"], pnp["t"], pnp["params"], None), "disagree; render confirms PnP"
+                        elif cons == ["ff"]:
+                            choice, why = (r["R"], r["t"], None, None), "disagree; render confirms feedforward"
+                        else:
+                            why = "disagree; render does not settle it"
+            elif prior is not None:
+                r = self.refine_pose_2d3d(i, prior[0], prior[1])
+                jf = self.judge_pose(i, r["R"], r["t"], "ff")
+                info["render"] = {"ff": {kk: jf.get(kk) for kk in ("score", "margin", "verdict")}}
+                if jf["verdict"] == "consistent" and r.get("inliers", 0) >= 15:
+                    choice, why = (r["R"], r["t"], None, None), "no PnP; feedforward placement, render consistent"
+                else:
+                    why = f"no PnP; feedforward placement, render {jf['verdict']}"
+            elif pnp is not None:
+                jp = self.judge_pose(i, pnp["R"], pnp["t"], "pnp")
+                info["render"] = {"pnp": {kk: jp.get(kk) for kk in ("score", "margin", "verdict")}}
+                if jp["verdict"] == "consistent":
+                    choice, why = (pnp["R"], pnp["t"], pnp["params"], None), "anchors did not align; PnP, render consistent"
+                else:
+                    why = f"anchors did not align; PnP, render {jp['verdict']}"
+            else:
+                why = "no placement"
+            info["why"] = why
+            if choice is not None:
+                accepted[i] = (*choice, why)
+            per[n] = info
+        placed = []
+        if accepted:
+            for i, (R, t, params, f, _) in accepted.items():
+                self.set_pose(i, np.c_[R, t], f)
+                if params is not None:
+                    self.rec.cameras[self.rec.images[i].camera_id].params = params
+                self.rec.register_frame(self.rec.images[i].frame_id)
+            self.attach_mapper()
+            for i in accepted:
+                with self.timer("triangulate"):
+                    self.mapper.triangulate_image(self.tri, i)
+            for i in accepted:
+                with self.timer("local_ba"):
+                    self.mapper.iterative_local_refinement(2, 0.001, self.mo, self.ba, self.tri, i)
+            for i, (R, t, _, _, _) in accepted.items():
+                if i not in self.reg():
+                    per[self.names[i]]["filtered"] = True
+                    continue
+                d, m = self.pose_gap(*self.pose_of(i), R, t)
+                per[self.names[i]].update({"ba_drift_deg": round(d, 2)})
+                placed.append(i)
+                self.status[i] = "placed"
+        for i in batch:
+            if i not in placed:
+                self.status[i] = "deferred"
+        if self.rec.num_reg_images() >= self.gc.ff_global_growth * max(self.last_global, 1):
+            self.global_refine()
+        row = {"round": k, "kind": "ff", "candidates": len(cand), "select": select_info, "batch": names(batch), "anchors": names(A),
+               "align": None if al is None else {kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in al.items() if kk in ("ok", "resid", "used", "dropped", "rot_dev", "by")},
+               "images": per, "registered": names(placed), "deferred": [self.names[i] for i in batch if i not in placed], **self.model_stats()}
+        whys: dict[str, int] = {}
+        for v in per.values():
+            whys[v["why"]] = whys.get(v["why"], 0) + 1
+        self.say(f"ff round {k}: +{len(placed)} of {len(batch)} -> {self.rec.num_reg_images()}/{len(self.names)} registered, "
+                 f"{row['num_points']} pts, reproj {row['reproj']}; " + "; ".join(f"{w}: {c}" for w, c in whys.items()))
+        return row
+
+    def vlm_select(self, k: int, pool: list[int], n: int) -> tuple[list[int], dict[str, Any]]:
+        """The VLM picks the round's images from the top-ranked pool, shown next to the registered images they match most."""
+        reg = self.reg()
+        match_w: dict[int, int] = {}
+        for i in pool:
+            for j, w in self.W.get(i, {}).items():
+                if j in reg:
+                    match_w[j] = match_w.get(j, 0) + w
+        ctx_imgs = sorted(match_w, key=match_w.get, reverse=True)[:8]
+        sheet_dir = self.workdir / "select"
+        model_sheet = self.advisor.sheet([self.names[j] for j in ctx_imgs], sheet_dir / f"round{k}_model.jpg", labels=None)
+        cand_sheet = self.advisor.sheet([self.names[i] for i in pool], sheet_dir / f"round{k}_candidates.jpg", labels=[str(a + 1) for a in range(len(pool))])
+        links = {str(a + 1): self.link_of(i)[0] for a, i in enumerate(pool)}
+        picks_idx, answer = self.advisor.select_next(model_sheet, cand_sheet, len(pool), n,
+                                                     {"round": k, "registered": len(reg), "pool": [self.names[i] for i in pool], "match_inliers": links})
+        picks = [pool[a] for a in picks_idx if 0 <= a < len(pool)][:n]
+        return picks, {"by": "vlm", "pool": len(pool), "picked": [self.names[i] for i in picks],
+                       "graph_top": [self.names[i] for i in pool[:n]], "skipped": answer.get("skip") if isinstance(answer, dict) else None}
+
     def pose_neighbours(self, R: np.ndarray, t: np.ndarray, k: int = 4, exclude: set[int] = frozenset()) -> list[int]:
         return self.nearest_registered(-R.T @ t, R[2], k, exclude)
 
@@ -1033,7 +1384,7 @@ class Solver:
         k, stall = 0, 0
         while k < self.gc.max_rounds:
             k += 1
-            row = self.grow_round(k)
+            row = self.ff_round(k) if self.gc.loop == "ff" else self.grow_round(k)
             if row is None:
                 row = self.place_hard(k) if self.gc.hard else None
                 if row is None:

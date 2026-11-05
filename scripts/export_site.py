@@ -3,10 +3,13 @@ tool step (parameters, summary, evidence images), the open solver's growth log, 
 cameras, gravity-aligned frame) as JSON for the page's 3D viewer.
 
     python scripts/export_site.py --out outputs/site [--runs agent_v13:wriva agent_eth3d_v13:eth3d] [--solver-runs incremental_v0 incremental_v0_t06]
+    second group, merged into an existing site: --solver-runs ff_vlm_dev ff_vlm_dev_s02 --solver-group solver-ffvlm --ep-suffix=-ffvlm
+        --solver-title "..." --controller "Pi3X loop, VLM selection" --compare-run incremental_v13 --merge-into <site>/data/index.json
 
 Then copy scripts/showcase/index.html next to the exported data/, img/ and models/ folders and serve or publish the folder.
 GT scores shown on the page come from each run's results.jsonl (benchmark layer)."""
 import argparse
+import shutil
 import io, json, re, struct, sys, time
 from pathlib import Path
 import numpy as np
@@ -67,11 +70,28 @@ _ap.add_argument("--out", default=str(ROOT / "outputs/site"))
 _ap.add_argument("--runs", nargs="*", default=["agent_v13:wriva", "agent_eth3d_v13:eth3d"], help="agent runs as <run>:<dataset>")
 _ap.add_argument("--solver-runs", nargs="*", default=["incremental_v13", "incremental_v13_mixed"])
 _ap.add_argument("--include-agent", action="store_true", help="also export the archived tool-selection agent episodes")
+_ap.add_argument("--solver-group", default="solver", help="group id of the solver episodes")
+_ap.add_argument("--solver-title", default="Open solver (Pi3X seed, verified growth, VLM-arbitrated hard images; no COLMAP mapper)")
+_ap.add_argument("--controller", default=None, help="controller label of the solver episodes (default: open solver v1.3)")
+_ap.add_argument("--ep-suffix", default="", help="suffix of the episode ids, so a second solver group does not overwrite the first")
+_ap.add_argument("--compare-run", default=None, help="solver run whose score is shown next to each episode (e.g. incremental_v13)")
+_ap.add_argument("--inline-images", action="store_true", help="embed the episode figures in the episode JSON as data URIs (keeps the published file count down)")
+_ap.add_argument("--img-side", type=int, default=1100, help="longest side of the exported figures")
+_ap.add_argument("--merge-into", default=None, help="existing site index.json: keep its groups and episodes, add (or replace) this group")
 _args = _ap.parse_args()
 SITE = Path(_args.out)
 for _d in ("data/ep", "models", "img"):
     (SITE / _d).mkdir(parents=True, exist_ok=True)
-MAX_POINTS, IMG_SIDE = 40000, 1100
+MAX_POINTS, IMG_SIDE = 40000, _args.img_side
+
+def inline_images(x, ep_id):
+    """Replace img/<ep_id>/... paths with data URIs and delete the files."""
+    import base64
+    if isinstance(x, dict): return {k: inline_images(v, ep_id) for k, v in x.items()}
+    if isinstance(x, list): return [inline_images(v, ep_id) for v in x]
+    if isinstance(x, str) and x.startswith(f"img/{ep_id}/") and (SITE / x).is_file():
+        return "data:image/jpeg;base64," + base64.b64encode((SITE / x).read_bytes()).decode()
+    return x
 
 def read_results(run):
     out = {}
@@ -232,7 +252,7 @@ def store_of(run_dir):
 
 index = {"generated": time.strftime("%Y-%m-%d"), "groups": [], "episodes": {}}
 plan = [(f"agent-{ds}", f"Agent, {ds.upper()} ({run})", run, ds, "agent") for run, ds in (r.split(":") for r in _args.runs)] if _args.include_agent else []
-plan.append(("solver", "Open solver (Pi3X seed, verified growth, VLM-arbitrated hard images; no COLMAP mapper)", None, None, "incremental"))
+plan.append((_args.solver_group, _args.solver_title, None, None, "incremental"))
 import pycolmap as _pc
 from agenticsfm.config import load_config as _lc
 from agenticsfm.datasets import load_benchmark as _lb
@@ -268,14 +288,20 @@ for gid, gtitle, run, dataset, controller in plan:
             index["episodes"][ep_id] = ep; group["episodes"].append(ep_id)
     else:
         eth = {s.name for s in (ROOT / "outputs/data/eth3d").iterdir()} if (ROOT / "outputs/data/eth3d").is_dir() else set()
+        # a scene rerun in a later run (e.g. after a crash) replaces the earlier attempt unless that one failed less
+        chosen = {}
         for run in _args.solver_runs:
-            label, dataset_of = (" (filter 0.6)" if "t06" in run else ""), {s: "eth3d" for s in eth}
-            results = read_results(run)
             if not (ROOT / "outputs/runs" / run).is_dir(): continue
+            res = read_results(run)
             for sc_dir in sorted((ROOT / "outputs/runs" / run).iterdir()):
                 if not (sc_dir / "trace.jsonl").is_file(): continue
+                ok = res.get(sc_dir.name, {}).get("status") == "ok"
+                if ok or sc_dir.name not in chosen: chosen[sc_dir.name] = (run, sc_dir, res, ok)
+        if True:
+            for run, sc_dir, results, _ok in chosen.values():
+                label, dataset_of = (" (filter 0.6)" if "t06" in run else ""), {s: "eth3d" for s in eth}
                 scene = sc_dir.name; dataset = dataset_of.get(scene, "wriva" if not scene.startswith(("m07_", "mixed", "images")) else "mixed")
-                ep_id = f"solver-{re.sub(r'[^a-z0-9]+', '-', short_scene(scene).lower()).strip('-')}" + ("-t06" if "t06" in run else "")
+                ep_id = f"solver-{re.sub(r'[^a-z0-9]+', '-', short_scene(scene).lower()).strip('-')}" + ("-t06" if "t06" in run else "") + _args.ep_suffix
                 print("==", ep_id)
                 store = store_of(sc_dir)
                 recs = load_trace(sc_dir)
@@ -293,7 +319,7 @@ for gid, gtitle, run, dataset, controller in plan:
                     for row in grow_log["log"]:
                         if row.get("kind") == "vlm":
                             imgs = {}
-                            for label, names_ in (row.get("images") or {}).items():
+                            for flabel, names_ in (row.get("images") or {}).items():
                                 out_names = []
                                 for nm in names_:
                                     if not Path(nm).is_absolute():          # scene photos: name only; the figures (absolute paths) are copied
@@ -306,7 +332,7 @@ for gid, gtitle, run, dataset, controller in plan:
                                             save_image(src, SITE / rel); out_names.append({"src": rel, "name": Path(nm).name})
                                         except Exception as e:
                                             print("   figure failed", src, e)
-                                imgs[label] = out_names
+                                imgs[flabel] = out_names
                             row["images"] = imgs
                             row["reasoning"] = (row.get("reasoning") or "")[-1200:]
                     # splice the growth rounds after the grow_model tool step
@@ -321,15 +347,27 @@ for gid, gtitle, run, dataset, controller in plan:
                     minfo = export_model(sc_dir / "final", SITE / "models" / f"{ep_id}-final.json", store / "images", order, gt_of(scene))
                     models.append({"id": f"{ep_id}-final", "label": "submitted (after optimize)", "file": f"models/{ep_id}-final.json", "has_order": True, **minfo})
                 r = results.get(scene, {})
-                ep = {"id": ep_id, "group": gid, "title": short_scene(scene) + label + ("" if run == "incremental_v0" else f" [{run.replace('incremental_', '')}]"), "scene": scene, "dataset": dataset,
-                      "controller": "open solver " + ("v0" if run == "incremental_v0" else "v1.3"), "run": run,
-                      "num_images": r.get("num_images_gt"), "score": score_of(r), "refs": ref_scores(scene, dataset), "wall": r.get("wall"),
+                refs = ref_scores(scene, dataset)
+                if _args.compare_run and score_of(read_results(_args.compare_run).get(scene)):
+                    refs["solver"] = score_of(read_results(_args.compare_run).get(scene)); refs["solver_run"] = _args.compare_run
+                title = short_scene(scene) + label + ("" if run == "incremental_v0" or _args.ep_suffix else f" [{run.replace('incremental_', '')}]")
+                ep = {"id": ep_id, "group": gid, "title": title, "scene": scene, "dataset": dataset,
+                      "controller": _args.controller or ("open solver " + ("v0" if run == "incremental_v0" else "v1.3")), "run": run,
+                      "num_images": r.get("num_images_gt"), "score": score_of(r), "refs": refs, "wall": r.get("wall"),
                       "n_turns": 0, "n_tools": sum(1 for s in steps if s["kind"] == "tool"), "tokens": 0, "submitted": r.get("submitted"), "models": models,
                       "grow": trim(grow_log["summary"]) if grow_log else None,
                       "gt_align": next((m["gt"] for m in reversed(models) if m.get("gt")), None)}
-                (SITE / "data/ep" / f"{ep_id}.json").write_text(json.dumps({**ep, "steps": steps}, default=str))
+                full = {**ep, "steps": steps}
+                if _args.inline_images:
+                    full = inline_images(full, ep_id); shutil.rmtree(SITE / "img" / ep_id, ignore_errors=True)
+                (SITE / "data/ep" / f"{ep_id}.json").write_text(json.dumps(full, default=str))
                 index["episodes"][ep_id] = ep; group["episodes"].append(ep_id)
     index["groups"].append(group)
+if _args.merge_into:
+    old = json.loads(Path(_args.merge_into).read_text())
+    new_ids = {g["id"] for g in index["groups"]}
+    index["groups"] = [g for g in old["groups"] if g["id"] not in new_ids] + index["groups"]
+    index["episodes"] = {**{k: v for k, v in old["episodes"].items() if v.get("group") not in new_ids}, **index["episodes"]}
 (SITE / "data/index.json").write_text(json.dumps(index, default=str))
 import os
 total = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(SITE) for f in fs)
