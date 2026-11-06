@@ -826,3 +826,30 @@ Test set: every leftover-group placement with known GT, 19 images.
   - Pi3X places BLH back images 2, 32, 36 and 38 (and side images 12, 34) about one camera-spread off in every run. Only 13, 28 and 33 come out precise.
   - BLH scores in the high 50s and 60s needed the imprecise placements. With precise admissions only, BLH is about 47–52.
   - Remaining run-to-run variance is no longer the VLM. It comes from Pi3X/GPU nondeterminism near thresholds (alignment 0.877 vs 0.9) and from the route through the hard stage.
+
+### Step 33 (2026-11-06, offline): can the BLH back cameras be corrected? No
+- **The back cameras are co-located clusters** (GT): 2/32/36/38 share one position, 13/28/33 another, 12/22 another, 7.7 camera spreads apart.
+- **Match triangulation + BA** of the unverified poses (everything else fixed, Cauchy loss, 3 rounds):
+  - 2/32/38 went from about 1.0 to 3.0 spreads (10°);
+  - accurate admissions degraded (0.09 → 0.54);
+  - 13/28/33 improved only where they started about 1 spread off.
+- **Their matches to model points are lookalikes.** BLH's back looks like its front: PnP on them lands 7–10 spreads off, mostly flipped about 180°, per image and pooled per co-located cluster.
+- **PnP on Pi3X-lifted points** of the other group members reproduces the Pi3X pose (circular). Using only the accurate cluster's points fails too: 2/32/36/38 share 22–70 matches with it.
+- **3D–3D ICP** of Pi3X depth points to the model's points made every camera worse. Even with the cameras at their GT poses, only 0.6% of 2/32/36/38's Pi3X points lie within 0.25 spreads of a model point (0.0% within 0.05). The model has no reconstruction of what they see.
+- **Conclusion:** no data in the scene can correct 2/32/36/38. Pi3X (about 1 spread off) is the only source.
+
+### Step 34 (2026-11-06): admit moved survivors with their joint Pi3X pose, unverified (commit 5b395b8, cache v33)
+- **User's choice:** admit them with the Pi3X pose, flagged unverified, no BA.
+  - Survivors that move under re-placement keep the joint pose. GT p11–p13 (22 moved survivors): joint mean 0.87 spreads off vs 1.81 re-placed; > 2 spreads off: joint 1 vs re-placed 4.
+  - All other gates are unchanged. `--ff-off moved` restores accurate-only.
+- **Results (p14):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p14_vlm_dev | 44.7 | 82.7 | 46.2 | 57.7 | 55.5 | 57.5 | **57.4** |
+
+  - BLH repeats: 56.3, 50.9, 58.7 (mean of 4: 53.0; p12 54.2, p13 46.9).
+- **GT check:** 20 admissions, all BLH; none elsewhere (no PTZ or A08 group passed the alignment).
+  - All rotations ≤ 6.2°. Centres: 13/28/33/22 at 0.02–0.31 spreads; 2/32/38 at 0.92–1.36.
+  - In BLH dev, 2/32/38 were re-placed stably (they did not move) at 2.0–2.2 spreads off, so the stability test can't catch them.
+- **Reading:** BLH now admits the back group in every run. BLH's remaining variance is how far off Pi3X puts the 2/32/36/38 cluster (0.9–2.2 spreads).
