@@ -117,6 +117,9 @@ class GrowConfig:
                                        # of the anchors agrees with the model; GT audit: correct groups 0.92-0.98, wrong ones <= 0.85)
     vlm_place_retry: bool = True       # Pi3X aligned below vlm_place_min_inl: retry with other anchor sets (picks only, most matched only) and
                                        # without members that were registered and later removed; keep the best point alignment
+    vlm_place_trusted: bool = True     # reference photos / Pi3X anchors only from images registered by matches (seed, ff rounds), not from
+                                       # hard-stage, held or unverified ones (GT: those carry centre errors of 0.9-2.6 camera spreads and
+                                       # broke every failed BLH alignment); all registered images when fewer than 3 trusted ones share matches
     vlm_place_extra: bool = True       # images of a second model that did not merge are leftovers for vlm_place too; the model merges
                                        # when vlm_place registers at least half its images, else it stays a separate model
     vlm_place_stable: bool = False     # Phase 3b gate (instead of 3c): Pi3X places the image the same way with two disjoint halves of the picks
@@ -1906,6 +1909,10 @@ class Solver:
             G = sorted(G, key=lambda i: -sum(n for j, n in self.W.get(i, {}).items() if j in G))[:8]
             names = lambda L: [self.names[x] for x in L]  # noqa: E731
             reg = self.reg()
+            if self.gc.vlm_place_trusted:
+                trusted = reg - self.hard_placed - self.held - self.unverified
+                if sum(1 for j in trusted if any(j in self.W.get(i, {}) for i in G)) >= 3:
+                    reg = trusted
             mw: dict[int, int] = {}
             for i in G:
                 for j, n in self.W.get(i, {}).items():
