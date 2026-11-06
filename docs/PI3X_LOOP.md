@@ -710,3 +710,48 @@ Test set: every leftover-group placement with known GT, 19 images.
   - The mean is within noise of the render-only version, which bought +1–2 points with wrong admissions. We keep the alignment requirement (correctness over coverage).
   - BLH still ranges 40–69, set upstream: whether the back group stays together as one leftover group and how cleanly Pi3X places it.
   - The 0.9 threshold sits in the gap 0.85–0.92 of about 25 groups. It is a general "the frame agrees with the model" test, but it was chosen on this data.
+
+### Step 27 (2026-11-05): retries with other anchor sets, and second models handed to vlm_place (commit 4f2ded9, cache v27)
+- **User's request:** stabilise BLH with (1) images of an unmerged second model going to vlm_place, the model merging when at least half its images are placed; (2) when Pi3X aligns below 0.9, retrying the joint placement with other anchor sets ("picks only", "most matched only", "without previously removed members"), keeping the best alignment under the same gate. `--ff-off extra`, `--ff-off retry`.
+- **Results (p8):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p8_vlm_dev | 44.8 | 82.2 | 53.9 | 57.7 | 57.7 | 54.8 | **58.5** |
+
+  - BLH repeats: 58.8, 48.2, 53.5 (four runs 48–59, against 40–69 before).
+- **What fired:**
+  - Retries never reached 0.9 anywhere (BLH rep998 0.76/0.81/0.73/0.77; PTZ groups 0.45–0.78, correctly left out).
+  - Change 1 fired only on s00 and s02 (second models of 4 and 6 images); their alignments failed, so the models stayed separate. No BLH run produced a second model.
+  - No wrong admission. BLH admissions had rotations < 5° but centres 0.03–1.6 spreads off.
+  - The narrower BLH spread is the luck of route, not the changes.
+- **Why the retries failed (GT, offline):**
+  - Failed BLH alignments (p7 0.70, p8 0.81) all had hard-stage anchors (images placed by the hard fallback) with right rotations but centres 0.9–2.6 spreads off, e.g. 36 at 2.56, 12 at 0.94, 02 at 1.78.
+  - Clean alignments (0.94–0.98, 5 groups): every anchor within 0.08 spreads, none from the hard stage.
+  - The retry variants draw from the same registered set, so they keep the bad anchors.
+
+### Step 28 (2026-11-05): reference photos and anchors from match-registered images only (commit 56a53c6, cache v28)
+- **Rule:** vlm_place shows the VLM, and anchors Pi3X on, only images registered through matches (not hard-stage, held or unverified), if at least 3 of them share matches with the group; otherwise all registered images. `--ff-off trusted`.
+- **Results (p9):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p9_vlm_dev | 42.1 | 82.9 | 52.6 | 59.3 | 56.0 | 55.6 | **58.1** |
+
+  - BLH repeats: rep997 48.1, rep998 51.6, rep999 61.6. Eight BLH runs since step 27: 48–62, mean 53.6 (p8) and 53.5 (p9).
+  - Other scenes within run noise of p8. A08's −2.7 has no vlm_place admission behind it (its only group aligned at 0.47 and was left out).
+- **What fired:**
+  - Every BLH group that got picks now aligns cleanly: 0.91 (dev), 0.967 (rep998), 0.931 (rep999); no retry was needed. Trusted anchors fixed the alignment failure.
+  - Change 1 fired on BLH for the first time (dev): a 4-image second model, 3 placed, merged by vlm_place.
+  - rep997: the VLM chose no reference photo for the 7-image back group ("none"), so nothing was placed (48.1).
+- **GT check of admissions** (correct = rotation < 5° and centre < 0.1 spread): 9 admitted, all BLH, all rotations 1.7–3.1°. Centres:
+  - 4 within 0.14 spreads (28, 33 twice, 13 in rep999);
+  - 5 off by 0.44–1.09 (38 twice, 13 and 33 in rep998).
+  - The render left out 2, 32 and 36 (centres 0.75–1.26 off) and found "no evidence" for all of the admitted.
+- **Reading:**
+  - With clean anchors and alignments ≥ 0.9, Pi3X still puts back-of-building cameras up to about one camera-spread off along the view. Alignment inliers say the frame agrees with the model; they don't bound the depth of cameras looking at an unmodelled side.
+  - BLH no longer fails by a broken alignment. What remains:
+    - whether the VLM finds reference photos for the back group (rep997);
+    - Pi3X centre errors on the back side, which no render test can check ("no evidence");
+    - the route before Phase 3 (the hard stage registering the back group gave the 63–69 runs).
+  - The pass mean is within noise of p6–p8 (57–59.6). The run-to-run VLM noise (temperature 0.3, no seed) is the same size as the effects being measured.
