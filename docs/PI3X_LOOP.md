@@ -786,3 +786,43 @@ Test set: every leftover-group placement with known GT, 19 images.
   - **One wrong admission, on s00.** A 2-image group aligned at 0.956; 45 was inconsistent, and the lone survivor 172 re-placed with cover 0 and was admitted at 176° (a flip). The old veto would have left both out.
   - BLH dev (39.6) took another route: the hard stage registered 2, 32, 36 and 38 with "placements agree, render inconsistent", at 2.9–3.4 spreads off. The 5-image leftover group then aligned at only 0.88.
 - **Hard-stage audit (GT, p6–p11, all scenes):** "placements agree, render inconsistent" covers 54 decisions. 47 of those images ended registered, and 37 of the 47 were off by ≥ 5° or ≥ 0.25 spreads (16 by ≥ 10° or ≥ 1 spread). That is the worst rate of any large bucket: plain "placements agree" was 18 of 24, "agree, render consistent" 4 of 11. Most cases were on BLH (36, 32 bad); s00/s01/M07 had 11 (5 bad).
+
+### Step 31 (2026-11-05): hard stage drops "agree, render inconsistent"; re-placement needs two survivors (commit f91c5e6, cache v31)
+- **Results (p12):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p12_vlm_dev | 43.9 | 82.0 | 55.1 | 57.5 | 59.0 | 55.7 | **58.9** |
+
+  - BLH repeats: 59.1, 43.4, 59.1. rep997 and rep999 came out identical (same route, same GT errors).
+- **GT check:** 20 admissions, all BLH.
+  - Most had the right rotation (1–5°) but centres 0.55–1.14 spreads off.
+  - rep998 admitted 28 and 33 at about 10 spreads (re-placement cover 0, "no evidence").
+  - The AUC gain came from imprecise admissions.
+
+### Step 32 (2026-11-05): re-placed survivors must stay near their joint placement (commit a578a62, cache v32)
+- **Rule:** a re-placed survivor must stay within 0.2 camera spreads and 3° of its joint placement.
+  - GT p11–p12: survivors within 0.14 spreads of GT moved ≤ 0.18 spreads / 0.9°; every survivor ≥ 0.55 off moved 0.24–9.7 spreads or 55°.
+  - Replayed offline: it keeps 13 (11 within 0.25 of GT) and drops 16, all wrong.
+  - The threshold was chosen in a narrow gap on this data.
+- **Results (p13):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p13_vlm_dev | 43.2 | 82.0 | 38.6 | 57.8 | 54.7 | 57.2 | **55.6** |
+
+  - BLH repeats: 51.5, 47.4, 50.0. BLH dev aligned at 0.877 (< 0.9) and left the whole back group out.
+- **GT check:** 5 admissions (33, 28 twice; 13 once), all 0.09–0.15 spreads, rotations 2–4°. No imprecise admission. 33 images left out.
+- **Reading (p9–p13):**
+
+  | Pass | Mean | BLH mean of 4 | Admissions | Within 0.2 spreads |
+  |---|---|---|---|---|
+  | p9 (temperature 0.3) | 58.1 | 53.5 | 9 | 4 |
+  | p10 (temperature 0) | 56.0 | 43.0 | 0 | 0 |
+  | p11 (+ re-place) | 56.1 | 54.4 | 13 | 10 (one 176° flip on s00) |
+  | p12 (+ hard fix) | 58.9 | 54.2 | 20 | 3 |
+  | p13 (+ stability) | 55.6 | 46.9 | 5 | 5 |
+
+  - Pi3X places BLH back images 2, 32, 36 and 38 (and side images 12, 34) about one camera-spread off in every run. Only 13, 28 and 33 come out precise.
+  - BLH scores in the high 50s and 60s needed the imprecise placements. With precise admissions only, BLH is about 47–52.
+  - Remaining run-to-run variance is no longer the VLM. It comes from Pi3X/GPU nondeterminism near thresholds (alignment 0.877 vs 0.9) and from the route through the hard stage.
