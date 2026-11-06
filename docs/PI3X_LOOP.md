@@ -755,3 +755,34 @@ Test set: every leftover-group placement with known GT, 19 images.
     - Pi3X centre errors on the back side, which no render test can check ("no evidence");
     - the route before Phase 3 (the hard stage registering the back group gave the 63–69 runs).
   - The pass mean is within noise of p6–p8 (57–59.6). The run-to-run VLM noise (temperature 0.3, no seed) is the same size as the effects being measured.
+
+### Step 29 (2026-11-05): VLM at temperature 0 (commit 864f944, cache v29)
+- **User's request:** lower the temperature to make BLH stable. The advisor now runs at temperature 0 (was 0.3, unseeded) with a per-question seed (hash of the question and image names). `--ff-off vlmtemp` restores 0.3.
+- **Results (p10):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p10_vlm_dev | 44.2 | 74.5 | 46.9 | 56.5 | 56.3 | 57.9 | **56.0** |
+
+  - BLH repeats: 46.7, 33.5, 44.8. Three of four BLH runs took the same route (32/39 after the hard stage, the same 7-image back group, alignment 0.92–0.95).
+  - Not fully deterministic: the same hard-stage question got different answers across runs, because Pi3X/GPU nondeterminism changes what the VLM is shown.
+  - M07 74.5 had no VLM placement: it took a different growth order and every image came out about 0.5° worse. The p11 M07 repeats at temperature 0 gave 82.4 and 82.8, so it was a one-off.
+- **Why BLH stayed low: the group veto.** The render was right about every member of the back group:
+  - "inconsistent": 2, 32, 36, 38, at 1.0–1.6 spreads off;
+  - "no evidence": 13, 28, 33, at 0.1–0.34 spreads.
+  - At 4 of 7 inconsistent the whole group was left out. p9's 61.6 run had 3 of 7 and admitted the rest, so a one-image difference decided BLH.
+
+### Step 30 (2026-11-05): re-place without the inconsistent members (commit 31e8c2e, cache v30)
+- **Rule:** members the render calls inconsistent are dropped and Pi3X re-places the rest without them. The survivors must pass the ≥ 0.9 alignment and the render check of the new placement. `--ff-off replace` restores the veto.
+- **Results (p11):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p11_vlm_dev | 44.2 | 81.6 | 39.6 | 57.2 | 59.0 | 55.1 | **56.1** |
+
+  - BLH repeats: 60.7, 61.2, 56.1. M07 repeats: 82.4, 82.8.
+- **GT check:**
+  - The BLH re-placements admitted 13, 28 and 33 at 0.02–0.15 spreads in every repeat, plus 22 (0.11, 0.32) and 38 (0.75, 5.6°) once each.
+  - **One wrong admission, on s00.** A 2-image group aligned at 0.956; 45 was inconsistent, and the lone survivor 172 re-placed with cover 0 and was admitted at 176° (a flip). The old veto would have left both out.
+  - BLH dev (39.6) took another route: the hard stage registered 2, 32, 36 and 38 with "placements agree, render inconsistent", at 2.9–3.4 spreads off. The 5-image leftover group then aligned at only 0.88.
+- **Hard-stage audit (GT, p6–p11, all scenes):** "placements agree, render inconsistent" covers 54 decisions. 47 of those images ended registered, and 37 of the 47 were off by ≥ 5° or ≥ 0.25 spreads (16 by ≥ 10° or ≥ 1 spread). That is the worst rate of any large bucket: plain "placements agree" was 18 of 24, "agree, render consistent" 4 of 11. Most cases were on BLH (36, 32 bad); s00/s01/M07 had 11 (5 bad).
