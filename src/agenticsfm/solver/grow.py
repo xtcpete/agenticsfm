@@ -125,6 +125,9 @@ class GrowConfig:
     vlm_place_replace: bool = True     # render-inconsistent members are dropped and the rest re-placed by Pi3X without them (same alignment
                                        # and render checks again), instead of vetoing the whole group when half are inconsistent (GT:
                                        # the inconsistent BLH members are the ones 1-1.6 spreads off; the vetoed rest were within 0.1-0.3)
+    vlm_place_replace_frac: float = 0.2    # a re-placed survivor must stay within this many camera spreads of its joint placement ...
+    vlm_place_replace_deg: float = 3.0     # ... and this rotation (GT p11-p12: survivors within 0.14 spreads of GT moved <= 0.18 spreads
+                                           # and <= 0.9 deg; every survivor >= 0.55 off moved 0.24-9.7 spreads or 55 deg)
     hard_agree_inconsistent: bool = False  # hard stage: accept a placement both anchor sets agree on even when the render says inconsistent
                                        # (GT p6-p11: 37 of 47 such images ended >= 5 deg or >= 0.25 spreads off; Pi3X can repeat its mistake)
     vlm_temperature: float = 0.0       # VLM sampling temperature (was 0.3, unseeded): greedy answers, so reruns take the same route
@@ -2073,14 +2076,27 @@ class Solver:
                             row["images"][self.names[i]]["why"] = f"re-placed without the inconsistent members: Pi3X aligned with {score(al2):.2f} point inliers (< {self.gc.vlm_place_min_inl}); left out"
                         render_ok = []
                     else:
+                        Cm = np.array(list(self.centres().values()))
+                        spread = float(np.median(np.linalg.norm(Cm - np.median(Cm, 0), axis=1))) if len(Cm) > 1 else 1.0
+                        moved = []
                         for i in keep:
                             n = self.names[i]
                             inf = row["images"][n]
                             inf["ff_pose_joint"] = inf["ff_pose"]
+                            Rj, tj = poses[i]
                             poses[i] = self.transform_pose(ff2[n]["E"], al2)
                             ff[n] = ff2[n]
                             inf["ff_pose"] = {"R": np.round(poses[i][0], 6).tolist(), "t": np.round(poses[i][1], 6).tolist()}
-                        self.ensure_depth([(i, *poses[i]) for i in keep], f"vlmplace{k}rs")
+                            gd = rot_angle(Rj @ poses[i][0].T)
+                            gm = float(np.linalg.norm((-Rj.T @ tj) - (-poses[i][0].T @ poses[i][1]))) / max(spread, 1e-9)
+                            inf["replace_gap"] = {"deg": round(gd, 1), "spreads": round(gm, 3)}
+                            if gd > self.gc.vlm_place_replace_deg or gm > self.gc.vlm_place_replace_frac:
+                                inf["why"] = f"re-placed without the inconsistent members, it moved {gm:.2f} camera spreads / {gd:.1f} deg: placement unstable; left out"
+                                moved.append(i)
+                        rp["moved"] = names(moved)
+                        keep = [i for i in keep if i not in moved]
+                        if keep:
+                            self.ensure_depth([(i, *poses[i]) for i in keep], f"vlmplace{k}rs")
                         for i in keep:
                             jr = self.judge_pose(i, *poses[i], f"vlmplace{k}s")
                             verd[i] = jr["verdict"]
