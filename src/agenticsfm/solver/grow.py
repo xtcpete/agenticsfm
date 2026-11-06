@@ -122,6 +122,9 @@ class GrowConfig:
                                        # broke every failed BLH alignment); all registered images when fewer than 3 trusted ones share matches
     vlm_place_extra: bool = True       # images of a second model that did not merge are leftovers for vlm_place too; the model merges
                                        # when vlm_place registers at least half its images, else it stays a separate model
+    vlm_place_replace: bool = True     # render-inconsistent members are dropped and the rest re-placed by Pi3X without them (same alignment
+                                       # and render checks again), instead of vetoing the whole group when half are inconsistent (GT:
+                                       # the inconsistent BLH members are the ones 1-1.6 spreads off; the vetoed rest were within 0.1-0.3)
     vlm_temperature: float = 0.0       # VLM sampling temperature (was 0.3, unseeded): greedy answers, so reruns take the same route
     vlm_seed: bool = True              # per-question sampling seed (keeps temperature > 0 reproducible too)
     vlm_place_stable: bool = False     # Phase 3b gate (instead of 3c): Pi3X places the image the same way with two disjoint halves of the picks
@@ -2051,7 +2054,45 @@ class Solver:
                     row["images"][self.names[i]]["render"] = {kk: jr.get(kk) for kk in ("verdict", "score", "margin", "cover")}
                 n_inc = sum(v == "inconsistent" for v in verd.values())
                 row["render_gate"] = {"inconsistent": n_inc, "pending": len(pending)}
-                if n_inc and 2 * n_inc >= len(pending):
+                keep = [i for i in pending if verd[i] != "inconsistent"]
+                if n_inc and keep and self.gc.vlm_place_replace:
+                    # the wrong members may pull the joint placement: Pi3X again without them, and the rest must pass the
+                    # alignment and render checks of this new placement
+                    for i in pending:
+                        if verd[i] == "inconsistent":
+                            row["images"][self.names[i]]["why"] = "render inconsistent; left out (the rest re-placed without it)"
+                    g2, ff2, al2 = place(A, keep, f"vlmplace{k}s")
+                    rp: dict[str, Any] = {"group": names(keep), "align": None if al2 is None else {kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in al2.items() if kk in ("ok", "resid", "used", "by", "point_inl")}}
+                    row["replace"] = rp
+                    if score(al2) < self.gc.vlm_place_min_inl:
+                        for i in keep:
+                            row["images"][self.names[i]]["why"] = f"re-placed without the inconsistent members: Pi3X aligned with {score(al2):.2f} point inliers (< {self.gc.vlm_place_min_inl}); left out"
+                        render_ok = []
+                    else:
+                        for i in keep:
+                            n = self.names[i]
+                            inf = row["images"][n]
+                            inf["ff_pose_joint"] = inf["ff_pose"]
+                            poses[i] = self.transform_pose(ff2[n]["E"], al2)
+                            ff[n] = ff2[n]
+                            inf["ff_pose"] = {"R": np.round(poses[i][0], 6).tolist(), "t": np.round(poses[i][1], 6).tolist()}
+                        self.ensure_depth([(i, *poses[i]) for i in keep], f"vlmplace{k}rs")
+                        for i in keep:
+                            jr = self.judge_pose(i, *poses[i], f"vlmplace{k}s")
+                            verd[i] = jr["verdict"]
+                            row["images"][self.names[i]]["render"] = {kk: jr.get(kk) for kk in ("verdict", "score", "margin", "cover")}
+                        n2 = sum(verd[i] == "inconsistent" for i in keep)
+                        rp["render_gate"] = {"inconsistent": n2, "pending": len(keep)}
+                        if n2 and 2 * n2 >= len(keep):
+                            for i in keep:
+                                row["images"][self.names[i]]["why"] = f"re-placed: {n2} of {len(keep)} members inconsistent again; left out"
+                            render_ok = []
+                        else:
+                            for i in keep:
+                                if verd[i] == "inconsistent":
+                                    row["images"][self.names[i]]["why"] = "re-placed: render inconsistent; left out"
+                            render_ok = [i for i in keep if verd[i] != "inconsistent"]
+                elif n_inc and 2 * n_inc >= len(pending):
                     for i in pending:
                         row["images"][self.names[i]]["why"] = f"render: {n_inc} of {len(pending)} pending members inconsistent; group layout wrong; left out"
                     render_ok = []
@@ -2068,7 +2109,7 @@ class Solver:
                 ok = str(lc.get("answer", "")).lower() == "plausible" and float(lc.get("confidence") or 0) >= 0.6
                 if render_ok is not None:   # 3c: the layout check is advisory only (it accepted wrong PTZ layouts, rejected correct BLH ones)
                     for i in render_ok:
-                        row["images"][self.names[i]]["why"] = f"render {verd[i]} (group not vetoed); layout {lc.get('answer')} (advisory); registered unverified"
+                        row["images"][self.names[i]]["why"] = f"render {verd[i]}{' (re-placed)' if 'replace' in row else ' (group not vetoed)'}; layout {lc.get('answer')} (advisory); registered unverified"
                         f_ = ff[self.names[i]]["f"]
                         unverified[i] = (poses[i][0], poses[i][1], None if self.camera_shared(i) else f_)
                 else:
