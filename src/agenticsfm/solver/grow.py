@@ -125,6 +125,8 @@ class GrowConfig:
     vlm_place_replace: bool = True     # render-inconsistent members are dropped and the rest re-placed by Pi3X without them (same alignment
                                        # and render checks again), instead of vetoing the whole group when half are inconsistent (GT:
                                        # the inconsistent BLH members are the ones 1-1.6 spreads off; the vetoed rest were within 0.1-0.3)
+    hard_agree_inconsistent: bool = False  # hard stage: accept a placement both anchor sets agree on even when the render says inconsistent
+                                       # (GT p6-p11: 37 of 47 such images ended >= 5 deg or >= 0.25 spreads off; Pi3X can repeat its mistake)
     vlm_temperature: float = 0.0       # VLM sampling temperature (was 0.3, unseeded): greedy answers, so reruns take the same route
     vlm_seed: bool = True              # per-question sampling seed (keeps temperature > 0 reproducible too)
     vlm_place_stable: bool = False     # Phase 3b gate (instead of 3c): Pi3X places the image the same way with two disjoint halves of the picks
@@ -1474,6 +1476,8 @@ class Solver:
                     best = max(("A", "B"), key=lambda tg: (judges[tg]["score"] if judges[tg]["score"] is not None else -1))
                     if strong_bad(best):
                         why = "placements agree but render strongly inconsistent"
+                    elif judges[best]["verdict"] == "inconsistent" and not self.gc.hard_agree_inconsistent:
+                        why = "placements agree but render inconsistent"
                     else:
                         choice, why = best, "placements agree" + (f", render {judges[best]['verdict']}" if judges[best]["verdict"] != "no evidence" else "")
                 else:
@@ -2055,7 +2059,7 @@ class Solver:
                 n_inc = sum(v == "inconsistent" for v in verd.values())
                 row["render_gate"] = {"inconsistent": n_inc, "pending": len(pending)}
                 keep = [i for i in pending if verd[i] != "inconsistent"]
-                if n_inc and keep and self.gc.vlm_place_replace:
+                if n_inc and len(keep) >= 2 and self.gc.vlm_place_replace:   # a lone survivor has no joint layout left to check
                     # the wrong members may pull the joint placement: Pi3X again without them, and the rest must pass the
                     # alignment and render checks of this new placement
                     for i in pending:
