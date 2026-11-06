@@ -15,6 +15,7 @@ The VLM never outputs geometry; its answers gate which feedforward placement is 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -33,7 +34,8 @@ SYSTEM = (
 
 
 class Advisor:
-    def __init__(self, cfg: dict[str, Any], images_dir: Path, log: list[dict[str, Any]], max_side: int = 768, mode: str = "decide"):
+    def __init__(self, cfg: dict[str, Any], images_dir: Path, log: list[dict[str, Any]], max_side: int = 768, mode: str = "decide",
+                 temperature: float = 0.0, seed: bool = True):
         from openai import OpenAI
 
         vlm = cfg["vlm"]
@@ -45,7 +47,8 @@ class Advisor:
         ctk["reasoning_effort"] = "low"
         extra["chat_template_kwargs"] = ctk
         self.request["extra_body"] = extra
-        self.request["temperature"] = 0.3
+        self.request["temperature"] = float(temperature)   # 0: greedy, the same question gets the same answer
+        self.seed = bool(seed)                              # a per-question seed keeps sampling (temperature > 0) reproducible too
         self.images_dir = images_dir
         self.log = log
         self.max_side = max_side
@@ -69,12 +72,16 @@ class Advisor:
                 content.append(encode_image(str(path), max_side or self.max_side))
                 shown.append(n)
         content.append({"type": "text", "text": question})
+        req = dict(self.request)
+        if self.seed:
+            key = json.dumps([kind, question, [(label, [Path(n).name for n in names]) for label, names in parts]])
+            req["seed"] = int(hashlib.sha1(key.encode()).hexdigest()[:8], 16)
         t0 = time.time()
         answer: dict[str, Any] = {"answer": "unsure"}
         reasoning, text, error = None, None, None
         try:
             resp = self.client.chat.completions.create(model=self.model, messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": content}],
-                                                       max_tokens=4096, **self.request)
+                                                       max_tokens=4096, **req)
             msg = resp.choices[0].message
             text = msg.content or ""
             rec = msg.model_dump()

@@ -122,6 +122,8 @@ class GrowConfig:
                                        # broke every failed BLH alignment); all registered images when fewer than 3 trusted ones share matches
     vlm_place_extra: bool = True       # images of a second model that did not merge are leftovers for vlm_place too; the model merges
                                        # when vlm_place registers at least half its images, else it stays a separate model
+    vlm_temperature: float = 0.0       # VLM sampling temperature (was 0.3, unseeded): greedy answers, so reruns take the same route
+    vlm_seed: bool = True              # per-question sampling seed (keeps temperature > 0 reproducible too)
     vlm_place_stable: bool = False     # Phase 3b gate (instead of 3c): Pi3X places the image the same way with two disjoint halves of the picks
     vlm_place_stable_deg: float = 5.0  # ... rotation within this, centre within ff_agree_frac of the scene scale
     ff_coloc: bool = True        # co-location guard: Pi3X puts a candidate on a registered anchor's centre -> its pose must sit there
@@ -237,7 +239,7 @@ class Solver:
             self.advisor.log = self.log
         elif gc.vlm != "off":
             from agenticsfm.solver.advisor import Advisor
-            self.advisor = Advisor(cfg, ws.images_dir, self.log, mode=gc.vlm)
+            self.advisor = Advisor(cfg, ws.images_dir, self.log, mode=gc.vlm, temperature=gc.vlm_temperature, seed=gc.vlm_seed)
         else:
             self.advisor = None
 
