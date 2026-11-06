@@ -38,7 +38,7 @@ PARAMS = {
         "select": {"type": "string", "enum": ["graph", "vlm"], "default": "graph", "description": "who picks each round's images"},
         "ff_off": {"type": "string", "default": "", "description": "ff-loop features to switch off (ablations), comma separated: "
                    "evidence (inliers in the VLM selection prompt), fill (fill VLM picks up to the round size), points (point-based alignment), "
-                   "settle (match support settles disagreements), sweep (final retry of unregistered images), anchors (matched anchors only), rotation, vlmplace, sky, coloc, rsrc, backface, cover, rgate (Phase 3b stability gate for VLM placements instead of the 3c render veto), ainl (no alignment-inlier requirement for 3c), retry (no re-placement with other anchors when the alignment is weak), extra (images of unmerged second models stay out of vlm_place), trusted (vlm_place references from all registered images, hard-stage ones included), vlmtemp (VLM at temperature 0.3 unseeded, as before cache v29), replace (a vlm_place group with half its members render-inconsistent is left out whole instead of re-placed without them), hardrender (the hard stage accepts agreeing placements the render calls inconsistent)"},
+                   "settle (match support settles disagreements), sweep (final retry of unregistered images), anchors (matched anchors only), rotation, vlmplace, sky, coloc, rsrc, backface, cover, rgate (Phase 3b stability gate for VLM placements instead of the 3c render veto), ainl (no alignment-inlier requirement for 3c), retry (no re-placement with other anchors when the alignment is weak), extra (images of unmerged second models stay out of vlm_place), trusted (vlm_place references from all registered images, hard-stage ones included), vlmtemp (VLM at temperature 0.3 unseeded, as before cache v29), replace (a vlm_place group with half its members render-inconsistent is left out whole instead of re-placed without them), hardrender (the hard stage accepts agreeing placements the render calls inconsistent), moved (vlm_place survivors that move under re-placement are left out: accurate-only admissions)"},
         "scores_id": {"type": "string", "description": "FlexGlue covisibility scores of the database: the images are split into scenes first, "
                                                        "so feedforward calls never mix scenes; each scene gets its own solver run"},
     },
@@ -57,7 +57,7 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
 
     started = time.time()
     params = {"feedforward": feedforward, "seed_size": int(seed_size), "group_size": int(group_size),
-              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 32,
+              "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 33,
               "support_pairs": int(support_pairs), "support_norm": bool(support_norm), "loop": loop, "select": select,
               "ff_off": ",".join(sorted(x for x in ff_off.split(",") if x.strip()))}
     inputs = {"db": db_id, **({"scores": scores_id} if scores_id else {})}
@@ -71,7 +71,7 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
                     vlm=vlm, multi_model=bool(multi_model), support_pairs=int(support_pairs),
                     support_norm=bool(support_norm), loop=loop, select=select)
     off = {x.strip() for x in ff_off.split(",") if x.strip()}
-    unknown = off - {"evidence", "fill", "points", "settle", "sweep", "anchors", "rotation", "vlmplace", "sky", "coloc", "rsrc", "backface", "cover", "rgate", "ainl", "retry", "extra", "trusted", "vlmtemp", "replace", "hardrender"}
+    unknown = off - {"evidence", "fill", "points", "settle", "sweep", "anchors", "rotation", "vlmplace", "sky", "coloc", "rsrc", "backface", "cover", "rgate", "ainl", "retry", "extra", "trusted", "vlmtemp", "replace", "hardrender", "moved"}
     if unknown:
         raise ValueError(f"unknown ff_off features: {sorted(unknown)}")
     gc = replace(gc, select_evidence="evidence" not in off, select_fill="fill" not in off, ff_align_points="points" not in off,
@@ -80,7 +80,7 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
                  rac_min_cover=0.0 if "cover" in off else gc.rac_min_cover,
                  vlm_place_render="rgate" not in off, vlm_place_stable="rgate" in off, vlm_place_min_inl=0.0 if "ainl" in off else gc.vlm_place_min_inl,
                  vlm_place_retry="retry" not in off, vlm_place_extra="extra" not in off, vlm_place_trusted="trusted" not in off,
-                 vlm_temperature=0.3 if "vlmtemp" in off else 0.0, vlm_seed="vlmtemp" not in off, vlm_place_replace="replace" not in off, hard_agree_inconsistent="hardrender" in off,
+                 vlm_temperature=0.3 if "vlmtemp" in off else 0.0, vlm_seed="vlmtemp" not in off, vlm_place_replace="replace" not in off, hard_agree_inconsistent="hardrender" in off, vlm_place_admit_moved="moved" not in off,
                  **({"ff_anchors_match": 6, "ff_anchors_diverse": 4} if "anchors" in off else {}))
     gpu = ws.gpus[0] if ws.gpus else None
     split = None

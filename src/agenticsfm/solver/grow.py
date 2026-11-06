@@ -128,6 +128,9 @@ class GrowConfig:
     vlm_place_replace_frac: float = 0.2    # a re-placed survivor must stay within this many camera spreads of its joint placement ...
     vlm_place_replace_deg: float = 3.0     # ... and this rotation (GT p11-p12: survivors within 0.14 spreads of GT moved <= 0.18 spreads
                                            # and <= 0.9 deg; every survivor >= 0.55 off moved 0.24-9.7 spreads or 55 deg)
+    vlm_place_admit_moved: bool = True     # a survivor that moves under re-placement is still admitted (unverified, no points, no BA) with its
+                                           # joint Pi3X pose (GT p11-p13, 22 moved survivors: joint pose mean 0.87 spreads off, re-placed 1.81;
+                                           # > 2 spreads: joint 1, re-placed 4); False: left out (accurate-only admissions)
     hard_agree_inconsistent: bool = False  # hard stage: accept a placement both anchor sets agree on even when the render says inconsistent
                                        # (GT p6-p11: 37 of 47 such images ended >= 5 deg or >= 0.25 spreads off; Pi3X can repeat its mistake)
     vlm_temperature: float = 0.0       # VLM sampling temperature (was 0.3, unseeded): greedy answers, so reruns take the same route
@@ -2084,6 +2087,7 @@ class Solver:
                             inf = row["images"][n]
                             inf["ff_pose_joint"] = inf["ff_pose"]
                             Rj, tj = poses[i]
+                            ffj = ff[n]
                             poses[i] = self.transform_pose(ff2[n]["E"], al2)
                             ff[n] = ff2[n]
                             inf["ff_pose"] = {"R": np.round(poses[i][0], 6).tolist(), "t": np.round(poses[i][1], 6).tolist()}
@@ -2091,9 +2095,15 @@ class Solver:
                             gm = float(np.linalg.norm((-Rj.T @ tj) - (-poses[i][0].T @ poses[i][1]))) / max(spread, 1e-9)
                             inf["replace_gap"] = {"deg": round(gd, 1), "spreads": round(gm, 3)}
                             if gd > self.gc.vlm_place_replace_deg or gm > self.gc.vlm_place_replace_frac:
-                                inf["why"] = f"re-placed without the inconsistent members, it moved {gm:.2f} camera spreads / {gd:.1f} deg: placement unstable; left out"
                                 moved.append(i)
+                                if self.gc.vlm_place_admit_moved:
+                                    # keep the joint placement (it passed the alignment and the render with the full group)
+                                    poses[i] = (Rj, tj); ff[n] = ffj; inf["ff_pose"] = inf.pop("ff_pose_joint")
+                                    inf["why"] = f"re-placed without the inconsistent members, it moved {gm:.2f} camera spreads / {gd:.1f} deg: joint Pi3X pose kept"
+                                else:
+                                    inf["why"] = f"re-placed without the inconsistent members, it moved {gm:.2f} camera spreads / {gd:.1f} deg: placement unstable; left out"
                         rp["moved"] = names(moved)
+                        rp["_moved_ids"] = list(moved)
                         keep = [i for i in keep if i not in moved]
                         if keep:
                             self.ensure_depth([(i, *poses[i]) for i in keep], f"vlmplace{k}rs")
@@ -2112,6 +2122,8 @@ class Solver:
                                 if verd[i] == "inconsistent":
                                     row["images"][self.names[i]]["why"] = "re-placed: render inconsistent; left out"
                             render_ok = [i for i in keep if verd[i] != "inconsistent"]
+                        if self.gc.vlm_place_admit_moved:
+                            render_ok = render_ok + moved     # judged on the joint placement (not inconsistent there)
                 elif n_inc and 2 * n_inc >= len(pending):
                     for i in pending:
                         row["images"][self.names[i]]["why"] = f"render: {n_inc} of {len(pending)} pending members inconsistent; group layout wrong; left out"
@@ -2129,7 +2141,7 @@ class Solver:
                 ok = str(lc.get("answer", "")).lower() == "plausible" and float(lc.get("confidence") or 0) >= 0.6
                 if render_ok is not None:   # 3c: the layout check is advisory only (it accepted wrong PTZ layouts, rejected correct BLH ones)
                     for i in render_ok:
-                        row["images"][self.names[i]]["why"] = f"render {verd[i]}{' (re-placed)' if 'replace' in row else ' (group not vetoed)'}; layout {lc.get('answer')} (advisory); registered unverified"
+                        row["images"][self.names[i]]["why"] = f"render {verd[i]}{(' (joint pose kept)' if i in (row.get('replace') or {}).get('_moved_ids', ()) else ' (re-placed)') if 'replace' in row else ' (group not vetoed)'}; layout {lc.get('answer')} (advisory); registered unverified"
                         f_ = ff[self.names[i]]["f"]
                         unverified[i] = (poses[i][0], poses[i][1], None if self.camera_shared(i) else f_)
                 else:
