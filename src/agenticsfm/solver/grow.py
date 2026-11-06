@@ -115,6 +115,10 @@ class GrowConfig:
                                        # otherwise every member not "inconsistent" registers unverified (the layout check is advisory)
     vlm_place_min_inl: float = 0.9     # ... and only when Pi3X aligned to the model on points with at least this inlier share (its geometry
                                        # of the anchors agrees with the model; GT audit: correct groups 0.92-0.98, wrong ones <= 0.85)
+    vlm_place_retry: bool = True       # Pi3X aligned below vlm_place_min_inl: retry with other anchor sets (picks only, most matched only) and
+                                       # without members that were registered and later removed; keep the best point alignment
+    vlm_place_extra: bool = True       # images of a second model that did not merge are leftovers for vlm_place too; the model merges
+                                       # when vlm_place registers at least half its images, else it stays a separate model
     vlm_place_stable: bool = False     # Phase 3b gate (instead of 3c): Pi3X places the image the same way with two disjoint halves of the picks
     vlm_place_stable_deg: float = 5.0  # ... rotation within this, centre within ff_agree_frac of the scene scale
     ff_coloc: bool = True        # co-location guard: Pi3X puts a candidate on a registered anchor's centre -> its pose must sit there
@@ -1920,15 +1924,44 @@ class Solver:
             if not picks:
                 row["result"] = "the VLM found no placed photo showing the same structures"
                 self.log.append(row); continue
-            A = list(dict.fromkeys(picks + top))[:8]
-            g = self.ff_groups([names(A) + names(G)], f"vlmplace{k}", save_depth=True)[0]
-            ff = {n: {"E": np.asarray(E, dtype=np.float64), "f": 0.5 * (K_[0][0] / tr[0] + K_[1][1] / tr[1])}
-                  for n, E, K_, tr in zip(g["names"], g["extrinsics"], g["intrinsics"], g["transforms"])}
-            al = self.align_points(g["depth_path"], A) if g.get("depth_path") else None
-            if not (al and al.get("ok")):
-                al = self.align_rot(ff, A)
+            def place(A, G_, tag):
+                g = self.ff_groups([names(A) + names(G_)], tag, save_depth=True)[0]
+                ff = {n: {"E": np.asarray(E, dtype=np.float64), "f": 0.5 * (K_[0][0] / tr[0] + K_[1][1] / tr[1])}
+                      for n, E, K_, tr in zip(g["names"], g["extrinsics"], g["intrinsics"], g["transforms"])}
+                al = self.align_points(g["depth_path"], A) if g.get("depth_path") else None
                 if not (al and al.get("ok")):
-                    al = self.align(ff, A)
+                    al = self.align_rot(ff, A)
+                    if not (al and al.get("ok")):
+                        al = self.align(ff, A)
+                return g, ff, al
+
+            score = lambda al_: (al_.get("point_inl") or 0.0) if (al_ and al_.get("ok") and al_.get("by") == "points") else -1.0  # noqa: E731
+            A = list(dict.fromkeys(picks + top))[:8]
+            g, ff, al = place(A, G, f"vlmplace{k}")
+            if self.gc.vlm_place_retry and score(al) < self.gc.vlm_place_min_inl:
+                # the joint placement depends on which anchors Pi3X sees and on weak members pulling the group; try the
+                # alternatives and keep the best point alignment (accepted only at vlm_place_min_inl, as before)
+                removed = {i for i in G if self.status[i] in ("dropped", "filtered", "deferred")}
+                G2 = [i for i in G if i not in removed]
+                variants = []
+                if len(picks) >= 3:
+                    variants.append(("picks only", picks[:8], G))
+                if len(top) >= 3 and set(top) != set(A):
+                    variants.append(("most matched only", top, G))
+                if removed and G2:
+                    variants.append(("without removed members", A, G2))
+                tries = [{"variant": "picks and most matched", "point_inl": round(score(al), 3), "group": len(G)}]
+                best = (score(al), A, G, g, ff, al)
+                for vi, (lab, A_, G_) in enumerate(variants):
+                    r_ = place(A_, G_, f"vlmplace{k}v{vi}")
+                    tries.append({"variant": lab, "point_inl": round(score(r_[2]), 3), "group": len(G_)})
+                    if score(r_[2]) > best[0]:
+                        best = (score(r_[2]), A_, G_, *r_)
+                    if best[0] >= self.gc.vlm_place_min_inl:
+                        break
+                _, A, G, g, ff, al = best
+                row["retries"] = tries
+                row["group"] = names(G)
             row["anchors"] = names(A)
             row["align"] = None if al is None else {kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in al.items() if kk in ("ok", "resid", "used", "by", "point_inl", "rot_dev")}
             if not (al and al.get("ok")):
@@ -2104,8 +2137,9 @@ class Solver:
     def run(self, out_dir: Path) -> dict[str, Any]:
         t0 = time.time()
         seed_info = self.build()
-        models_out = [out_dir]
+        models_out: list[Path | None] = [out_dir]
         extra: list[dict[str, Any]] = []
+        unmerged: list[tuple["Solver", dict[str, Any]]] = []
         if self.gc.multi_model:
             remaining = [i for i in self.names if i not in self.reg()]
             for comp in self.components(remaining):
@@ -2139,17 +2173,29 @@ class Solver:
                 self.log.append(rec_)
                 self.say(f"component {tag}: {sub.rec.num_reg_images()} of {len(comp)} images; same scene: {verdict}; absorbed {nplaced}; {'merged' if merged else 'kept as a separate model'}")
                 if not merged:
-                    d = out_dir.parent / str(len(models_out))
-                    d.mkdir(parents=True, exist_ok=True)
-                    sub.rec.write(str(d))
-                    models_out.append(d)
-                    extra.append({"model": tag, **sub.model_stats(), "component": len(comp), "same_scene": verdict,
-                                  "names": [sub.names[i] for i in sub.reg()]})
+                    unmerged.append((sub, {"model": tag, **sub.model_stats(), "component": len(comp), "same_scene": verdict,
+                                           "names": [sub.names[i] for i in sub.reg()]}))
+                    models_out.append(None)   # written after vlm_place, which may still merge it
                 else:
                     self.global_refine(final=True)
+        place_extra = self.gc.vlm_place_extra and self.gc.loop == "ff" and self.gc.ff_vlm_place
         if self.gc.loop == "ff" and self.gc.ff_vlm_place and self.advisor is not None and self.advisor.enabled:
-            kept_elsewhere = {self.ids[n] for e in extra for n in e.get("names", []) if n in self.ids}
+            kept_elsewhere = set() if place_extra else {self.ids[n] for _, e in unmerged for n in e["names"] if n in self.ids}
             self.rounds = self.vlm_place(self.rounds, kept_elsewhere)
+        models_out = [out_dir]
+        reg_now = self.reg()
+        for sub, e in unmerged:
+            inside = [n for n in e["names"] if n in self.ids and self.ids[n] in reg_now]
+            if place_extra and len(inside) >= 0.5 * len(e["names"]):
+                self.log.append({"round": self.rounds, "kind": "component", "model": e["model"], "merged_by": "vlm_place",
+                                 "placed": len(inside), "registered": len(e["names"]), "merged": True})
+                self.say(f"component {e['model']}: vlm place put {len(inside)} of its {len(e['names'])} images into the main model; merged")
+                continue
+            d = out_dir.parent / str(len(models_out))
+            d.mkdir(parents=True, exist_ok=True)
+            sub.rec.write(str(d))
+            models_out.append(d)
+            extra.append(e)
         out_dir.mkdir(parents=True, exist_ok=True)
         self.rec.write(str(out_dir))
         reg = self.reg()
