@@ -77,12 +77,19 @@ _ap.add_argument("--ep-suffix", default="", help="suffix of the episode ids, so 
 _ap.add_argument("--compare-run", default=None, help="solver run whose score is shown next to each episode (e.g. incremental_v13)")
 _ap.add_argument("--inline-images", action="store_true", help="embed the episode figures in the episode JSON as data URIs (keeps the published file count down)")
 _ap.add_argument("--img-side", type=int, default=1100, help="longest side of the exported figures")
+_ap.add_argument("--max-points", type=int, default=40000, help="points shown per model")
+_ap.add_argument("--jpeg-quality", type=int, default=74)
+_ap.add_argument("--webp", action="store_true", help="save the figures as WebP (about a third smaller than JPEG)")
+_ap.add_argument("--inline-models", action="store_true", help="embed the models in the episode JSON (one file per episode)")
+_ap.add_argument("--solver-desc", default=None, help="paragraph shown above the group's table in the overview")
+_ap.add_argument("--final-only", action="store_true", help="export only the submitted model (not the grown one)")
 _ap.add_argument("--merge-into", default=None, help="existing site index.json: keep its groups and episodes, add (or replace) this group")
 _args = _ap.parse_args()
 SITE = Path(_args.out)
 for _d in ("data/ep", "models", "img"):
     (SITE / _d).mkdir(parents=True, exist_ok=True)
-MAX_POINTS, IMG_SIDE = 40000, _args.img_side
+MAX_POINTS, IMG_SIDE = _args.max_points, _args.img_side
+IMG_EXT = ".webp" if _args.webp else ".jpg"
 
 def inline_images(x, ep_id):
     """Replace img/<ep_id>/... paths with data URIs and delete the files."""
@@ -90,7 +97,7 @@ def inline_images(x, ep_id):
     if isinstance(x, dict): return {k: inline_images(v, ep_id) for k, v in x.items()}
     if isinstance(x, list): return [inline_images(v, ep_id) for v in x]
     if isinstance(x, str) and x.startswith(f"img/{ep_id}/") and (SITE / x).is_file():
-        return "data:image/jpeg;base64," + base64.b64encode((SITE / x).read_bytes()).decode()
+        return ("data:image/webp;base64," if x.endswith(".webp") else "data:image/jpeg;base64,") + base64.b64encode((SITE / x).read_bytes()).decode()
     return x
 
 def read_results(run):
@@ -124,7 +131,8 @@ def save_image(src, dst):
     s = IMG_SIDE / max(im.size)
     if s < 1: im = im.resize((round(im.width * s), round(im.height * s)), Image.LANCZOS)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    im.save(dst, format="JPEG", quality=74, optimize=True)
+    if str(dst).endswith(".webp"): im.save(dst, format="WEBP", quality=_args.jpeg_quality, method=6)
+    else: im.save(dst, format="JPEG", quality=_args.jpeg_quality, optimize=True)
     return im.size
 
 def largest_submodel(model_dir):
@@ -207,7 +215,7 @@ def steps_from_trace(recs, ep_id, img_counter):
             for p in r.get("images", []):
                 if Path(p).is_file():
                     img_counter[0] += 1
-                    rel = f"img/{ep_id}/{img_counter[0]:03d}.jpg"
+                    rel = f"img/{ep_id}/{img_counter[0]:03d}{IMG_EXT}"
                     try:
                         w, h = save_image(p, SITE / rel); imgs.append({"src": rel, "w": w, "h": h, "name": Path(p).name})
                     except Exception as e:
@@ -265,7 +273,7 @@ def gt_of(scene):
     return _gt_cache[scene]
 img_counter = [0]
 for gid, gtitle, run, dataset, controller in plan:
-    group = {"id": gid, "title": gtitle, "episodes": []}
+    group = {"id": gid, "title": gtitle, "episodes": [], **({"desc": _args.solver_desc} if _args.solver_desc else {})}
     if controller == "agent":
         results = read_results(run)
         for sc_dir in sorted((ROOT / "outputs/runs" / run).iterdir()):
@@ -290,18 +298,19 @@ for gid, gtitle, run, dataset, controller in plan:
         eth = {s.name for s in (ROOT / "outputs/data/eth3d").iterdir()} if (ROOT / "outputs/data/eth3d").is_dir() else set()
         # a scene rerun in a later run (e.g. after a crash) replaces the earlier attempt unless that one failed less
         chosen = {}
-        for run in _args.solver_runs:
+        for spec in _args.solver_runs:      # "run" or "run=tag" (a repeat run kept as its own episode)
+            run, _, tag = spec.partition("=")
             if not (ROOT / "outputs/runs" / run).is_dir(): continue
             res = read_results(run)
             for sc_dir in sorted((ROOT / "outputs/runs" / run).iterdir()):
                 if not (sc_dir / "trace.jsonl").is_file(): continue
                 ok = res.get(sc_dir.name, {}).get("status") == "ok"
-                if ok or sc_dir.name not in chosen: chosen[sc_dir.name] = (run, sc_dir, res, ok)
+                if ok or (tag, sc_dir.name) not in chosen: chosen[(tag, sc_dir.name)] = (run, sc_dir, res, ok, tag)
         if True:
-            for run, sc_dir, results, _ok in chosen.values():
+            for run, sc_dir, results, _ok, tag in chosen.values():
                 label, dataset_of = (" (filter 0.6)" if "t06" in run else ""), {s: "eth3d" for s in eth}
                 scene = sc_dir.name; dataset = dataset_of.get(scene, "wriva" if not scene.startswith(("m07_", "mixed", "images")) else "mixed")
-                ep_id = f"solver-{re.sub(r'[^a-z0-9]+', '-', short_scene(scene).lower()).strip('-')}" + ("-t06" if "t06" in run else "") + _args.ep_suffix
+                ep_id = f"solver-{re.sub(r'[^a-z0-9]+', '-', short_scene(scene).lower()).strip('-')}" + ("-t06" if "t06" in run else "") + _args.ep_suffix + (f"-{tag}" if tag else "")
                 print("==", ep_id)
                 store = store_of(sc_dir)
                 recs = load_trace(sc_dir)
@@ -312,7 +321,9 @@ for gid, gtitle, run, dataset, controller in plan:
                     grow_log = json.loads((store / "model" / grow_art / "grow_log.json").read_text())
                     for row in grow_log["log"]:
                         if row.get("kind") == "seed":
-                            for n in row["attempts"][row["chosen"]]["kept"]: order.setdefault(n, 0)
+                            att = row.get("attempts") or []; ch = row.get("chosen")
+                            if isinstance(ch, int) and 0 <= ch < len(att):
+                                for n in att[ch].get("kept", []): order.setdefault(n, 0)
                         elif isinstance(row.get("registered"), list):
                             for n in row["registered"]: order.setdefault(n, row.get("round", 0))
                     # vlm rows: copy the figures / photos they were shown into the site
@@ -327,7 +338,7 @@ for gid, gtitle, run, dataset, controller in plan:
                                     src = Path(nm)
                                     if src.is_file():
                                         img_counter[0] += 1
-                                        rel = f"img/{ep_id}/{img_counter[0]:03d}.jpg"
+                                        rel = f"img/{ep_id}/{img_counter[0]:03d}{IMG_EXT}"
                                         try:
                                             save_image(src, SITE / rel); out_names.append({"src": rel, "name": Path(nm).name})
                                         except Exception as e:
@@ -340,7 +351,7 @@ for gid, gtitle, run, dataset, controller in plan:
                         if s["kind"] == "tool" and s["tool"] == "grow_model":
                             s["grow_log"] = grow_log["log"]; s["grow_summary"] = trim(grow_log["summary"]); break
                 models = []
-                if grow_art:
+                if grow_art and not _args.final_only:
                     minfo = export_model(store / "model" / grow_art, SITE / "models" / f"{ep_id}-grown.json", store / "images", order, gt_of(scene))
                     models.append({"id": f"{ep_id}-grown", "label": "grown (before refinement)", "file": f"models/{ep_id}-grown.json", "has_order": True, **minfo})
                 if (sc_dir / "final").is_dir():
@@ -350,7 +361,7 @@ for gid, gtitle, run, dataset, controller in plan:
                 refs = ref_scores(scene, dataset)
                 if _args.compare_run and score_of(read_results(_args.compare_run).get(scene)):
                     refs["solver"] = score_of(read_results(_args.compare_run).get(scene)); refs["solver_run"] = _args.compare_run
-                title = short_scene(scene) + label + ("" if run == "incremental_v0" or _args.ep_suffix else f" [{run.replace('incremental_', '')}]")
+                title = short_scene(scene) + label + ("" if run == "incremental_v0" or _args.ep_suffix else f" [{run.replace('incremental_', '')}]") + (f" ({tag})" if tag else "")
                 ep = {"id": ep_id, "group": gid, "title": title, "scene": scene, "dataset": dataset,
                       "controller": _args.controller or ("open solver " + ("v0" if run == "incremental_v0" else "v1.3")), "run": run,
                       "num_images": r.get("num_images_gt"), "score": score_of(r), "refs": refs, "wall": r.get("wall"),
@@ -358,6 +369,11 @@ for gid, gtitle, run, dataset, controller in plan:
                       "grow": trim(grow_log["summary"]) if grow_log else None,
                       "gt_align": next((m["gt"] for m in reversed(models) if m.get("gt")), None)}
                 full = {**ep, "steps": steps}
+                if _args.inline_models:   # models travel inside the episode file; the viewer reads "inline:<id>"
+                    full["model_data"] = {}
+                    for m in models:
+                        mp = SITE / m["file"]; full["model_data"][m["id"]] = json.loads(mp.read_text()); mp.unlink(); m["file"] = "inline:" + m["id"]
+                    full["models"] = models
                 if _args.inline_images:
                     full = inline_images(full, ep_id); shutil.rmtree(SITE / "img" / ep_id, ignore_errors=True)
                 (SITE / "data/ep" / f"{ep_id}.json").write_text(json.dumps(full, default=str))

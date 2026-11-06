@@ -42,6 +42,8 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 600; letter-spacing:
 .rail .brand .sub { font-size: 12px; color: var(--muted); margin-top: 4px }
 .rail .group { margin-top: 16px }
 .rail .group .eyebrow { margin: 0 0 6px 8px }
+.rail details.group > summary { cursor: pointer; padding: 4px 0; line-height: 1.35 }
+.rail details.group > summary:hover { color: var(--fg) }
 .rail .ep { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; width: 100%; text-align: left; border: 0; background: none; padding: 5px 8px; border-radius: 6px; color: inherit }
 .rail .ep:hover { background: var(--surface-2) }
 .rail .ep.current { background: var(--accent-soft); color: var(--fg) }
@@ -203,7 +205,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
     var rail = $('#rail'), pick = $('#picker');
     pick.appendChild(h('option', { value: '', text: 'Overview' }));
     INDEX.groups.forEach(function (g) {
-      var box = h('div', { class: 'group' }, [h('div', { class: 'eyebrow', text: g.title })]);
+      var box = h('details', { class: 'group', 'data-group': g.id }, [h('summary', { class: 'eyebrow', text: g.title + ' · ' + g.episodes.length })]);
       var og = h('optgroup', { label: g.title });
       g.episodes.forEach(function (id) {
         var ep = INDEX.episodes[id], sc = ep.score ? ep.score[primary(ep.dataset)] : null;
@@ -217,6 +219,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
   }
   function markCurrent(id) {
     document.querySelectorAll('.rail .ep').forEach(function (b) { b.classList.toggle('current', b.getAttribute('data-id') === id); });
+    if (id && INDEX.episodes[id]) { var gd = document.querySelector('.rail details[data-group="' + INDEX.episodes[id].group + '"]'); if (gd) gd.open = true; }
     $('#picker').value = id || '';
   }
 
@@ -226,7 +229,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
     var v = $('#view'); v.innerHTML = '';
     var n = Object.keys(INDEX.episodes).length;
     v.appendChild(h('div', { class: 'lede' }, [
-      h('div', { class: 'eyebrow', text: 'Open solver episodes · ' + n + ' scenes · exported ' + INDEX.generated }),
+      h('div', { class: 'eyebrow', text: 'Open solver episodes · ' + n + ' episodes · exported ' + INDEX.generated }),
       h('h2', { text: 'An incremental solver with a VLM in the loop, checked against ground truth' }),
       h('p', { html: 'Each episode is one scene handed to the <b>open solver</b>: a Pi3X seed on the densest cluster, PnP growth in rounds verified against the matches, feedforward placement of the hard images with two anchor sets (the VLM arbitrates between render-and-compare figures when they disagree), a render audit of every camera, and separate models for image sets of another scene. Every pose comes from a tool; the VLM only gates which placement is kept. The step log below each 3D view shows every round, every hard placement with its reason, and every VLM question with the figures it saw and its answer.' }),
       h('p', { class: 'muted', text: 'Ground truth enters only here, in the benchmark layer, after the run: each model is aligned to the GT cameras with a robust similarity, GT cameras are drawn in the viewer with an error vector per camera, and the chart gives the per-image rotation error. WRIVA scores are the AUC of pairwise pose error over all image pairs (an unregistered image counts as wrong); ETH3D uses COLMAP\u2019s AUC at 1, 3 and 5 degrees.' })
@@ -240,7 +243,9 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
     if (INDEX.groups.some(function (g) { return g.id === 'solver-p123'; }))
       cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · Pi3X loop v2, phases 1–3 (best run) · auc_all @10 / @3' }), h('div', { class: 'big', text: '60.4 / 23.2' }), h('div', { class: 'muted', text: 'BLH0001 68.5 with all 39 images (the back group placed by the VLM, unverified, all < 5°); A08 44.7; above scripted 59.7' })]));
     if (INDEX.groups.some(function (g) { return g.id === 'solver-p3b'; }))
-      cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · Pi3X loop v2, phases 1–3b (current code) · auc_all @10 / @3' }), h('div', { class: 'big', text: '57.3 / 22.1' }), h('div', { class: 'muted', text: 'run-to-run spread is 3–6 points on PTZ and up to 29 on BLH0001; the stability check admitted no VLM placement this run' })]));
+      cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · Pi3X loop v2, phases 1–3b · auc_all @10 / @3' }), h('div', { class: 'big', text: '57.3 / 22.1' }), h('div', { class: 'muted', text: 'run-to-run spread is 3–6 points on PTZ and up to 29 on BLH0001; the stability check admitted no VLM placement this run' })]));
+    if (INDEX.groups.some(function (g) { return g.id === 'solver-p14'; }))
+      cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · Pi3X loop p14 (current code) · auc_all @10 / @3' }), h('div', { class: 'big', text: '57.4 / 22.7' }), h('div', { class: 'muted', text: 'BLH0001 46–59 over four runs: its back cameras go in unverified with their Pi3X pose (rotations within 6°, centres up to ~2 camera spreads off); no VLM admission on the other scenes. Passes p4–p13 below show each step on the way.' })]));
     v.appendChild(cards);
     INDEX.groups.forEach(function (g) {
       var sec = h('div', { class: 'section' }, [h('h2', { text: g.title })]);
@@ -248,7 +253,8 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
       var hasEth = g.episodes.some(function (id) { return INDEX.episodes[id].dataset === 'eth3d'; });
       var hasWr = g.episodes.some(function (id) { return INDEX.episodes[id].dataset === 'wriva'; });
       var hasSolver = g.episodes.some(function (id) { var e = INDEX.episodes[id]; return e.refs && e.refs.solver; });
-      if (g.id === 'solver-ffvlm') sec.appendChild(h('p', { text: 'Pi3X loop: every round, the VLM looks at the images already in the model and the remaining candidates and picks the next batch; Pi3X places the batch with matched anchors from the model, and each image is kept when its Pi3X pose and its PnP pose agree (or render-and-compare confirms one of them), then triangulated and refined locally; global bundle adjustment runs as the model grows by a quarter. Each round row lists every image with its reason.' }));
+      if (g.desc) sec.appendChild(h('p', { text: g.desc }));
+      else if (g.id === 'solver-ffvlm') sec.appendChild(h('p', { text: 'Pi3X loop: every round, the VLM looks at the images already in the model and the remaining candidates and picks the next batch; Pi3X places the batch with matched anchors from the model, and each image is kept when its Pi3X pose and its PnP pose agree (or render-and-compare confirms one of them), then triangulated and refined locally; global bundle adjustment runs as the model grows by a quarter. Each round row lists every image with its reason.' }));
       if (g.id === 'solver-p123' || g.id === 'solver-p3b') sec.appendChild(h('p', { text: 'Pi3X loop v2: the VLM sees each candidate\'s match inliers when it picks the next batch; Pi3X is aligned to the model on lifted 3D points; when Pi3X and PnP disagree, match support decides; a final sweep retries skipped images; leftover groups with no usable matches go to the VLM, which picks overlapping photos as Pi3X anchors and checks a top-down layout, and such poses are registered unverified (no triangulation, no BA).' + (g.id === 'solver-p3b' ? ' Phase 3b: an unverified pose is kept only if Pi3X places the image in the same spot with each half of the VLM\'s picks.' : '') }));
       sec.appendChild(h('p', { text: 'Same matches as the baseline controllers; the score is the submitted model (grown, then shared-intrinsics refinement). GT columns: median per-camera rotation error after alignment and the number of cameras more than 10 degrees off.' }));
       var head = h('tr', {}, [h('th', { text: 'Scene' }), h('th', { class: 'num', text: 'Images' }), h('th', { class: 'num', text: 'Registered' }),
@@ -482,6 +488,8 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
       } else if (r.kind === 'component') {
         row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Component', h('small', { text: r.model || '' })]),
           h('div', { class: 'body' }, [r.error ? h('span', { class: 'err', text: String(r.error).slice(0, 200) }) : (r.registered + ' of ' + (Array.isArray(r.component) ? r.component.length : r.component) + ' images · same scene: ' + r.same_scene + ' · absorbed ' + r.absorbed + ' · ' + (r.merged ? 'merged' : 'kept as a separate model'))])]);
+      } else if (r.kind === 'seed' && !(r.attempts && r.attempts[r.chosen])) {
+        row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Seed', h('small', { text: r.model || 'Pi3X' })]), h('div', { class: 'body' }, [(r.attempts || []).length + ' seed attempts; the kept attempt is not in the log'])]);
       } else if (r.kind === 'seed') {
         var a = r.attempts[r.chosen];
         row = h('div', { class: 'round', 'data-round': 0 }, [h('div', { class: 'lab' }, ['Seed', h('small', { text: 'Pi3X · ' + a.group.length + ' images' })]),
@@ -744,7 +752,7 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
     try { VIEWER = new Viewer(box); } catch (e) { col.appendChild(h('div', { class: 'err', text: 'WebGL is not available here: ' + e })); return; }
     function loadModel(file) {
       meta.textContent = 'loading ' + file + '…'; roundWrap.innerHTML = '';
-      fetch(file).then(function (r) { return r.json(); }).then(function (obj) {
+      (file.indexOf('inline:') === 0 ? Promise.resolve(ep.model_data[file.slice(7)]) : fetch(file).then(function (r) { return r.json(); })).then(function (obj) {
         if (!VIEWER) return;
         VIEWER.load(obj);
         var d = VIEWER.data;
