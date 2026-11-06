@@ -474,6 +474,18 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
         });
         row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, ['Hard ' + r.round, h('small', { text: 'Pi3X × 2 anchor sets' + (r.model ? ' · ' + r.model : '') })]),
           h('div', { class: 'body' }, ['+' + (r.registered || []).length + ' of ' + (r.batch || []).length + (r.error ? ' · ' + r.error : '') + ' · ' + (r.num_registered || '') + ' in model'].concat(items))]);
+      } else if (r.kind === 'examine') {
+        var eims = r.images || {};
+        var eitems = Object.keys(eims).map(function (n) {
+          var v = eims[n], mv = (r.moved || []).indexOf(n) >= 0, rm = (r.removed || []).indexOf(n) >= 0;
+          var b = ['support ' + v.support + (v.support_rest != null ? ' (vs unflagged ' + v.support_rest + ')' : '')];
+          if (v.support_new != null) b.push('fresh PnP ' + v.pnp_inliers + ' inliers, support ' + v.support_new + ', ' + v.gap_deg + '° / ' + v.gap_frac + ' of scale from the old pose');
+          if (v.ba_drift_deg != null) b.push('local BA moved it ' + v.ba_drift_deg + '°');
+          return h('div', { style: 'margin:2px 0' }, [h('span', { class: 'tag ' + (mv ? 'ok' : (rm ? 'bad' : 'warn')), text: n.replace(/\.(jpg|JPG|png|jpeg)$/, '') }), ' ', h('span', { text: v.why || '' }),
+            h('span', { class: 'muted mono', style: 'font-size:11px', text: ' · ' + b.join(' · ') })]);
+        });
+        row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Examine', h('small', { text: r.checked + ' cameras checked' })]),
+          h('div', { class: 'body' }, [h('div', {}, [(r.flagged || []).length + ' lost their match support · re-placed ' + (r.moved || []).length + ' · removed ' + (r.removed || []).length + ' · ' + r.num_registered + ' in model'])].concat(eitems))]);
       } else if (r.kind === 'repair') {
         row = h('div', { class: 'round' }, [h('div', { class: 'lab' }, ['Repair', h('small', { text: 'fold check' })]),
           h('div', { class: 'body' }, ['inconsistent strong pairs ' + r.inconsistent_frac + ' · consistent blocks ' + JSON.stringify(r.components || []) + ' · ' + (r.action || ''), (r.suspects || []).length ? h('div', { class: 'tags' }, tags(r.suspects, 'warn')) : null])]);

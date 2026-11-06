@@ -123,16 +123,26 @@ class Advisor:
               "If the middle panel depicts other objects than the photo (a different building, terrain where the photo shows a wall), the placement is "
               "NOT aligned. A sparse rendering is normal: judge where its points fall, not how many there are.")
 
+    FIGURE_V2 = ("Each figure has three panels. Left: the photo. Middle: what the 3D model shows from this camera's estimated pose (neighbouring "
+                 "photos re-projected through the model's geometry; dark where the model has nothing). Right: a checkerboard of the two: the tiles "
+                 "alternate between the photo and the model's rendering. If the camera is placed correctly, roof lines, walls, roads and other "
+                 "structures continue across the tile borders (a shift of a few pixels is fine). If it is placed wrongly, structures jump or break at "
+                 "the borders, or the rendered tiles show different things than the photo tiles.")
+    figure_text: str = ""
+
+    def fig_text(self) -> str:
+        return self.figure_text or self.FIGURE
+
     def render_verdict(self, figure_path: str, context: dict[str, Any] | None = None) -> str:
         """'aligned' / 'misaligned' / 'unsure' for one render-and-compare figure."""
-        parts = [(self.FIGURE + " Figure:", [figure_path])]
+        parts = [(self.fig_text() + " Figure:", [figure_path])]
         q = 'Is the model aligned with the photo in this figure? Answer {"answer": "aligned" | "misaligned" | "unsure", "confidence": 0-1, "reason": "<one sentence>"}'
         v = self.ask("render_verdict", parts, q, context)
         return str(v.get("answer", "unsure")).strip().lower() if isinstance(v, dict) else "unsure"
 
     def render_verdicts(self, figures: list[str], context: dict[str, Any] | None = None) -> list[str]:
         """One call for several images of a round: 'aligned' / 'misaligned' / 'unsure' per figure, in order."""
-        parts = [(self.FIGURE, [])] + [(f"Figure {k + 1}:", [f]) for k, f in enumerate(figures)]
+        parts = [(self.fig_text(), [])] + [(f"Figure {k + 1}:", [f]) for k, f in enumerate(figures)]
         q = ('For each figure, is the model aligned with the photo? Answer {"verdicts": [{"figure": 1, "answer": "aligned" | "misaligned" | "unsure", '
              '"reason": "<a few words>"}, ...]} with one entry per figure, in order.')
         v = self.ask("render_verdicts", parts, q, context)
@@ -149,7 +159,7 @@ class Advisor:
 
     def render_choose(self, figure_a: str, figure_b: str, context: dict[str, Any] | None = None) -> str:
         """'a' / 'b' / 'neither' / 'unsure': which of two candidate placements renders consistently with the photo."""
-        parts = [(self.FIGURE + " Figure A (first candidate placement):", [figure_a]), ("Figure B (second candidate placement):", [figure_b])]
+        parts = [(self.fig_text() + " Figure A (first candidate placement):", [figure_a]), ("Figure B (second candidate placement):", [figure_b])]
         q = ('Which placement is aligned with the photo: A, B, both, or neither? Neither is the right answer whenever no rendering shows the '
              'photo\'s own structures in place. Answer {"answer": "A" | "B" | "both" | "neither" | "unsure", "confidence": 0-1, "middle_panels": "<what A and B depict>", "reason": "<one sentence>"}')
         v = self.ask("render_choose", parts, q, context)

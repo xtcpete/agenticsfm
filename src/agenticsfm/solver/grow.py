@@ -135,6 +135,23 @@ class GrowConfig:
                                        # (GT p6-p11: 37 of 47 such images ended >= 5 deg or >= 0.25 spreads off; Pi3X can repeat its mistake)
     vlm_temperature: float = 0.0       # VLM sampling temperature (was 0.3, unseeded): greedy answers, so reruns take the same route
     vlm_seed: bool = True              # per-question sampling seed (keeps temperature > 0 reproducible too)
+    examine: bool = True               # after every round that changes the model: re-check each match-verified camera's support against
+                                       # the grown model; a camera that lost it gets a fresh PnP against points the flagged cameras did not
+                                       # make, and moves when that pose fits the matches clearly better (GT p14 PTZ: the cameras 20-100 deg /
+                                       # ~1 camera spread off had support 0.06-0.38 at the end, though >= 0.5 when admitted; a fresh PnP put
+                                       # most within 6 deg, support 0.52-0.64; correct flagged cameras stayed correct)
+    examine_flag: float = 0.4          # support below this flags a camera
+    examine_accept: float = 0.45       # the fresh pose must reach this support (against unflagged cameras) ...
+    examine_gain: float = 0.1          # ... and beat the current pose by this much
+    examine_drop: float = 0.2          # no better pose and support below this: the camera leaves the model and returns to the pool
+    examine_max: int = 2               # examinations per camera (no oscillation)
+    examine_vlm: bool = True           # the VLM on the render figures where support cannot decide: a suspect with no clearly better pose
+                                       # (old vs fresh pose, render_choose) and a suspect about to be removed (render_verdict); acted on
+                                       # only with vlm=decide, logged otherwise
+    rac_v2: bool = True                # render-and-compare v2 (docs/EXAMINE.md): dense occlusion-aware render (inverse warping through the
+                                       # candidate's own feedforward depth), align-then-judge verdict (shift of the render onto the photo and
+                                       # the agreement after it; GT: AUC 0.88-0.97 vs 10-20 deg errors, old margin 0.61-0.87), checkerboard
+                                       # figure for the VLM; the vlm_place gate keeps v1 (its thresholds are calibrated on it)
     vlm_place_stable: bool = False     # Phase 3b gate (instead of 3c): Pi3X places the image the same way with two disjoint halves of the picks
     vlm_place_stable_deg: float = 5.0  # ... rotation within this, centre within ff_agree_frac of the scene scale
     ff_coloc: bool = True        # co-location guard: Pi3X puts a candidate on a registered anchor's centre -> its pose must sit there
@@ -227,6 +244,7 @@ class Solver:
         self.rng = np.random.default_rng(0)
         self._sweeping = False
         self.unverified: set[int] = set()
+        self.examined: dict[int, int] = {}
         self._rotfit: dict[tuple[int, int], dict[str, Any] | None] = {}
         self._last_corr = 0
         self.tries = {i: 0 for i in self.names}
@@ -244,7 +262,7 @@ class Solver:
         self.ff_seconds = 0.0
         self.log: list[dict[str, Any]] = []
         self.timer = Timer()
-        self.rac = RenderCompare(self.rec, ws.images_dir, min_conf=self.gc.rac_min_conf, backface=self.gc.rac_backface, min_cover=self.gc.rac_min_cover)
+        self.rac = RenderCompare(self.rec, ws.images_dir, min_conf=self.gc.rac_min_conf, backface=self.gc.rac_backface, min_cover=self.gc.rac_min_cover, v2=self.gc.rac_v2)
         if advisor is not None:
             self.advisor = advisor
             self.advisor.log = self.log
@@ -253,6 +271,8 @@ class Solver:
             self.advisor = Advisor(cfg, ws.images_dir, self.log, mode=gc.vlm, temperature=gc.vlm_temperature, seed=gc.vlm_seed)
         else:
             self.advisor = None
+        if self.advisor is not None:
+            self.advisor.figure_text = self.advisor.FIGURE_V2 if self.gc.rac_v2 else self.advisor.FIGURE
 
     # -- helpers -----------------------------------------------------------------------------
     def say(self, msg: str) -> None:
@@ -411,12 +431,15 @@ class Solver:
                 break
         return out
 
-    def correspondences_2d3d(self, i: int) -> tuple[np.ndarray, np.ndarray]:
+    def correspondences_2d3d(self, i: int, exclude: set[int] | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """2D-3D matches of image i: its verified matches to registered images' keypoints that have a model point. With
+        ``exclude``: neither from those images nor to points they observe (points a suspect camera helped triangulate)."""
         reg = self.reg()
         kp_i = self.kp(i)
         pts2d, pts3d = [], []
+        bad_pts: dict[int, bool] = {}
         for j, n in self.W.get(i, {}).items():
-            if j not in reg:
+            if j not in reg or (exclude and j in exclude):
                 continue
             a, b = (i, j) if i < j else (j, i)
             m = self.pairs[(a, b)]
@@ -425,6 +448,12 @@ class Solver:
             for ii, jj in zip(idx_i, idx_j):
                 p2 = p2s[int(jj)]
                 if p2.has_point3D():
+                    if exclude:
+                        pid = p2.point3D_id
+                        if pid not in bad_pts:
+                            bad_pts[pid] = any(e.image_id in exclude for e in self.rec.points3D[pid].track.elements)
+                        if bad_pts[pid]:
+                            continue
                     pts2d.append(kp_i[int(ii)])
                     pts3d.append(self.rec.points3D[p2.point3D_id].xyz)
         return np.array(pts2d, dtype=np.float64).reshape(-1, 2), np.array(pts3d, dtype=np.float64).reshape(-1, 3)
@@ -804,13 +833,13 @@ class Solver:
             return r
         return self.own_pnp_pose(i, f_alt)
 
-    def own_pnp_pose(self, i: int, f_alt: float | None = None) -> dict[str, Any] | None:
+    def own_pnp_pose(self, i: int, f_alt: float | None = None, exclude: set[int] | None = None) -> dict[str, Any] | None:
         """Independent absolute pose from the 2D-3D correspondences, as the mapper would do it (RANSAC, focal length
         estimated when the camera has no prior and is not shared, then refined), on a copy of the camera. When that fails
         and another focal length is offered (the feedforward model's), it is tried as the start. None: no pose."""
         import pycolmap
 
-        pts2d, pts3d = self.correspondences_2d3d(i)
+        pts2d, pts3d = self.correspondences_2d3d(i, exclude)
         self._last_corr = len(pts3d)
         if len(pts3d) < 30:
             return None
@@ -994,7 +1023,7 @@ class Solver:
         return {"ok": frac >= self.gc.ff_points_min_inl, "s": s_, "R": R_, "t": t_, "resid": round(1 - frac, 4), "used": len(anchors),
                 "dropped": [], "by": "points", "points": int(len(src)), "point_inl": round(frac, 3)}
 
-    def support_pose(self, i: int, R: np.ndarray, t: np.ndarray, params: np.ndarray | None = None) -> float:
+    def support_pose(self, i: int, R: np.ndarray, t: np.ndarray, params: np.ndarray | None = None, among: set[int] | None = None) -> float:
         """Match support (as for PnP growth) of a candidate pose of an unregistered image, without registering it:
         the pose and intrinsics are set temporarily and restored. NaN when the image has no strong pair to the model."""
         import pycolmap
@@ -1007,7 +1036,7 @@ class Solver:
             fr.rig_from_world = pycolmap.Rigid3d(pycolmap.Rotation3d(R), t)
             if params is not None:
                 cam.params = params
-            reg = self.reg()
+            reg = self.reg() if among is None else among
             num = den = 0.0
             strong = sorted(((n, j) for j, n in self.W.get(i, {}).items() if n >= self.gc.strong_pair and j in reg), reverse=True)
             with self.timer("support"):
@@ -1378,20 +1407,22 @@ class Solver:
         near = [j for j in self.pose_neighbours(R, t, 3 * k, {i}) if facing(j)]
         return list(dict.fromkeys(matched[:k] + near))[:k]
 
-    def judge_pose(self, i: int, R: np.ndarray, t: np.ndarray, tag: str, figure: bool = False) -> dict[str, Any]:
+    def judge_pose(self, i: int, R: np.ndarray, t: np.ndarray, tag: str, figure: bool = False, v1: bool = False) -> dict[str, Any]:
         with self.timer("render_compare"):
-            return self._judge_pose(i, R, t, tag, figure)
+            return self._judge_pose(i, R, t, tag, figure, v1)
 
-    def _judge_pose(self, i: int, R: np.ndarray, t: np.ndarray, tag: str, figure: bool = False) -> dict[str, Any]:
+    def _judge_pose(self, i: int, R: np.ndarray, t: np.ndarray, tag: str, figure: bool = False, v1: bool = False) -> dict[str, Any]:
         """Render-and-compare verdict of a candidate pose; the three-panel figure for the advisor when asked."""
         import pycolmap
 
         n = self.names[i]
         P = pycolmap.Rigid3d(pycolmap.Rotation3d(R), t)
         nbs = [self.names[j] for j in self.render_sources(i, R, t, 4)]
-        j = self.rac.judge(n, P, nbs)
+        v2 = self.gc.rac_v2 and not v1
+        j = self.rac.judge_v2(n, P, nbs) if v2 else self.rac.judge(n, P, nbs)
         if figure and self.rac.usable(nbs):
-            j["figure"] = self.rac.figure(n, P, nbs, self.workdir / "rac" / f"{Path(n).stem}_{tag}.jpg")
+            fig = self.rac.figure_v2 if v2 else self.rac.figure
+            j["figure"] = fig(n, P, nbs, self.workdir / "rac" / f"{Path(n).stem}_{tag}.jpg")
         return j
 
     def ensure_depth(self, wants: list[tuple[int, np.ndarray, np.ndarray]], tag: str) -> None:
@@ -1400,6 +1431,8 @@ class Solver:
         for i, R, t in wants:
             nbs = self.render_sources(i, R, t, 4)
             need = [j for j in nbs if self.names[j] not in self.rac.depth]
+            if self.gc.rac_v2 and self.names[i] not in self.rac.cand_depth:
+                need.append(i)                      # v2 renders through the candidate's own depth
             if need:
                 g = tuple([self.names[i]] + [self.names[j] for j in nbs])
                 if g not in seen:
@@ -1487,8 +1520,12 @@ class Solver:
                     else:
                         choice, why = best, "placements agree" + (f", render {judges[best]['verdict']}" if judges[best]["verdict"] != "no evidence" else "")
                 else:
+                    sh = {tg: judges[tg].get("shift") for tg in ("A", "B")}
                     if len(cons) == 1:
                         choice, why = cons[0], "placements disagree, render picks " + cons[0]
+                    elif self.gc.rac_v2 and len(cons) == 2 and abs(sh["A"] - sh["B"]) > 0.02:
+                        choice = min(cons, key=lambda tg: sh[tg])
+                        why = f"placements disagree, both render consistent, {choice} lines up with less shift"
                     elif askable:
                         figA = self.judge_pose(i, ps["A"][0], ps["A"][1], "A", figure=True).get("figure")
                         figB = self.judge_pose(i, ps["B"][0], ps["B"][1], "B", figure=True).get("figure")
@@ -1515,9 +1552,9 @@ class Solver:
                     fig = self.judge_pose(i, ps[tag][0], ps[tag][1], tag, figure=True).get("figure")
                     vv = self.advisor.render_verdict(fig, {"image": n, "placement": tag, **info["render"][tag]}) if fig else "unsure"
                     info["vlm"] = vv
-                    if vv == "aligned" and decide and v != "inconsistent":
+                    if vv == "aligned" and decide and v != "inconsistent" and not self.gc.rac_v2:
                         choice, why = tag, f"single placement, render {v}, advisor: aligned"
-                    else:
+                    else:   # v2: the VLM's yes/no on one figure is near chance (GT: "aligned" for 57% of 10-deg errors); logged only
                         why = f"single placement, render {v}, advisor: {vv}"
                 else:
                     why = f"single placement, render {v}, no advisor"
@@ -1596,6 +1633,123 @@ class Solver:
         if out:
             self.attach_mapper()
         return out
+
+    def examine(self, k: int) -> dict[str, Any] | None:
+        """Look at every match-verified camera again now that the model has grown: its match support against the current
+        model. A camera below examine_flag is a suspect: it gets a fresh PnP against model points that no suspect helped
+        triangulate, and both poses are scored against the unflagged cameras. The fresh pose replaces the old one when
+        it fits the matches clearly better; a suspect with no better pose and very low support leaves the model and
+        returns to the candidate pool (it can come back in a later round). Hard-stage, held and unverified cameras are
+        not judged here: they were placed because matches could not place them."""
+        if not self.gc.examine:
+            return None
+        reg = self.reg()
+        check = sorted(i for i in reg if i not in self.unverified and i not in self.held and i not in self.hard_placed)
+        if len(check) < 6:
+            return None
+        nan = lambda v: v != v  # noqa: E731
+        rnd = lambda v: None if nan(v) else round(float(v), 3)  # noqa: E731
+        with self.timer("examine"):
+            sup = self.support(check)
+            flagged = [i for i in check if not nan(sup[i]) and sup[i] < self.gc.examine_flag and self.examined.get(i, 0) < self.gc.examine_max]
+            if not flagged:
+                return None
+            F = set(flagged)
+            among = reg - F
+            per: dict[str, dict[str, Any]] = {}
+            moves: dict[int, dict[str, Any]] = {}
+            drops: list[int] = []
+            for i in sorted(flagged, key=lambda i: sup[i]):
+                self.examined[i] = self.examined.get(i, 0) + 1
+                R0, t0 = self.pose_of(i)
+                s_old = self.support_pose(i, R0, t0, None, among)
+                info: dict[str, Any] = {"support": rnd(sup[i]), "support_rest": rnd(s_old)}
+                p = self.own_pnp_pose(i, exclude=F)
+                s_new = float("nan")
+                if p is not None:
+                    s_new = self.support_pose(i, p["R"], p["t"], None if self.camera_shared(i) else p["params"], among)
+                    d, m = self.pose_gap(p["R"], p["t"], R0, t0)
+                    info.update({"pnp_inliers": f"{p['inliers']}/{p['of']}", "support_new": rnd(s_new), "gap_deg": round(d, 1), "gap_frac": round(m, 3)})
+                else:
+                    info["corr_2d3d"] = self._last_corr
+                base = 0.0 if nan(s_old) else s_old
+                ask = self.gc.examine_vlm and self.advisor is not None and self.advisor.enabled
+                act = self.gc.vlm == "decide"
+                if p is not None and not nan(s_new) and s_new >= max(base + self.gc.examine_gain, self.gc.examine_accept):
+                    moves[i] = p
+                    info["why"] = "re-placed: a fresh PnP fits the matches better"
+                elif nan(s_old) or s_old < self.gc.examine_drop:
+                    drops.append(i)
+                    info["why"] = "removed: its matches disagree with the model and no better pose was found"
+                elif ask and p is not None and not nan(s_new) and s_new > base:
+                    v, jn = self.examine_ask_choose(i, (R0, t0), (p["R"], p["t"]), f"ex{k}")
+                    info["vlm"] = v
+                    if jn:
+                        info["render_new"] = {kk: jn.get(kk) for kk in ("score", "shift", "verdict", "cover")}
+                    if act and v == "b" and (jn or {}).get("verdict") != "inconsistent":
+                        moves[i] = p
+                        info["why"] = "re-placed: support slightly better and the VLM picks the fresh pose"
+                    else:
+                        info["why"] = "kept: no clearly better pose" + (f" (VLM: {v})" if v else "")
+                else:
+                    info["why"] = "kept: no clearly better pose"
+                per[self.names[i]] = info
+            for i in drops:
+                self.deregister(i)
+                self.status[i] = "deferred"
+                self.tries[i] = min(self.tries[i], self.gc.max_tries - 1)
+            for i, p in moves.items():
+                self.deregister(i)
+                self.set_pose(i, np.c_[p["R"], p["t"]])
+                if not self.camera_shared(i):
+                    self.rec.cameras[self.rec.images[i].camera_id].params = p["params"]
+                self.rec.register_frame(self.rec.images[i].frame_id)
+            if moves or drops:
+                self.attach_mapper()
+                for i in moves:
+                    with self.timer("triangulate"):
+                        self.mapper.triangulate_image(self.tri, i)
+                for i in moves:
+                    with self.timer("local_ba"):
+                        self.mapper.iterative_local_refinement(2, 0.001, self.mo, self.ba, self.tri, i)
+                for i, p in moves.items():
+                    if i not in self.reg():
+                        per[self.names[i]]["filtered"] = True
+                        self.status[i] = "deferred"
+                        continue
+                    per[self.names[i]]["ba_drift_deg"] = round(self.pose_gap(*self.pose_of(i), p["R"], p["t"])[0], 2)
+                self.rac.invalidate()
+        moved = [self.names[i] for i in moves if i in self.reg()]
+        row = {"round": k, "kind": "examine", "checked": len(check), "flagged": [self.names[i] for i in flagged], "moved": moved,
+               "removed": [self.names[i] for i in drops], "images": per, **self.model_stats()}
+        self.say(f"examine after round {k}: {len(check)} cameras, {len(flagged)} below support {self.gc.examine_flag}; "
+                 f"re-placed {len(moved)}, removed {len(drops)}")
+        return row
+
+    def examine_ask_choose(self, i: int, old: tuple[np.ndarray, np.ndarray], new: tuple[np.ndarray, np.ndarray], tag: str) -> tuple[str | None, dict | None]:
+        """Pairwise: 'a' = keep the current pose, 'b' = the fresh PnP pose, else neither / both / unsure. The render verdicts
+        decide first when they differ (consistent vs not); the VLM is asked only when they do not (GT: on pairs the
+        numeric check cannot decide, the VLM picks the right pose 15 of 17 times on the checkerboard figures)."""
+        self.ensure_depth([(i, *old), (i, *new)], f"{tag}depth")
+        ja = self.judge_pose(i, *old, f"{tag}_old", figure=True)
+        jb = self.judge_pose(i, *new, f"{tag}_new", figure=True)
+        va, vb = ja.get("verdict"), jb.get("verdict")
+        if vb == "consistent" and va != "consistent":
+            return "b", jb
+        if va == "consistent" and vb != "consistent":
+            return "a", jb
+        fa, fb = ja.get("figure"), jb.get("figure")
+        if not (fa and fb):
+            return None, jb
+        return self.advisor.render_choose(fa, fb, {"image": self.names[i], "examine": tag, "A": "current pose", "B": "fresh PnP"}), jb
+
+    def examine_refine(self, k: int) -> None:
+        """Examine after a global refinement; refine again when it changed the model."""
+        ex = self.examine(k)
+        if ex:
+            self.log.append(ex)
+            if ex["moved"] or ex["removed"]:
+                self.global_refine(final=True)
 
     def audit(self) -> dict[str, Any] | None:
         """Render-and-compare every camera of the model; drop the ones whose photo disagrees with what the model shows."""
@@ -1760,6 +1914,10 @@ class Solver:
                 if row is None:
                     break
             self.log.append(row)
+            if row.get("registered"):
+                ex = self.examine(k)
+                if ex:
+                    self.log.append(ex)
             stall = stall + 1 if not row.get("registered") else 0
             if stall >= 6:
                 break
@@ -1767,9 +1925,11 @@ class Solver:
         for r in self.repair_fold(k):
             self.log.append(r)
         self.global_refine(final=True)
+        self.examine_refine(k)
         if self.gc.loop == "ff" and self.gc.ff_sweep:
             k = self.sweep(k)
             self.rounds = k
+            self.examine_refine(k)
         if self.held or self.hard_placed:
             self.log.append({"round": k, "kind": "held", "images": self.rerefine_held()})
         if self.gc.audit:
@@ -2059,7 +2219,7 @@ class Solver:
                 self.ensure_depth([(i, *poses[i]) for i in pending], f"vlmplace{k}r")
                 verd = {}
                 for i in pending:
-                    jr = self.judge_pose(i, *poses[i], f"vlmplace{k}")
+                    jr = self.judge_pose(i, *poses[i], f"vlmplace{k}", v1=True)
                     verd[i] = jr["verdict"]
                     row["images"][self.names[i]]["render"] = {kk: jr.get(kk) for kk in ("verdict", "score", "margin", "cover")}
                 n_inc = sum(v == "inconsistent" for v in verd.values())
@@ -2108,7 +2268,7 @@ class Solver:
                         if keep:
                             self.ensure_depth([(i, *poses[i]) for i in keep], f"vlmplace{k}rs")
                         for i in keep:
-                            jr = self.judge_pose(i, *poses[i], f"vlmplace{k}s")
+                            jr = self.judge_pose(i, *poses[i], f"vlmplace{k}s", v1=True)
                             verd[i] = jr["verdict"]
                             row["images"][self.names[i]]["render"] = {kk: jr.get(kk) for kk in ("verdict", "score", "margin", "cover")}
                         n2 = sum(verd[i] == "inconsistent" for i in keep)

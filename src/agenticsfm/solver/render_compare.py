@@ -18,8 +18,14 @@ PERTURB = (("yaw5", 5.0, 0.0), ("yaw15", 15.0, 0.0), ("shift5", 0.0, 0.05), ("sh
 
 
 class RenderCompare:
-    def __init__(self, rec, images_dir: Path, min_conf: float = 0.0, backface: bool = False, min_cover: float = 0.0):
+    def __init__(self, rec, images_dir: Path, min_conf: float = 0.0, backface: bool = False, min_cover: float = 0.0, v2: bool = False):
         self.rec = rec
+        self.v2 = v2                 # dense occlusion-aware render, align-then-judge verdict, checkerboard figure (docs/EXAMINE.md, v2)
+        self.cand_depth: dict[str, tuple[np.ndarray, Any, str]] = {}   # every image of a depth group -> (depth, transform, group file)
+        self.group_members: dict[str, list[str]] = {}
+        self.group_files: dict[str, Any] = {}
+        self.group_scale: dict[str, float | None] = {}
+        self.colour_cache: dict[tuple[str, int, int], np.ndarray] = {}
         self.backface = backface     # drop source points whose surface faces away from the target camera
         self.min_cover = min_cover   # a render covering less of the photo than this is "no evidence", not "inconsistent"
         self.normals: dict[str, np.ndarray] = {}   # name -> unit surface normals in the source camera frame (H, W, 3); 0 = unknown
@@ -65,8 +71,21 @@ class RenderCompare:
 
     # -- depth ---------------------------------------------------------------------------------
     def add_depth(self, npz_path: str) -> None:
-        """Register dense depth of the images in a feedforward group (backend result with save_depth)."""
+        """Register dense depth of the images in a feedforward group (backend result with save_depth). Registered images
+        become render sources; with v2 every member (a candidate too) keeps its depth for inverse rendering, scaled
+        through the group's registered members (one feedforward frame)."""
         z = np.load(npz_path)
+        if self.v2:
+            names = [str(n) for n in z["names"]]
+            self.group_members[npz_path] = names
+            self.group_files[npz_path] = z
+            for k, n in enumerate(names):
+                if n in self.cand_depth:
+                    continue
+                d = z["depth"][k].astype(np.float32)
+                if self.min_conf > 0 and "conf" in z.files:
+                    d = np.where(z["conf"][k].astype(np.float32) >= self.min_conf, d, 0.0).astype(np.float32)
+                self.cand_depth[n] = (d, z["transforms"][k], npz_path)
         for k, n in enumerate(z["names"]):
             n = str(n)
             if n in self.depth or not self.rec.find_image_with_name(n) or not self.image(n).has_pose:
@@ -116,6 +135,7 @@ class RenderCompare:
     def invalidate(self) -> None:
         """After a refinement or normalisation the model's scale changed: recompute depth scales on demand."""
         self.scales = {}
+        self.group_scale = {}
 
     def scale(self, name: str) -> float | None:
         if name not in self.scales:
@@ -283,3 +303,231 @@ class RenderCompare:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(out).save(out_path, quality=85)
         return str(out_path)
+
+    # -- v2: dense rendering, align-then-judge, checkerboard figure ----------------------------------------
+    def target_scale(self, target: str) -> float | None:
+        """Scale of a candidate's group depth to the model: median of the scales of the group's registered members
+        (the candidate's own sparse points excluded)."""
+        if target not in self.cand_depth:
+            return None
+        gp = self.cand_depth[target][2]
+        key = gp + "|" + target
+        if key not in self.group_scale:
+            z = self.group_files[gp]
+            sc = []
+            for k, n in enumerate(self.group_members[gp]):
+                im = self.rec.find_image_with_name(n)
+                if n == target or im is None or not im.has_pose:
+                    continue
+                s_, _ = self.depth_scale(n, z["depth"][k].astype(np.float32), z["transforms"][k])
+                if s_ is not None:
+                    sc.append(s_)
+            self.group_scale[key] = float(np.median(sc)) if sc else None
+        return self.group_scale[key]
+
+    def colour(self, name: str, w: int, h: int) -> np.ndarray:
+        key = (name, w, h)
+        if key not in self.colour_cache:
+            from PIL import Image
+
+            self.colour_cache[key] = np.asarray(Image.open(self.images_dir / name).convert("RGB").resize((w, h), Image.BILINEAR), dtype=np.float32) / 255.0
+        return self.colour_cache[key]
+
+    def render(self, target: str, P_t, nbs: list[str], width: int = 96) -> dict[str, Any]:
+        """The model's view from pose P_t: RGB, valid mask. Inverse when the candidate has feedforward depth (each photo
+        pixel lifted through it and looked up in the sources where their own depth agrees: hole-free, occlusion-aware),
+        otherwise forward splatting into a z-buffer with each source sample's footprint."""
+        K_t, W_t, H_t = self.K(target)
+        h = max(1, round(H_t * width / W_t))
+        s = width / W_t
+        R_t, t_t = P_t.rotation.matrix(), P_t.translation
+        nbs = self.usable(nbs)
+        st = self.target_scale(target)
+        if st is not None and nbs:
+            # feedforward depth scale is not shared exactly within a group (PTZ s00: members 0.5-2x the group median), and a
+            # candidate has no sparse points to measure its own: take the scale at which its depth agrees with the most source
+            # pixels (low resolution). No forward fallback: GT shows it calls correct PTZ poses inconsistent.
+            w0 = 48
+            h0 = max(1, round(H_t * w0 / W_t))
+            best = max((self._render_inverse(target, R_t, t_t, K_t, nbs, w0, h0, w0 / W_t, st * f)["cover"], f)
+                       for f in (0.5, 0.6, 0.7, 0.85, 1.0, 1.2, 1.4, 1.7, 2.0))
+            r = self._render_inverse(target, R_t, t_t, K_t, nbs, width, h, s, st * best[1])
+            r["scale_factor"] = best[1]
+            return r
+        return self._render_forward(R_t, t_t, K_t, nbs, width, h, s)
+
+    def _render_inverse(self, target, R_t, t_t, K_t, nbs, width, h, s, st, tol: float = 0.1):
+        d_t, tr_t, _ = self.cand_depth[target]
+        sx, sy, ox, oy = tr_t
+        vs, us = np.mgrid[0:h, 0:width]
+        u0, v0 = (us + 0.5) / s, (vs + 0.5) / s
+        mu = np.clip(np.round(u0 * sx + ox).astype(int), 0, d_t.shape[1] - 1)
+        mv = np.clip(np.round(v0 * sy + oy).astype(int), 0, d_t.shape[0] - 1)
+        z = d_t[mv, mu] * st
+        has = z > 0
+        x = (u0 - K_t[0, 2]) / K_t[0, 0]
+        y = (v0 - K_t[1, 2]) / K_t[1, 1]
+        Xw = (np.stack([x * z, y * z, z], -1) - t_t) @ R_t
+        rgb = np.zeros((h, width, 3), np.float32)
+        best = np.full((h, width), np.inf, np.float32)
+        for j in nbs:
+            depth_j, tr_j = self.depth[j]
+            sj = self.scale(j)
+            Pj = self.image(j).cam_from_world()
+            Rj, tj = Pj.rotation.matrix(), Pj.translation
+            K_j, W_j, H_j = self.K(j)
+            Xj = Xw @ Rj.T + tj
+            zj = Xj[..., 2]
+            ok = has & (zj > 1e-6)
+            zz = np.where(ok, zj, 1.0)
+            uj = K_j[0, 0] * Xj[..., 0] / zz + K_j[0, 2]
+            vj = K_j[1, 1] * Xj[..., 1] / zz + K_j[1, 2]
+            ok &= (uj >= 0) & (uj < W_j - 1) & (vj >= 0) & (vj < H_j - 1)
+            sxj, syj, oxj, oyj = tr_j
+            dj = depth_j[np.clip(np.round(vj * syj + oyj).astype(int), 0, depth_j.shape[0] - 1),
+                         np.clip(np.round(uj * sxj + oxj).astype(int), 0, depth_j.shape[1] - 1)] * sj
+            rel = np.where(ok & (dj > 0), np.abs(zj - dj) / np.maximum(dj, 1e-9), np.inf)
+            take = (rel < tol) & (rel < best)
+            if take.any():
+                cw = 256
+                chh = max(1, round(H_j * cw / W_j))
+                col = self.colour(j, cw, chh)
+                rgb[take] = col[np.clip((vj * chh / H_j).astype(int), 0, chh - 1)[take], np.clip((uj * cw / W_j).astype(int), 0, cw - 1)[take]]
+                best[take] = rel[take]
+        valid = np.isfinite(best)
+        return {"rgb": rgb, "valid": valid, "mode": "inverse", "cover": float(valid.mean())}
+
+    def _render_forward(self, R_t, t_t, K_t, nbs, width, h, s):
+        rgb = np.zeros((h, width, 3), np.float32)
+        zbuf = np.full((h, width), np.inf, np.float32)
+        c_t = -R_t.T @ t_t
+        for j in nbs:
+            depth_j, tr_j = self.depth[j]
+            sj = self.scale(j)
+            Pjw = self.image(j).cam_from_world().inverse()
+            Rw, tw = Pjw.rotation.matrix(), Pjw.translation
+            H, W = depth_j.shape
+            step = max(1, W // 192)
+            vs, us = np.mgrid[0:H:step, 0:W:step]
+            d = depth_j[vs, us] * sj
+            ok = d > 0
+            sx, sy, ox, oy = tr_j
+            K_j, W_j, H_j = self.K(j)
+            x = ((us - ox) / sx - K_j[0, 2]) / K_j[0, 0]
+            y = ((vs - oy) / sy - K_j[1, 2]) / K_j[1, 1]
+            Xw = np.stack([x * d, y * d, d], -1)[ok] @ Rw.T + tw
+            Xt = Xw @ R_t.T + t_t
+            z = Xt[:, 2]
+            front = (z > 1e-6) & self.facing(j, vs[ok], us[ok], Xw, Rw, c_t)
+            zz = np.where(front, z, 1.0)
+            u = (K_t[0, 0] * Xt[:, 0] / zz + K_t[0, 2]) * s
+            v = (K_t[1, 1] * Xt[:, 1] / zz + K_t[1, 2]) * s
+            r = np.clip(np.ceil((step / sx) * (K_t[0, 0] / K_j[0, 0]) * (d[ok] / zz) * s / 2).astype(int), 0, 3)
+            inb = front & (u >= 0) & (u < width) & (v >= 0) & (v < h)
+            cw = 256
+            chh = max(1, round(H_j * cw / W_j))
+            col = self.colour(j, cw, chh)
+            C = col[np.clip(((vs[ok] - oy) / sy * chh / H_j).astype(int), 0, chh - 1), np.clip(((us[ok] - ox) / sx * cw / W_j).astype(int), 0, cw - 1)]
+            idx = np.where(inb)[0]
+            for dy in range(-3, 4):
+                for dx in range(-3, 4):
+                    sel = idx[(abs(dx) <= r[idx]) & (abs(dy) <= r[idx])]
+                    if not len(sel):
+                        continue
+                    uu = (u[sel] + dx).astype(int)
+                    vv = (v[sel] + dy).astype(int)
+                    m = (uu >= 0) & (uu < width) & (vv >= 0) & (vv < h)
+                    uu, vv, zs, cs = uu[m], vv[m], z[sel][m], C[sel][m]
+                    o = np.argsort(-zs)
+                    uu, vv, zs, cs = uu[o], vv[o], zs[o], cs[o]
+                    closer = zs < zbuf[vv, uu]
+                    zbuf[vv[closer], uu[closer]] = zs[closer]
+                    rgb[vv[closer], uu[closer]] = cs[closer]
+        valid = np.isfinite(zbuf)
+        return {"rgb": rgb, "valid": valid, "mode": "forward", "cover": float(valid.mean())}
+
+    @staticmethod
+    def _grad(g: np.ndarray) -> np.ndarray:
+        import cv2
+
+        gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+        return np.sqrt(gx * gx + gy * gy)
+
+    @staticmethod
+    def _ncc(a, b, m):
+        if m.sum() < 50:
+            return None
+        x = a[m] - a[m].mean()
+        y = b[m] - b[m].mean()
+        return float((x * y).sum() / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-9))
+
+    def judge_v2(self, name: str, P, nbs: list[str], width: int = 96, max_shift: float = 0.3) -> dict[str, Any]:
+        """Align, then judge: the render-to-photo shift that best lines up their gradients (masked NCC), the agreement
+        after that shift, and the agreement without it. A correct pose needs no shift; a coarse one a small shift; a pose
+        rotated 10 deg about 10-20% of the width; a wrong place does not line up at any shift (GT calibration on six
+        scenes, docs/EXAMINE.md). Verdict: consistent = shift <= 0.08 and NCC >= 0.4; inconsistent = shift > 0.15 or
+        NCC < 0.3; no evidence below min_cover."""
+        import cv2
+
+        nbs = self.usable(nbs)
+        if not nbs:
+            return {"image": name, "score": None, "verdict": "no evidence", "neighbours": nbs, "cover": 0.0}
+        r = self.render(name, P, nbs, width)
+        h = r["valid"].shape[0]
+        out = {"image": name, "neighbours": nbs, "cover": round(r["cover"], 3), "mode": r["mode"]}
+        if r["cover"] < max(self.min_cover, 0.05):
+            return {**out, "score": None, "verdict": "no evidence"}
+        gp = self._grad(self.colour(name, width, h).mean(-1))
+        gr = self._grad(r["rgb"].mean(-1))
+        vm = cv2.erode(r["valid"].astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        n0 = vm.sum()
+        z0 = self._ncc(gp, gr, vm)
+        R = int(max_shift * width)
+        best = (-2.0, 0, 0)
+        for dy in range(-R, R + 1):
+            ys0, ys1 = max(0, -dy), min(h, h - dy)
+            if ys1 <= ys0:
+                continue
+            for dx in range(-R, R + 1):
+                xs0, xs1 = max(0, -dx), min(width, width - dx)
+                m = vm[ys0:ys1, xs0:xs1]
+                if m.sum() < 0.4 * n0:
+                    continue
+                v = self._ncc(gp[ys0 + dy:ys1 + dy, xs0 + dx:xs1 + dx], gr[ys0:ys1, xs0:xs1], m)
+                if v is not None and v > best[0]:
+                    best = (v, dx, dy)
+        if z0 is None or best[0] < -1:
+            return {**out, "score": None, "verdict": "no evidence"}
+        shift = float(np.hypot(best[1], best[2])) / width
+        ncc = best[0]
+        if shift <= 0.08 and ncc >= 0.4:
+            verdict = "consistent"
+        elif shift > 0.15 or ncc < 0.3:
+            verdict = "inconsistent"
+        else:
+            verdict = "ambiguous"
+        return {**out, "score": round(ncc, 3), "ncc0": round(z0, 3), "shift": round(shift, 3), "dx": round(best[1] / width, 3), "dy": round(best[2] / width, 3),
+                "margin": None, "verdict": verdict}
+
+    def figure_v2(self, name: str, P, nbs: list[str], out_path: Path, width: int = 448) -> str | None:
+        """Photo | render | checkerboard (tiles alternate photo and render: on a correct pose structures continue across
+        the tile borders, on a wrong one they break or the render tiles show something else)."""
+        from PIL import Image
+
+        nbs = self.usable(nbs)
+        if not nbs:
+            return None
+        r = self.render(name, P, nbs, width=width)
+        h = r["valid"].shape[0]
+        ph = self.colour(name, width, h)
+        ren = np.where(r["valid"][..., None], r["rgb"], 0.16)
+        tile = max(16, width // 8)
+        yy, xx = np.mgrid[0:h, 0:width]
+        board = np.where((((yy // tile + xx // tile) % 2 == 1) & r["valid"])[..., None], ren, ph)
+        sep = np.full((h, 6, 3), 1.0)
+        out = (np.concatenate([ph, sep, ren, sep, board], 1) * 255).astype(np.uint8)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(out).save(out_path, quality=88)
+        return str(out_path)
+
