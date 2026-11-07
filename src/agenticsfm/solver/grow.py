@@ -148,6 +148,8 @@ class GrowConfig:
     examine_vlm: bool = True           # the VLM on the render figures where support cannot decide: a suspect with no clearly better pose
                                        # (old vs fresh pose, render_choose) and a suspect about to be removed (render_verdict); acted on
                                        # only with vlm=decide, logged otherwise
+    hard_vlm_needs_evidence: bool = False   # hard stage: no pairwise VLM between two renders without evidence (p17: PTZ cameras > 10 deg
+                                            # 4 vs 5-8, but BLH 49.6 vs 53.5: the back cluster takes another route); off = p16 behaviour
     rac_v2: bool = True                # render-and-compare v2 (docs/EXAMINE.md): dense occlusion-aware render (inverse warping through the
                                        # candidate's own feedforward depth), align-then-judge verdict (shift of the render onto the photo and
                                        # the agreement after it; GT: AUC 0.88-0.97 vs 10-20 deg errors, old margin 0.61-0.87), checkerboard
@@ -1526,7 +1528,7 @@ class Solver:
                     elif self.gc.rac_v2 and len(cons) == 2 and abs(sh["A"] - sh["B"]) > 0.02:
                         choice = min(cons, key=lambda tg: sh[tg])
                         why = f"placements disagree, both render consistent, {choice} lines up with less shift"
-                    elif self.gc.rac_v2 and all(judges[tg]["verdict"] == "no evidence" for tg in ("A", "B")):
+                    elif self.gc.hard_vlm_needs_evidence and all(judges[tg]["verdict"] == "no evidence" for tg in ("A", "B")):
                         why = "placements disagree, neither render has evidence"   # GT p16: the VLM's picks on two empty figures were 2 of 4 wrong (> 10 deg)
                     elif askable:
                         figA = self.judge_pose(i, ps["A"][0], ps["A"][1], "A", figure=True).get("figure")
