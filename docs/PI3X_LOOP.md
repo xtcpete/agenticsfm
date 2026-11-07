@@ -853,3 +853,84 @@ Test set: every leftover-group placement with known GT, 19 images.
   - All rotations ≤ 6.2°. Centres: 13/28/33/22 at 0.02–0.31 spreads; 2/32/38 at 0.92–1.36.
   - In BLH dev, 2/32/38 were re-placed stably (they did not move) at 2.0–2.2 spreads off, so the stability test can't catch them.
 - **Reading:** BLH now admits the back group in every run. BLH's remaining variance is how far off Pi3X puts the 2/32/36/38 cluster (0.9–2.2 spreads).
+
+### Step 35 (2026-11-06, offline): why PTZ keeps clearly wrong cameras
+- **GT, p14 grown models:** each PTZ scene keeps 4–6 cameras more than 10° off, most about 1 camera spread off too (s00 23/99/139, s01 87/90/118/128/135, s02 40/73).
+- **They entered through normal ff rounds** with match support ≥ 0.5, while the model was small. Nothing looked at them again.
+- **Against the final model their support is 0.06–0.38;** correct cameras are mostly ≥ 0.6. Support below 0.4 flags 13 wrong and 14 correct PTZ cameras, so a flag alone must not drop a camera.
+- **A fresh PnP against points no flagged camera made** (scratchpad `fix_proto.py`) fixes most of them: s00 23 33° → 1.9° (support 0.15 → 0.57), 99 19° → 0.5°, s02 40 104° → 6°, 73 24° → 6°. Correct flagged cameras stay correct.
+- **Not fixable this way:**
+  - s01's co-located cluster 87/90/118/128 (their points come mostly from each other; rotations 23° → 4–7°, centres stay 0.2–0.6 spreads off);
+  - cameras with high support that are still wrong (s00 160 at 164°, support 0.90; A08 147/137/97 at 11–16° in every run).
+
+### Step 36 (2026-11-06): examine after every round (commit de35e97, cache v34 for p15)
+- **After each round that adds cameras, and after the final refinement and the sweep:**
+  - Every match-verified camera's support is re-checked. Hard-stage, held and unverified cameras are skipped: matches could not place them.
+  - Below 0.4: a fresh PnP from points no flagged camera made. The camera moves when the new pose's support, against unflagged cameras, is ≥ 0.45 and ≥ 0.1 above the old pose's.
+  - With no better pose and support below 0.2, the camera leaves the model and returns to the pool. Each camera is examined at most twice.
+  - `--ff-off examine` reverts.
+- **p15 (examine only):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p15_vlm_dev | 44.8 | 82.8 | 45.2 | 58.9 | 57.5 | 56.9 | **57.7** |
+
+  - BLH repeats 49.0, 58.2, 59.1 (mean of 4: 52.9).
+  - GT: PTZ cameras > 10° 5/6/4 → 2/2/3. s01 135 was moved 24° and ended 6.4° off; s02 73 was moved and ended 5.8°.
+  - Early removals of correct cameras (M07 round 4, s00 44) came back later.
+
+### Step 37 (2026-11-06, offline): render-and-compare v2 and what the VLM can judge
+- **Calibration harness** (scratchpad `eval_rac2.py`, p14 models, 25 GT-correct cameras per scene): each camera scored at its true pose, a coarse pose (3° and 3% of span), 10° and 20° rotations, and 15% and 30% shifts.
+- **v1** (forward splat of 4 sources, one global NCC, margin over 5°/5% perturbations):
+  - calls 50–60% of coarse-but-correct poses inconsistent;
+  - passes 14% of 10° errors ("consistent");
+  - AUC vs 10° 0.61–0.87.
+- **v2** (in `render_compare.py`):
+  - Inverse warping through the candidate's own Pi3X depth: every photo pixel is lifted, placed by the pose and looked up in the sources where their own depth agrees. The render is dense and occlusion-aware.
+  - Pi3X depth scale is not shared within a group (PTZ s00: 0.5–2× the group median), so the candidate's scale is searched (0.5–2×, best coverage).
+  - Score: search the shift of the render onto the photo (masked NCC of gradient magnitude). The shift says how far off the pose is; the NCC after it says whether it is the same place.
+  - AUC of the shift vs 10°/20° errors: 0.88–0.97 (M07 0.97, A08 0.88, PTZ 0.89–0.96, BLH 0.92).
+  - Verdict "consistent" = shift ≤ 8% and NCC ≥ 0.4. It passes 2 of 90 10° errors and none of 90 shifted poses; about half of true poses pass, the rest are mostly "no evidence".
+  - A forward fallback when the inverse render is empty made correct PTZ poses "inconsistent", so it was removed.
+- **Photometric rotation refinement** (correct yaw/pitch from the shift, roll by search):
+  - fixes 10° on M07 (to 0.9°) and 6° on BLH (to 0.6°);
+  - does nothing on PTZ, and its acceptance rule was unsound;
+  - not used.
+- **VLM on render figures** (`vlm_eval.py`, 150 poses × 2 figure styles):
+  - **Yes/no "aligned?":** "aligned" for 29/30 true but also 25/30 10° errors on the old figure, and near chance on the checkerboard. Never acted on.
+  - **Pairwise, true vs wrong:** on the checkerboard right 22, wrong 3, no pick 5 (vs 10°); old figure 20 / 8. The numeric v2 check is never wrong when it decides, but is undecided on 40–50% of pairs. On exactly those, the checkerboard VLM picks right 15 of 17.
+- **Policy:** numeric verdict first; the VLM only as a pairwise tie-breaker, on checkerboard figures.
+
+### Step 38 (2026-11-06): v2 in the loop, pairwise VLM acting (commit de35e97, cache v35)
+- **Ff-round arbitration and the hard stage use v2.** The `vlm_place` gate keeps v1, because its thresholds are calibrated on it.
+- **Hard stage:**
+  - when both placements are consistent but disagree, the smaller shift wins;
+  - a single placement is accepted only on the render verdict (the VLM's yes/no is logged);
+  - two disagreeing placements without a numeric decision go to the pairwise VLM (acts with `--vlm decide`).
+- **Examine:** a suspect with only a slightly better fresh pose goes to the pairwise question (numeric verdicts first). No VLM before a removal.
+- `--ff-off racv2` / `exvlm` revert.
+- **p16 (all on, `--vlm decide`):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p14_vlm_dev | 44.7 | 82.7 | 46.2 | 57.7 | 55.5 | 57.5 | 57.4 |
+  | p15_vlm_dev (examine) | 44.8 | 82.8 | 45.2 | 58.9 | 57.5 | 56.9 | 57.7 |
+  | p16_vlm_dev (all) | 44.3 | 82.4 | 58.9 | 58.9 | 58.1 | 57.0 | **59.9** |
+
+  - BLH repeats 56.4, 47.5, 50.5 (mean of 4: 53.3; the 58.9 dev run is partly luck). PTZ mean 56.9 (p14) → 57.8 (p15) → 58.0.
+- **GT (p16):**
+  - PTZ cameras > 10°: 3/1/1 (p14 5/6/4). BLH 39 in model, none > 10°.
+  - Every examine move ended within 6.5°, most within 2°.
+  - Hard-stage VLM acts: s00 44 (1.3°), s00 29 (4.4°), s01 91 (0.6°), s01 159 (later filtered).
+  - s02 102, accepted wrongly at 69° in p15 by v1 ("render picks B"), entered on a v2 "consistent" render at 5.4°.
+  - Every v2 "render confirms" arbitration ended within 5.5° (p14: two at 24° and 104°).
+- **Still wrong:** high-support cameras examine cannot see (A08 147/137/97, s00 160). The BLH back cameras still enter the hard stage as "placements agree, render no evidence" at 0.3–3 spreads off (existing behaviour, not v2).
+- **Repeat (`p16_vlm_rep`, same code, `--support-pairs 996`):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p16_vlm_rep | 45.0 | 81.7 | 54.3 | 59.4 | 56.8 | 58.2 | **59.2** |
+
+  - PTZ mean 58.1 (p16 58.0, p14 56.9). PTZ cameras > 10°: 3/3/2, mostly 10–14°.
+  - **Hard-stage VLM picks over both runs:** 8 acts; 2 ended > 10° off (BLH 13 at 12°, s01 174 at 13.9°). In both, both renders were "no evidence": the VLM chose between two near-empty figures. Picks on figures with content all ended within 5°.
+- **Fix (cache v36):** the hard stage asks the pairwise VLM only when at least one render has evidence. Confirmation pass `p17_vlm_dev` with BLH repeats launched.

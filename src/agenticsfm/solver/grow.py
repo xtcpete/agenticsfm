@@ -1526,6 +1526,8 @@ class Solver:
                     elif self.gc.rac_v2 and len(cons) == 2 and abs(sh["A"] - sh["B"]) > 0.02:
                         choice = min(cons, key=lambda tg: sh[tg])
                         why = f"placements disagree, both render consistent, {choice} lines up with less shift"
+                    elif self.gc.rac_v2 and all(judges[tg]["verdict"] == "no evidence" for tg in ("A", "B")):
+                        why = "placements disagree, neither render has evidence"   # GT p16: the VLM's picks on two empty figures were 2 of 4 wrong (> 10 deg)
                     elif askable:
                         figA = self.judge_pose(i, ps["A"][0], ps["A"][1], "A", figure=True).get("figure")
                         figB = self.judge_pose(i, ps["B"][0], ps["B"][1], "B", figure=True).get("figure")
