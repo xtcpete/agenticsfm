@@ -245,7 +245,9 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
     if (INDEX.groups.some(function (g) { return g.id === 'solver-p3b'; }))
       cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · Pi3X loop v2, phases 1–3b · auc_all @10 / @3' }), h('div', { class: 'big', text: '57.3 / 22.1' }), h('div', { class: 'muted', text: 'run-to-run spread is 3–6 points on PTZ and up to 29 on BLH0001; the stability check admitted no VLM placement this run' })]));
     if (INDEX.groups.some(function (g) { return g.id === 'solver-p14'; }))
-      cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · Pi3X loop p14 (current code) · auc_all @10 / @3' }), h('div', { class: 'big', text: '57.4 / 22.7' }), h('div', { class: 'muted', text: 'BLH0001 46–59 over four runs: its back cameras go in unverified with their Pi3X pose (rotations within 6°, centres up to ~2 camera spreads off); no VLM admission on the other scenes. Passes p4–p13 below show each step on the way.' })]));
+      cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · Pi3X loop p14 · auc_all @10 / @3' }), h('div', { class: 'big', text: '57.4 / 22.7' }), h('div', { class: 'muted', text: 'BLH0001 46–59 over four runs: its back cameras go in unverified with their Pi3X pose (rotations within 6°, centres up to ~2 camera spreads off); no VLM admission on the other scenes. Passes p4–p13 below show each step on the way.' })]));
+    if (INDEX.groups.some(function (g) { return g.id === 'solver-p16'; }))
+      cards.appendChild(h('div', { class: 'card' }, [h('div', { class: 'eyebrow', text: 'WRIVA dev, 6 scenes · p16: examine every round + render v2 + pairwise VLM · auc_all @10' }), h('div', { class: 'big', text: '59.9 / 59.2' }), h('div', { class: 'muted', text: 'two full runs (p14: 57.4). PTZ cameras more than 10° off (GT): 15 in p14, 5 and 8 here. Every camera is re-checked against its matches after each round and re-placed by a fresh PnP when it lost them; the hard stage judges renders by how far they must shift to line up with the photo; the VLM only picks between two poses.' })]));
     v.appendChild(cards);
     INDEX.groups.forEach(function (g) {
       var sec = h('div', { class: 'section' }, [h('h2', { text: g.title })]);
@@ -468,9 +470,9 @@ dialog .cap button { background: none; border: 1px solid var(--line); border-rad
         var ims = r.images || {};
         var items = Object.keys(ims).map(function (n) {
           var v = ims[n], ok = (r.registered || []).indexOf(n) >= 0;
-          var rd = v.render || {}; var rtxt = Object.keys(rd).map(function (tg) { return tg + ' ' + (rd[tg].score == null ? '–' : rd[tg].score) + '/' + (rd[tg].margin == null ? '–' : rd[tg].margin); }).join('  ');
+          var rd = v.render || {}; var rtxt = Object.keys(rd).map(function (tg) { return tg + ' ' + (rd[tg].verdict || '') + ' ' + (rd[tg].score == null ? '–' : rd[tg].score) + (rd[tg].margin == null ? '' : '/' + rd[tg].margin); }).join('  ');
           return h('div', { style: 'margin:2px 0' }, [h('span', { class: 'tag ' + (ok ? 'ok' : 'warn'), text: n.replace(/\.(jpg|JPG|png|jpeg)$/, '') }), ' ', h('span', { text: v.why || '' }),
-            h('span', { class: 'muted mono', style: 'font-size:11px', text: (v.agree_deg != null ? ' · agree ' + v.agree_deg + '°' : '') + (rtxt ? ' · render score/margin ' + rtxt : '') + (v.vlm ? ' · VLM ' + v.vlm : '') + (v.held ? ' · held' : '') + (v.ba_drift_deg != null ? ' · BA moved ' + v.ba_drift_deg + '°' : '') })]);
+            h('span', { class: 'muted mono', style: 'font-size:11px', text: (v.agree_deg != null ? ' · agree ' + v.agree_deg + '°' : '') + (rtxt ? ' · render ' + rtxt : '') + (v.vlm ? ' · VLM ' + v.vlm : '') + (v.held ? ' · held' : '') + (v.ba_drift_deg != null ? ' · BA moved ' + v.ba_drift_deg + '°' : '') })]);
         });
         row = h('div', { class: 'round', 'data-round': r.round }, [h('div', { class: 'lab' }, ['Hard ' + r.round, h('small', { text: 'Pi3X × 2 anchor sets' + (r.model ? ' · ' + r.model : '') })]),
           h('div', { class: 'body' }, ['+' + (r.registered || []).length + ' of ' + (r.batch || []).length + (r.error ? ' · ' + r.error : '') + ' · ' + (r.num_registered || '') + ' in model'].concat(items))]);

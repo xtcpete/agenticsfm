@@ -36,7 +36,11 @@ G = [  # id, suffix, runs, controller, title, desc
  ("solver-p12", "p12", ["p12_vlm_dev"] + reps("p12", [997, 998, 999]), "Pi3X loop (p12)", "p12: hard stage drops 'agree, render inconsistent'; re-placement needs two survivors; mean {m}", None),
  ("solver-p13", "p13", ["p13_vlm_dev"] + reps("p13", [997, 998, 999]), "Pi3X loop (p13)", "p13: re-placed survivors must stay within 0.2 camera spreads and 3 deg of the joint placement; mean {m}", None),
  ("solver-p14", "p14", ["p14_vlm_dev"] + reps("p14", [997, 998, 999]), "Pi3X loop (p14, current code)",
-  "p14 (current code): survivors that move under re-placement are admitted unverified with their joint Pi3X pose; mean {m}", None),
+  "p14: survivors that move under re-placement are admitted unverified with their joint Pi3X pose; mean {m}", None),
+ ("solver-p15", "p15", ["p15_vlm_dev"] + reps("p15", [997, 998, 999]), "Pi3X loop (p15, examine)",
+  "p15: examine after every round (each camera's match support re-checked; a camera that lost it gets a fresh PnP and moves when that fits better); mean {m}", None),
+ ("solver-p16", "p16", ["p16_vlm_dev", "p16_vlm_rep=rep"] + reps("p16", [997, 998, 999]), "Pi3X loop (p16, examine + render v2 + pairwise VLM)",
+  "p16: examine + render-and-compare v2 (dense render, align-then-judge) + the VLM as a pairwise tie-breaker acting in the hard stage; mean {m}, repeat (rep) 59.2", None),
 ]
 COMMON = ["--inline-images", "--inline-models", "--webp", "--jpeg-quality", "58"]
 def run(args):
@@ -44,12 +48,12 @@ def run(args):
     subprocess.run([PY, "scripts/export_site.py", "--out", str(OUT)] + args, cwd=ROOT, check=True)
 only = sys.argv[2:]
 if not only or "solver" in only:
-    run(COMMON + ["--img-side", "900", "--max-points", "25000"])          # open solver v1.3 (default runs and title)
+    run(COMMON + ["--img-side", "900", "--max-points", "8000"])          # open solver v1.3 (default runs and title)
 for gid, sfx, runs, ctl, title, desc in G:
     if only and gid not in only: continue
     base = [r.split("=")[0] for r in runs if "=" not in r]
     m = mean_of(*base); g = mean_of("ff_graph_dev", "ff_graph_dev_s01") if gid == "solver-ffvlm" else None
-    args = COMMON + ["--img-side", "640", "--max-points", "15000", "--final-only", "--solver-runs", *runs, "--solver-group", gid,
+    args = COMMON + ["--img-side", "640", "--max-points", "8000", "--final-only", "--solver-runs", *runs, "--solver-group", gid,
                      "--solver-title", title.format(m=m, g=g), f"--ep-suffix=-{sfx}", "--controller", ctl, "--compare-run", "incremental_v13",
                      "--merge-into", str(OUT / "data/index.json")]
     if desc: args += ["--solver-desc", desc]
