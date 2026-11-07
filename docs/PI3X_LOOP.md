@@ -934,3 +934,15 @@ Test set: every leftover-group placement with known GT, 19 images.
   - PTZ mean 58.1 (p16 58.0, p14 56.9). PTZ cameras > 10°: 3/3/2, mostly 10–14°.
   - **Hard-stage VLM picks over both runs:** 8 acts; 2 ended > 10° off (BLH 13 at 12°, s01 174 at 13.9°). In both, both renders were "no evidence": the VLM chose between two near-empty figures. Picks on figures with content all ended within 5°.
 - **Fix (cache v36):** the hard stage asks the pairwise VLM only when at least one render has evidence. Confirmation pass `p17_vlm_dev` with BLH repeats launched.
+- **p17 (the evidence rule on):**
+
+  | Run | A08 | M07 | BLH | s00 | s01 | s02 | Mean |
+  |---|---|---|---|---|---|---|---|
+  | p17_vlm_dev | 43.7 | 82.8 | 48.7 | 57.0 | 59.0 | 57.6 | **58.1** |
+
+  - BLH repeats 50.5, 50.2, 48.9 (mean of 4: 49.6, against 53.5 over 5 p16 runs). PTZ mean 57.9 (p16 58.0/58.1).
+  - GT: PTZ cameras > 10° 2/1/1 (the fewest so far). BLH has 35 cameras: the back cluster 2/32/36/38 was left out at `vlm_place` ("render inconsistent") in both runs checked, and 13 ended 45° and 17° off.
+  - The rule changes BLH's route more than its precision.
+- **Decision (user asked for p16 on all sequences):** the rule is now `hard_vlm_needs_evidence`, off by default (p16 behaviour, cache v35, commit 871c817).
+- **Full runs launched 2026-11-06 17:17 on p16 code:** `p16_wriva_test` (28 WRIVA test sequences) then `p16_eth3d` (25 scenes), one process per GPU (4/5/6), balanced by image count.
+  - `run.py --workers N` assigns scene k to GPU k mod N regardless of which GPU is free, which can put two Pi3X jobs on one GPU; hence one process per GPU.
