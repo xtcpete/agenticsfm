@@ -182,6 +182,23 @@ class GrowConfig:
     repair_act: bool = False     # re-place the minority block of a detected fold (v1.6 misfired on old_computer: detect and log only until the re-placement is reliable)
     seed_fold_frac: float = 0.1
     strong_pair: int = 50        # inliers for a pair to count in the support
+    realign: bool = True         # after growth: find blocks of cameras that agree with each other but whose matches to the rest
+                                 # the poses do not explain (a seam or a fold), and move a block rigidly when the evidence says so
+    realign_seam: float = 0.35   # a cut whose crossing matches are explained below this share is a seam
+    realign_pair_min: int = 100  # PnP of a block camera uses outside points through its pairs with at least this many matches
+    realign_min_block: int = 8   # smaller blocks are left alone
+    realign_min_deg: float = 2.0 # smaller corrections are left to bundle adjustment
+    realign_worse: float = 0.2   # at most this share of the block's cameras may lose outside-point inliers under the move
+                                 # (0.1 refused old_computer's 180 deg fold in p18: 2 of 13 cameras)
+    realign_improved: float = 0.4    # ... and at least this share must gain (1.5x + 5), or
+    realign_agree: float = 0.75  # ... this share of the re-placed cameras' own PnP poses agree with the move (within realign_agree_deg)
+    realign_agree_deg: float = 5.0
+    realign_flip_deg: float = 10.0   # a turn above this (a fold, not drift) must also explain at least realign_flip_frac of the
+    realign_flip_frac: float = 0.06  # block's outside correspondences: a doppelganger flip explains only the repeated structure
+                                     # (GT, p16+p18, WRIVA+ETH3D: right flips 0.08-0.16, wrong ones 0.016-0.029)
+    realign_vlm: bool = False    # a move also needs the VLM (pairwise, renders from outside-block cameras only) to pick the moved pose
+    realign_vlm_cams: int = 2    # ... for each of the block's best-supported cameras
+    realign_max_moves: int = 3
     epipolar_px: float = 4.0
     max_tries: int = 2           # PnP attempts per image in our loop (COLMAP's own cap is 3)
     global_ba_growth: float = 1.1
@@ -249,6 +266,7 @@ class Solver:
         self.examined: dict[int, int] = {}
         self._rotfit: dict[tuple[int, int], dict[str, Any] | None] = {}
         self._last_corr = 0
+        self._rac_exclude: set[int] = set()
         self.tries = {i: 0 for i in self.names}
         self.hard_tried = {i: 0 for i in self.names}
         self.status = {i: "unplaced" for i in self.names}
@@ -296,7 +314,7 @@ class Solver:
         C = np.array(list(self.centres().values()))
         return float(np.linalg.norm(np.ptp(C, axis=0))) if len(C) > 1 else 1.0
 
-    def pair_consistency(self, i: int, j: int) -> float:
+    def pair_consistency(self, i: int, j: int, raw: bool = False) -> float:
         """Share of the pair's verified matches within ``epipolar_px`` of the epipolar lines under the current poses."""
         a, b = (i, j) if i < j else (j, i)
         m = self.pairs[(a, b)]
@@ -318,7 +336,7 @@ class Solver:
         E = np.array([[0, -t[2], t[1]], [t[2], 0, -t[0]], [-t[1], t[0], 0]]) @ R
         frac_epi = float((sampson(E, x0, x1) * f < self.gc.epipolar_px).mean())
         pose = max(frac_epi, frac_rot)
-        if not self.gc.support_norm:
+        if raw or not self.gc.support_norm:
             return pose
         best = self.best_fit(a, b, x0, x1, f)
         return min(1.0, pose / best) if best > 0.05 else pose
@@ -1401,12 +1419,12 @@ class Solver:
         same surfaces, so they come first (strongest first; the same set for every candidate pose of i); nearby cameras
         fill up. A source looking the opposite way from the candidate shows the far side of the scene and is never used."""
         if not self.gc.rac_sources_match:
-            return self.pose_neighbours(R, t, k, {i})
+            return self.pose_neighbours(R, t, k, {i} | self._rac_exclude)
         d = R[2]
-        reg = self.reg()
+        reg = self.reg() - self._rac_exclude
         facing = lambda j: float(np.dot(self.rec.images[j].viewing_direction(), d)) > self.gc.rac_min_cos  # noqa: E731
         matched = [j for j, n in sorted(self.W.get(i, {}).items(), key=lambda x: -x[1]) if j in reg and j != i and n >= self.gc.rac_min_matches and facing(j)]
-        near = [j for j in self.pose_neighbours(R, t, 3 * k, {i}) if facing(j)]
+        near = [j for j in self.pose_neighbours(R, t, 3 * k, {i} | self._rac_exclude) if facing(j)]
         return list(dict.fromkeys(matched[:k] + near))[:k]
 
     def judge_pose(self, i: int, R: np.ndarray, t: np.ndarray, tag: str, figure: bool = False, v1: bool = False) -> dict[str, Any]:
@@ -1730,7 +1748,8 @@ class Solver:
                  f"re-placed {len(moved)}, removed {len(drops)}")
         return row
 
-    def examine_ask_choose(self, i: int, old: tuple[np.ndarray, np.ndarray], new: tuple[np.ndarray, np.ndarray], tag: str) -> tuple[str | None, dict | None]:
+    def examine_ask_choose(self, i: int, old: tuple[np.ndarray, np.ndarray], new: tuple[np.ndarray, np.ndarray], tag: str,
+                           labels: tuple[str, str] = ("current pose", "fresh PnP")) -> tuple[str | None, dict | None]:
         """Pairwise: 'a' = keep the current pose, 'b' = the fresh PnP pose, else neither / both / unsure. The render verdicts
         decide first when they differ (consistent vs not); the VLM is asked only when they do not (GT: on pairs the
         numeric check cannot decide, the VLM picks the right pose 15 of 17 times on the checkerboard figures)."""
@@ -1745,7 +1764,7 @@ class Solver:
         fa, fb = ja.get("figure"), jb.get("figure")
         if not (fa and fb):
             return None, jb
-        return self.advisor.render_choose(fa, fb, {"image": self.names[i], "examine": tag, "A": "current pose", "B": "fresh PnP"}), jb
+        return self.advisor.render_choose(fa, fb, {"image": self.names[i], "examine": tag, "A": labels[0], "B": labels[1]}), jb
 
     def examine_refine(self, k: int) -> None:
         """Examine after a global refinement; refine again when it changed the model."""
@@ -1857,6 +1876,275 @@ class Solver:
         maj, mino = (a, b) if len(a) >= len(b) else (b, a)
         return maj, mino, stats
 
+    # -- block re-alignment ------------------------------------------------------------------
+    def seam_blocks(self, P: dict[tuple[int, int], tuple[int, int]], nodes: list[int], depth: int = 0, out: list | None = None) -> list[dict[str, Any]]:
+        """Recursive spectral cut (normalised Laplacian, sweep along the Fiedler order) of the graph weighted by the matches
+        the poses explain. A cut whose crossing matches are mostly unexplained is a seam; its smaller side is a candidate
+        block, and both sides are cut again."""
+        out = [] if out is None else out
+        if len(nodes) < 6 or depth > 5:
+            return out
+        idx = {n: a for a, n in enumerate(nodes)}
+        A = np.zeros((len(nodes), len(nodes)))
+        for (i, j), (ok, n) in P.items():
+            if i in idx and j in idx and ok > 0:
+                A[idx[i], idx[j]] += ok
+                A[idx[j], idx[i]] += ok
+        d = A.sum(1) + 1e-9
+        L = np.eye(len(nodes)) - A / np.sqrt(np.outer(d, d))
+        try:
+            vals, vecs = np.linalg.eigh(L)
+        except np.linalg.LinAlgError:
+            return out
+        order = np.argsort(vecs[:, 1] / np.sqrt(d))
+        srt = [nodes[x] for x in order]
+        pos = {n: a for a, n in enumerate(srt)}
+        rows = [(pos[i], pos[j], ok, n) for (i, j), (ok, n) in P.items() if i in pos and j in pos]
+        best = None
+        for cut in range(3, len(srt) - 2, max(1, len(srt) // 60)):
+            ok = tot = 0
+            for a, b, o, n in rows:
+                if (a < cut) != (b < cut):
+                    ok += o
+                    tot += n
+            if tot >= 500 and (best is None or ok / tot < best[0]):
+                best = (ok / tot, cut, tot)
+        if best is None or best[0] >= self.gc.realign_seam:
+            return out
+        a, b = srt[:best[1]], srt[best[1]:]
+        small, big = (a, b) if len(a) < len(b) else (b, a)
+        out.append({"block": small, "cross": round(best[0], 3), "cross_matches": int(best[2])})
+        self.seam_blocks(P, big, depth + 1, out)
+        self.seam_blocks(P, small, depth + 1, out)
+        return out
+
+    def block_pnp(self, i: int, block: set[int]) -> dict[str, Any] | None:
+        """Correspondences of block camera i to model points no block camera observes (through its pairs with at least
+        realign_pair_min matches to outside images), and i's PnP pose on them; intrinsics fixed."""
+        import pycolmap
+
+        reg = self.reg()
+        kp_i = self.kp(i)
+        pts2d, pts3d, inb, seen = [], [], {}, set()
+        for j, n in self.W.get(i, {}).items():
+            if j not in reg or j in block or n < self.gc.realign_pair_min:
+                continue
+            a, b = (i, j) if i < j else (j, i)
+            m = self.pairs[(a, b)]
+            idx_i, idx_j = (m[:, 0], m[:, 1]) if i < j else (m[:, 1], m[:, 0])
+            p2s = self.rec.images[j].points2D
+            for ii, jj in zip(idx_i, idx_j):
+                p2 = p2s[int(jj)]
+                if not p2.has_point3D():
+                    continue
+                pid = p2.point3D_id
+                if (int(ii), pid) in seen:
+                    continue
+                seen.add((int(ii), pid))
+                if pid not in inb:
+                    inb[pid] = any(e.image_id in block for e in self.rec.points3D[pid].track.elements)
+                if not inb[pid]:
+                    pts2d.append(kp_i[int(ii)])
+                    pts3d.append(self.rec.points3D[pid].xyz)
+        if len(pts3d) < 30:
+            return None
+        p2 = np.array(pts2d, dtype=np.float64)
+        p3 = np.array(pts3d, dtype=np.float64)
+        cam = self.rec.cameras[self.rec.images[i].camera_id]
+        out = {"p2": p2, "p3": p3, "cam": cam}
+        eo = pycolmap.AbsolutePoseEstimationOptions()
+        eo.ransac.max_error = self.gc.epipolar_px
+        ro = pycolmap.AbsolutePoseRefinementOptions()
+        ro.refine_focal_length = False
+        ro.refine_extra_params = False
+        with self.timer("pnp"):
+            res = pycolmap.estimate_and_refine_absolute_pose(p2, p3, cam, eo, ro)
+        if res:
+            out["P"] = res["cam_from_world"]
+        return out
+
+    def block_inliers(self, res: dict[int, dict[str, Any]], s: float, W: np.ndarray, cb: np.ndarray, d: np.ndarray) -> dict[int, int]:
+        """Per block camera: outside-point inliers when the block moves by X' = s W (X - cb) + cb + d (the outside points are
+        carried back into the block's frame and projected with the current pose)."""
+        out = {}
+        for i, r in res.items():
+            R0, t0 = self.pose_of(i)
+            Y = ((r["p3"] - cb - d) @ W) / s + cb
+            Xc = Y @ R0.T + t0
+            ok = Xc[:, 2] > 1e-9
+            uv = np.full((len(Y), 2), np.inf)
+            if ok.any():
+                uv[ok] = np.asarray(r["cam"].img_from_cam(Xc[ok], False))
+            out[i] = int((np.linalg.norm(uv - r["p2"], axis=1) < self.gc.epipolar_px).sum())
+        return out
+
+    def block_sim3(self, res: dict[int, dict[str, Any]]) -> dict[str, Any] | None:
+        """One rigid (similarity) motion for the whole block. Hypotheses from the cameras' own PnP poses (each alone at
+        scale 1; pairs give the scale), each scored by the outside-point inliers of all block cameras; the best one is
+        refined on the cameras whose PnP agrees with it."""
+        from scipy.spatial.transform import Rotation as Rot
+
+        cand = {}
+        for i, r in res.items():
+            if "P" not in r:
+                continue
+            R0 = self.pose_of(i)[0]
+            Rn = r["P"].rotation.matrix()
+            cand[i] = (Rn.T @ R0, self.rec.images[i].projection_center(), r["P"].inverse().translation)
+        if len(cand) < 3:
+            return None
+        cb = np.mean([self.rec.images[i].projection_center() for i in res], axis=0)
+        hyps = [(1.0, W, Cn - (W @ (Co - cb) + cb)) for W, Co, Cn in cand.values()]
+        ns = list(cand)
+        rng = np.random.default_rng(0)
+        for _ in range(min(400, len(ns) * (len(ns) - 1) // 2)):
+            a, b = rng.choice(len(ns), 2, replace=False)
+            A, B = cand[ns[a]], cand[ns[b]]
+            do = np.linalg.norm(A[1] - B[1])
+            if do < 1e-9:
+                continue
+            sc = np.linalg.norm(A[2] - B[2]) / do
+            if 0.25 < sc < 4:
+                hyps.append((sc, A[0], A[2] - (sc * A[0] @ (A[1] - cb) + cb)))
+        score = lambda h: sum(self.block_inliers(res, *h[:2], cb, h[2]).values())  # noqa: E731
+        sc_all = [score(h) for h in hyps]
+        k = int(np.argmax(sc_all))
+        best, (s, W, d) = sc_all[k], hyps[k]
+        for _ in range(3):
+            ag = [i for i, (Wi, _, _) in cand.items() if self.rot_deg(Wi @ W.T) < self.gc.realign_agree_deg]
+            if len(ag) < 3:
+                break
+            W2 = Rot.from_matrix(np.array([cand[i][0] for i in ag])).mean().as_matrix()
+            Q = (np.array([cand[i][1] for i in ag]) - cb) @ W2.T
+            Cn = np.array([cand[i][2] for i in ag])
+            M = np.zeros((3 * len(ag), 4))
+            M[:, 0] = Q.ravel()
+            M[:, 1:] = np.tile(np.eye(3), (len(ag), 1))
+            sol = np.linalg.lstsq(M, (Cn - cb).ravel(), rcond=None)[0]
+            s2, d2 = float(sol[0]), sol[1:]
+            if not 0.25 < s2 < 4:
+                break
+            sc2 = score((s2, W2, d2))
+            if sc2 <= best:
+                break
+            best, s, W, d = sc2, s2, W2, d2
+        agree = sum(1 for Wi, _, _ in cand.values() if self.rot_deg(Wi @ W.T) < self.gc.realign_agree_deg)
+        return {"s": s, "W": W, "cb": cb, "d": d, "angle": self.rot_deg(W), "agree": agree, "placed": len(cand)}
+
+    def block_pose(self, i: int, h: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        """Camera i's pose after its block moves by h."""
+        R0, t0 = self.pose_of(i)
+        C0 = -R0.T @ t0
+        Rn = R0 @ h["W"].T
+        Cn = h["s"] * h["W"] @ (C0 - h["cb"]) + h["cb"] + h["d"]
+        return Rn, -Rn @ Cn
+
+    def realign_blocks(self, k: int) -> list[dict[str, Any]]:
+        """A block of cameras that agree with each other but whose verified matches to the rest of the model the poses
+        mostly do not explain: the tracks across never merged (the block sits rotated or shifted), or two lookalike
+        parts were folded onto each other (a block turned by up to 180 deg). Each block camera is re-placed by PnP on
+        points only outside cameras observe; one similarity for the whole block is chosen by the outside-point inliers
+        of all its cameras. The block moves when: the motion is at least realign_min_deg; almost no camera loses
+        inliers and enough gain (or their own PnP poses agree with it); and the VLM, shown each of the best-supported
+        cameras rendered from outside-block cameras at the current and the moved pose, picks the moved one. Its points
+        move with it; points shared with the rest are dropped and re-triangulated, then a global refinement."""
+        if not self.gc.realign:
+            return []
+        out = []
+        for _ in range(self.gc.realign_max_moves):
+            reg = self.reg()
+            if len(reg) < 2 * self.gc.realign_min_block:
+                break
+            with self.timer("realign"):
+                P = {}
+                for (i, j), m in self.pairs.items():
+                    if i in reg and j in reg:
+                        n = len(m)
+                        P[(i, j)] = (int(round(self.pair_consistency(i, j, raw=True) * n)), n)
+                blocks = sorted(self.seam_blocks(P, sorted(reg)), key=lambda b: -len(b["block"]))
+            moved = False
+            for b in blocks:
+                B = set(b["block"]) & self.reg()
+                if len(B) < self.gc.realign_min_block or len(B) > 0.5 * len(self.reg()):
+                    continue
+                row: dict[str, Any] = {"round": k, "kind": "realign", "block": [self.names[i] for i in sorted(B)], "cross": b["cross"],
+                                       "cross_matches": b["cross_matches"]}
+                with self.timer("realign"):
+                    res = {i: r for i in sorted(B) if (r := self.block_pnp(i, B)) is not None}
+                    h = self.block_sim3(res) if res else None
+                if h is None:
+                    row["action"] = "none: too few block cameras re-placed on outside points"
+                    out.append(row)
+                    continue
+                old = self.block_inliers(res, 1.0, np.eye(3), h["cb"], np.zeros(3))
+                new = self.block_inliers(res, h["s"], h["W"], h["cb"], h["d"])
+                nc = len(res)
+                imp = sum(1 for i in res if new[i] >= 1.5 * old[i] + 5) / nc
+                wor = sum(1 for i in res if new[i] < old[i] - 5) / nc
+                agree = h["agree"] / max(h["placed"], 1)
+                o, nw = sum(old.values()), sum(new.values())
+                ncorr = sum(len(r["p2"]) for r in res.values())
+                frac = nw / max(ncorr, 1)
+                row.update({"cams_with_points": nc, "angle_deg": round(h["angle"], 2), "scale": round(h["s"], 3),
+                            "shift_frac": round(float(np.linalg.norm(h["d"])) / max(self.scene_scale(), 1e-9), 3),
+                            "inliers_old": o, "inliers_new": nw, "outside_corr": ncorr, "explained_new": round(frac, 3), "improved": round(imp, 2), "worse": round(wor, 2), "agree": round(agree, 2)})
+                why = ("correction below realign_min_deg" if h["angle"] < self.gc.realign_min_deg else
+                       "the move does not fit the outside points" if nw < 2 * o + 30 else
+                       "the move costs some cameras their outside-point inliers" if wor > self.gc.realign_worse else
+                       "a turn this large explains too few of the block's outside matches (lookalike structure)"
+                       if h["angle"] >= self.gc.realign_flip_deg and frac < self.gc.realign_flip_frac else
+                       "too few cameras support the move" if imp < self.gc.realign_improved and agree < self.gc.realign_agree else None)
+                if why is None and self.gc.realign_vlm:
+                    if self.advisor is None or not self.advisor.enabled:
+                        why = "no VLM to confirm the move"
+                    else:
+                        votes = []
+                        self._rac_exclude = set(B)
+                        try:
+                            for i in sorted(res, key=lambda i: -new[i])[: self.gc.realign_vlm_cams]:
+                                v, jn = self.examine_ask_choose(i, self.pose_of(i), self.block_pose(i, h), f"ra{k}",
+                                                                labels=("current pose", "block moved"))
+                                votes.append({"image": self.names[i], "pick": v, "render_new": (jn or {}).get("verdict")})
+                        finally:
+                            self._rac_exclude = set()
+                            self.rac.invalidate()
+                        row["vlm"] = votes
+                        if not votes or not all(x["pick"] == "b" for x in votes):
+                            why = "the VLM does not pick the moved pose"
+                if why is not None:
+                    row["action"] = "none: " + why
+                    out.append(row)
+                    continue
+                for i in B:
+                    self.set_pose(i, np.c_[self.block_pose(i, h)])
+                drop = []
+                for pid, pt in self.rec.points3D.items():
+                    inb = [e.image_id in B for e in pt.track.elements]
+                    if all(inb):
+                        pt.xyz = h["s"] * h["W"] @ (pt.xyz - h["cb"]) + h["cb"] + h["d"]
+                    elif any(inb):
+                        drop.append(pid)
+                for pid in drop:
+                    self.rec.delete_point3D(pid)
+                self.attach_mapper()
+                for i in self.reg():
+                    with self.timer("triangulate"):
+                        self.mapper.triangulate_image(self.tri, i)
+                self.global_refine(final=True)
+                row["action"] = f"moved {len(B)} cameras by {h['angle']:.1f} deg; {len(drop)} shared points dropped, tracks re-triangulated"
+                row.update(self.model_stats())
+                self.say(f"realign: block of {len(B)} moved by {h['angle']:.1f} deg (inliers {o} -> {nw}, improved {imp:.2f}, worse {wor:.2f})")
+                out.append(row)
+                moved = True
+                break
+            if not moved:
+                break
+        return out
+
+    @staticmethod
+    def rot_deg(R: np.ndarray) -> float:
+        return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+
     def repair_fold(self, k: int) -> list[dict[str, Any]]:
         """A fold (two self-consistent blocks whose mutual strong pairs disagree with the poses, as on repeated or
         mirrored structure): deregister the smaller block and place its images again as hard images, with anchors
@@ -1926,6 +2214,8 @@ class Solver:
             if stall >= 6:
                 break
         self.rounds = k
+        for r in self.realign_blocks(k):
+            self.log.append(r)
         for r in self.repair_fold(k):
             self.log.append(r)
         self.global_refine(final=True)

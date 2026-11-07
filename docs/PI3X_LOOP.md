@@ -946,3 +946,52 @@ Test set: every leftover-group placement with known GT, 19 images.
 - **Decision (user asked for p16 on all sequences):** the rule is now `hard_vlm_needs_evidence`, off by default (p16 behaviour, cache v35, commit 871c817).
 - **Full runs launched 2026-11-06 17:17 on p16 code:** `p16_wriva_test` (28 WRIVA test sequences) then `p16_eth3d` (25 scenes), one process per GPU (4/5/6), balanced by image count.
   - `run.py --workers N` assigns scene k to GPU k mod N regardless of which GPU is free, which can put two Pi3X jobs on one GPU; hence one process per GPU.
+
+### Step 39 (2026-11-07): full runs on p16 code, and re-aligning folded blocks (cache v38)
+
+- **Full p16 results:**
+  - WRIVA test (28 sequences), against COLMAP `fixed_wriva_v12`: auc@10 67.2 vs 70.6, auc_all@10 60.0 vs 65.1, auc@3 42.2 vs 42.6.
+  - ETH3D (25 scenes): colmap_auc@1/3/5 64.8/84.9/89.6, against incremental_v13 65.7/85.6/90.2 and scripted 68.5/88.1/92.7.
+- **Main failure mode (GT): a two-zone fold.** A self-consistent block of cameras sits turned about 180° about the vertical relative to the rest. It forms early (MultiZone's second zone attached at rounds 4–9).
+  - Scenes: A01 s00/s01, MultiZone s00, TwoZones, ETH3D old_computer (26 of 54 cameras at 180°).
+  - TwoZones has almost no genuine cross matches; COLMAP splits it.
+- **Tool: `realign_blocks`**, run after growth.
+  1. **Seam detection:** spectral bisection of the explained-match graph (per pair, the share of verified matches the poses explain). A cut whose crossing matches are explained below 0.35 is a seam.
+  2. **Per-camera placement:** each block camera is placed by PnP on points that only outside cameras observe.
+  3. **One similarity for the whole block:** hypotheses come from single cameras and from pairs (for scale), scored by the pooled outside-point inliers of all block cameras, then refined on the cameras that agree.
+  4. **The move:** block-only points move with the block, mixed points are dropped, then re-triangulation and global BA.
+- **Acting rule:**
+  - The turn is at least 2°.
+  - Inliers at least 2× + 30.
+  - At most 20% of cameras lose inliers.
+  - At least 40% of cameras gain (or 75% of their own PnP poses agree).
+  - **A turn over 10° must explain at least 6% of the block's outside correspondences.**
+    - A real fold, once corrected, explains a large share of the matches to the rest of the model. A lookalike (doppelganger) flip explains only the repeated structure.
+    - GT on p16 and p18 models: correct flips 0.08–0.16; wrong ones (ETH3D facade at 180°, courtyard at 90°, two PTZ blocks) 0.016–0.029.
+- **The VLM check was tried and is off (`realign_vlm`).**
+  - **p18:** pairwise renders from outside-block cameras at the current vs the moved pose.
+  - **Correct move refused.** On MultiZone the correct 179° move of 115 cameras was refused: the moved-pose render was empty even with GT-correct pose and sources. The block shares only far background (60–90 m away) with outside cameras, and their Pi3X depth drops it.
+  - **Wrong move approved.** The VLM then approved a wrong 22.6° move of 19 cameras (GT 67.7° off afterwards; auc@10 41.2 → 34.9).
+  - **Renders don't settle lookalikes.** Offline, on facade the wrong 180° pose renders "consistent"; on old_computer both poses do.
+- **Offline (p16 models, the v38 rule, BA after each move, against a control with BA only):**
+  - Over all 59 models (28 WRIVA test, 6 dev, 25 ETH3D), the rule acts on 6:
+
+    | Model | Control | Realigned | Score |
+    |---|---|---|---|
+    | MultiZone s00 | 41.1 | 82.0 | auc@10 |
+    | old_computer | 35.2 | 48.0 | colmap_auc@3 |
+    | TrailerPark s00 | 62.9 | 73.3 | auc@10 |
+    | A01 s00 | 27.8 | 28.2 | auc@10 |
+    | TwoZones | 37.2 | 37.4 | auc@10 |
+    | A01 s01 | 19.7 | 19.7 | auc@10 |
+
+  - It refuses facade (0.023), courtyard (0.029) and PTZ s01's 145° block (0.016).
+- **Live (p19, 12 scenes):**
+  - old_computer: one 13-camera block moved 180°. Cameras > 90° off went from 26 to 13; colmap_auc@3 41.0 → 52.5.
+  - MultiZone: the fold did not form this run (78.0).
+  - TrailerPark s00 grew a new 18-camera fold that the rule could not fit (58.0).
+  - No other moves; dev unchanged within run noise.
+  - Fold formation varies between runs, so the offline test on fixed models is the cleaner measure.
+- **Open:**
+  - A01: PnP agrees with the fold, and focal is off by up to 29% in the folded half.
+  - Unmerged sub-models (TrailerPark, SmartCampus).
