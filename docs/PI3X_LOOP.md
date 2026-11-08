@@ -1025,3 +1025,60 @@ Test set: every leftover-group placement with known GT, 19 images.
   - Small folded PTZ blocks (TrailerPark s00/s01: 18 and 38 cameras > 90° off) need evidence beyond pooled outside inliers.
   - old_computer's second half (worse 0.23).
   - A01 fold and focal error; unmerged sub-models (TrailerPark, SmartCampus).
+
+### Step 41 (2026-11-08): VLM tools for folds; landmark anchoring (cache v39, v40)
+
+- **Question:** COLMAP rarely forms the folds we lose on. Can a better VLM tool tell a true fold from a lookalike flip, given only the photos?
+- **Offline case set (GT used offline only):**
+  - 61 proposed block moves were harvested from the p16–p20 final models (`fold_cases.py`, scratchpad).
+  - Each move is labelled by its GT error, with the GT similarity fitted on the cameras outside the block: move / stay / unclear.
+  - 29 cases turn ≥ 10°: 9 true folds, 20 wrong moves.
+  - The geometric statistics (explained share, inliers, improved, agree) overlap completely between the two classes.
+- **Tools tried on the 29 large-turn cases:**
+
+  | Tool | What the VLM sees and answers | Folds found | Wrong moves approved |
+  |---|---|---|---|
+  | 1 | block photo with the outside photos of each pose, A/B "same place", both orders | 5/9 | 4/20 |
+  | 1b | absolute "same place" per supporter group | answers "same" almost always | |
+  | 2 | match lines of one pair: same object or lookalike | 4/9 | 9/20 |
+  | 1c | contrastive A/B, differences listed before the answer (medium effort) | 3/9 | 2/20 |
+  | 1c, xhigh | same | all "unsure" (token cap) | |
+  | **3, anchoring** | six distinctive details of the photo alone, then a count of the details found in each pose's photos (separate calls) | **3/9 (pro/con rule), 5/9 (sum ≥ 2)** | **0/20** |
+
+  - Tool 1c's two orders agree on only 49 of 110 cameras: A/B judgements are position-biased.
+  - Anchoring avoids A/B entirely. When it commits on a camera it is right 44 times and wrong 9.
+- **Ceiling check (me, blinded sheets):**
+  - Distinctive scenes (MultiZone 64°, courtyard, old_computer, facade): 12/12 cameras right.
+  - TrailerPark trailers: 2/6, chance.
+  - The PTZ trailer folds are not decidable from these photo groups, even for a stronger model. Distinctive structure is.
+- **Rule (v39):**
+  - A turn ≥ `realign_flip_deg` must pass anchoring instead of the 6% explained-share guard.
+  - For up to 4 block cameras the score is Σ(details found at moved − at current). Supporters are outside photos whose verified matches the pose explains, with other suspect blocks excluded. The move needs score ≥ 2.
+  - Offline, geometric gates plus anchoring: 5/9 folds found, 0/20 wrong (v38: 5/9, 2/20).
+  - The two v38 errors are MultiZone's 64° block in p19 and p20. Anchoring vetoes them at −16 and −13.
+- **Stability (same 29 cases, geometric gates plus anchoring):**
+
+  | Run | Folds found | Wrong moves approved |
+  |---|---|---|
+  | medium effort | 5/9 | 0/20 |
+  | xhigh effort | 4/9 | 1/20 |
+  | temperature 0.7 | 3/9 | 0/20 |
+
+  - The xhigh false move is the symmetric facade (+3; −3 to +1 elsewhere).
+  - True MultiZone folds score only 1–4, so the margin is thin.
+  - TrailerPark true folds score −4 to 0: confidently wrong, consistent with the ceiling check.
+- **p21 live (v39), 9 scenes:**
+  - old_computer: the anchor path moved the 13-camera 179.8° block (score 4; details such as the wall clock, glass doors and exit sign); colmap@3 52.5.
+  - MultiZone s00 auc@10 34.8 (p20 78.0): growth formed a 179° fold this run.
+    - Its 139-camera block was refused by the geometric support gate (improved 0.39 < 0.4) before anchoring ran.
+    - GT (offline harvest): a true fold, median 179.7° → 0.7° if moved. Anchoring scores it +5 / +3 / +4 over three runs.
+    - A 13.6° block beside it was anchor-vetoed live (−15). GT: wrong either way (89° → 76°).
+  - Dev scenes flat against p16–p19; BLH auc@10 70.9.
+- **v40:**
+  - With anchoring as the veto, anchored turns need improved ≥ 0.3 (`realign_anchor_improved`) instead of 0.4.
+  - Offline, the only cases newly admitted are two TrailerPark 143° lookalikes. Both are vetoed in all three anchoring runs (−4 to −1).
+  - p22 = full WRIVA test, ETH3D and dev runs on v40.
+- **Open:**
+  - TrailerPark small PTZ folds: lookalike trailers; the tool ceiling is at chance with these photo groups.
+  - A01: geometry never proposes the ~178° flip, because the outside matches support the fold.
+  - The anchoring margin is thin (true folds score +1 to +7).
