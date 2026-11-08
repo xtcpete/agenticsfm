@@ -203,6 +203,7 @@ class GrowConfig:
     realign_anchor_cams: int = 4   # for this many block cameras the VLM lists details of the photo alone, then checks them in the
     realign_anchor_min: int = 2    # outside photos each pose explains; the moved pose must find this many more details in total
     realign_anchor_effort: str = "medium"
+    realign_anchor_improved: float = 0.3  # with anchoring as the veto, a large turn needs only this share of gaining cameras
     epipolar_px: float = 4.0
     max_tries: int = 2           # PnP attempts per image in our loop (COLMAP's own cap is 3)
     global_ba_growth: float = 1.1
@@ -2097,7 +2098,8 @@ class Solver:
                        "the move costs some cameras their outside-point inliers" if wor > self.gc.realign_worse else
                        "a turn this large explains too few of the block's outside matches (lookalike structure)"
                        if h["angle"] >= self.gc.realign_flip_deg and frac < self.gc.realign_flip_frac and not self.gc.realign_anchor else
-                       "too few cameras support the move" if imp < self.gc.realign_improved and agree < self.gc.realign_agree else None)
+                       "too few cameras support the move" if imp < (self.gc.realign_anchor_improved if self.gc.realign_anchor and h["angle"] >= self.gc.realign_flip_deg
+                                                                     else self.gc.realign_improved) and agree < self.gc.realign_agree else None)
                 if why is None and self.gc.realign_anchor and h["angle"] >= self.gc.realign_flip_deg:
                     if self.advisor is None or not self.advisor.enabled:
                         why = "no VLM to confirm the turn"
