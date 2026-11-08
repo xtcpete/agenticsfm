@@ -61,8 +61,9 @@ class Advisor:
         return self.mode != "off"
 
     def ask(self, kind: str, parts: list[tuple[str, list[str]]], question: str, context: dict[str, Any] | None = None,
-            max_side: int | None = None) -> dict[str, Any]:
-        """parts: [(label, [image names]), ...]; the question ends with the JSON schema expected."""
+            max_side: int | None = None, effort: str | None = None) -> dict[str, Any]:
+        """parts: [(label, [image names]), ...]; the question ends with the JSON schema expected. effort overrides the
+        reasoning effort for this question (low | medium | xhigh)."""
         content: list[dict[str, Any]] = []
         shown = []
         for label, names in parts:
@@ -73,6 +74,10 @@ class Advisor:
                 shown.append(n)
         content.append({"type": "text", "text": question})
         req = dict(self.request)
+        if effort:
+            extra = dict(req.get("extra_body", {}))
+            extra["chat_template_kwargs"] = dict(extra.get("chat_template_kwargs", {}), reasoning_effort=effort)
+            req["extra_body"] = extra
         if self.seed:
             key = json.dumps([kind, question, [(label, [Path(n).name for n in names]) for label, names in parts]])
             req["seed"] = int(hashlib.sha1(key.encode()).hexdigest()[:8], 16)
@@ -114,6 +119,30 @@ class Advisor:
                  'Answer {"answer": "same" | "different" | "unsure", "confidence": 0-1, "reason": "<one sentence>"}')
         a = self.ask("same_place", parts, q, context)
         return str(a.get("answer", "unsure")).strip().lower() if isinstance(a, dict) else "unsure"
+
+    ANCHOR_DETAILS = ("This photo was taken at a site with many similar-looking structures (repeated or mirror-image buildings, entrances, "
+                      "houses, trailers). List six details visible in this photo that would identify this exact spot and that a lookalike copy "
+                      "elsewhere on the site would probably NOT share: specific objects, signs, posters, window blinds, damage, vehicles, a "
+                      "particular tree, what stands next to or behind the main structure, distant landmarks on the skyline. Prefer details that "
+                      'are easy to recognise from another viewpoint. Answer with JSON only: {"details": ["...", "..."]}')
+
+    def anchor_details(self, image: str, context: dict[str, Any] | None = None, effort: str = "medium") -> list[str]:
+        """Distinctive details of one photo, the ones a lookalike copy of its structure would not share (stage 1 of
+        landmark anchoring: the photo is shown alone, so nothing else steers what is listed)."""
+        a = self.ask("anchor_details", [("Photo:", [image])], self.ANCHOR_DETAILS, context, max_side=1024, effort=effort)
+        return [str(x) for x in (a.get("details") or [])][:6] if isinstance(a, dict) and isinstance(a.get("details"), list) else []
+
+    def anchor_check(self, details: list[str], images: list[str], context: dict[str, Any] | None = None, effort: str = "medium") -> int | None:
+        """How many of the listed details are clearly visible in these photos (stage 2; each group is asked on its own, so
+        there is no A/B position to favour). None when the answer cannot be read."""
+        lst = "\n".join(f"{k + 1}. {d}" for k, d in enumerate(details))
+        q = ("These photos were taken somewhere on a site with many similar-looking structures. For each detail below, say whether it is "
+             "clearly visible in at least one of these photos (the same specific thing, not merely something similar in kind). Be strict: "
+             "a generic match (any brick wall, any white trailer) does not count.\n" + lst +
+             '\nAnswer with JSON only: {"found": [true | false, ...]} with one entry per detail, in order.')
+        a = self.ask("anchor_check", [("Photos:", images)], q, context, max_side=1024, effort=effort)
+        fl = a.get("found") if isinstance(a, dict) else None
+        return sum(1 for x in fl if x is True) if isinstance(fl, list) else None
 
     FIGURE = ("Each figure has three panels. Left: the photo. Middle: what the 3D model shows from this camera's estimated position "
               "(pixels of neighbouring photos projected through the model's geometry; dark grey where the model knows nothing). Right: the "

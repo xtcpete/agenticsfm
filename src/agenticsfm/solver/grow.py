@@ -199,6 +199,10 @@ class GrowConfig:
     realign_vlm: bool = False    # a move also needs the VLM (pairwise, renders from outside-block cameras only) to pick the moved pose
     realign_vlm_cams: int = 2    # ... for each of the block's best-supported cameras
     realign_max_moves: int = 3
+    realign_anchor: bool = True    # a turn above realign_flip_deg is confirmed by landmark anchoring instead of realign_flip_frac:
+    realign_anchor_cams: int = 4   # for this many block cameras the VLM lists details of the photo alone, then checks them in the
+    realign_anchor_min: int = 2    # outside photos each pose explains; the moved pose must find this many more details in total
+    realign_anchor_effort: str = "medium"
     epipolar_px: float = 4.0
     max_tries: int = 2           # PnP attempts per image in our loop (COLMAP's own cap is 3)
     global_ba_growth: float = 1.1
@@ -2092,8 +2096,18 @@ class Solver:
                        "the move does not fit the outside points" if nw < 2 * o + 30 else
                        "the move costs some cameras their outside-point inliers" if wor > self.gc.realign_worse else
                        "a turn this large explains too few of the block's outside matches (lookalike structure)"
-                       if h["angle"] >= self.gc.realign_flip_deg and frac < self.gc.realign_flip_frac else
+                       if h["angle"] >= self.gc.realign_flip_deg and frac < self.gc.realign_flip_frac and not self.gc.realign_anchor else
                        "too few cameras support the move" if imp < self.gc.realign_improved and agree < self.gc.realign_agree else None)
+                if why is None and self.gc.realign_anchor and h["angle"] >= self.gc.realign_flip_deg:
+                    if self.advisor is None or not self.advisor.enabled:
+                        why = "no VLM to confirm the turn"
+                    else:
+                        others = {i for bb in blocks for i in bb["block"]} - B
+                        with self.timer("realign_anchor"):
+                            score, arows = self.anchor_block(B, others, h, f"ra{k}")
+                        row["anchor"] = {"score": score, "cams": arows, "suspects": len(others)}
+                        if score < self.gc.realign_anchor_min:
+                            why = "the VLM does not find the photos' own details at the moved pose (lookalike structure)"
                 if why is None and self.gc.realign_vlm:
                     if self.advisor is None or not self.advisor.enabled:
                         why = "no VLM to confirm the move"
@@ -2140,6 +2154,73 @@ class Solver:
             if not moved:
                 break
         return out
+
+    def explained_count(self, i: int, j: int, Pi: tuple[np.ndarray, np.ndarray], Pj: tuple[np.ndarray, np.ndarray]) -> int:
+        """Verified matches of the pair (i, j) whose Sampson error under poses Pi, Pj is below epipolar_px."""
+        a, b = (i, j) if i < j else (j, i)
+        m = self.pairs.get((a, b))
+        if m is None or not len(m):
+            return 0
+        mi, mj = (m[:, 0], m[:, 1]) if i < j else (m[:, 1], m[:, 0])
+        ci, cj = self.rec.cameras[self.rec.images[i].camera_id], self.rec.cameras[self.rec.images[j].camera_id]
+        xa = np.asarray(ci.cam_from_img(self.kp(i)[mi].astype(np.float64)))
+        xb = np.asarray(cj.cam_from_img(self.kp(j)[mj].astype(np.float64)))
+        R = Pj[0] @ Pi[0].T
+        t = Pj[1] - R @ Pi[1]
+        ha, hb = np.c_[xa, np.ones(len(xa))], np.c_[xb, np.ones(len(xb))]
+        f = 0.5 * (ci.mean_focal_length() + cj.mean_focal_length())
+        tn = np.linalg.norm(t)
+        if tn < 1e-9:
+            p = ha @ R.T
+            return int((np.linalg.norm(p[:, :2] / p[:, 2:3] - xb, axis=1) * f < self.gc.epipolar_px).sum())
+        tx = np.array([[0, -t[2], t[1]], [t[2], 0, -t[0]], [-t[1], t[0], 0]]) / tn
+        E = tx @ R
+        Fa, Fb = ha @ E.T, hb @ E
+        num = np.einsum("ij,ij->i", hb, Fa) ** 2
+        den = Fa[:, 0] ** 2 + Fa[:, 1] ** 2 + Fb[:, 0] ** 2 + Fb[:, 1] ** 2
+        return int((np.sqrt(num / np.maximum(den, 1e-18)) * f < self.gc.epipolar_px).sum())
+
+    def anchor_block(self, B: set[int], others: set[int], h: dict[str, Any], tag: str) -> tuple[int, list[dict[str, Any]]]:
+        """Landmark anchoring of a proposed block turn. For the block cameras with the most matches to the rest, the photos
+        outside the block (and outside every other suspect block) whose verified matches each pose explains are its
+        supporters at that pose (nearby cameras when a pose has none). The VLM lists distinctive details of the block photo
+        alone, then counts how many it finds among each pose's supporters; score = sum of (moved - current)."""
+        reg = self.reg()
+        excl = B | others
+        cands = []
+        for i in B:
+            js = [(j, n) for j, n in self.W.get(i, {}).items() if j in reg and j not in excl and n >= 30]
+            if js:
+                cands.append((sum(n for _, n in js), i, js))
+        cands.sort(key=lambda x: -x[0])
+        groups = []
+        for _, i, js in cands[: 3 * self.gc.realign_anchor_cams]:
+            P0, P1 = self.pose_of(i), self.block_pose(i, h)
+            rows = [(j, self.explained_count(i, j, P0, self.pose_of(j)), self.explained_count(i, j, P1, self.pose_of(j))) for j, _ in js]
+            cur = [j for j, o, m in sorted(rows, key=lambda r: -r[1]) if o >= 15 and o > 2 * m][:3]
+            mov = [j for j, o, m in sorted(rows, key=lambda r: -r[2]) if m >= 15 and m > 2 * o][:3]
+            both = bool(cur and mov)
+            if not cur:
+                cur = [j for j in self.pose_neighbours(*P0, 6, excl | set(mov)) if j not in mov][:3]
+            if not mov:
+                mov = [j for j in self.pose_neighbours(*P1, 6, excl | set(cur)) if j not in cur][:3]
+            if cur and mov:
+                groups.append((not both, i, cur, mov))
+        groups.sort(key=lambda g: g[0])
+        score, out = 0, []
+        for _, i, cur, mov in groups[: self.gc.realign_anchor_cams]:
+            ctx = {"image": self.names[i], "examine": tag}
+            det = self.advisor.anchor_details(self.names[i], ctx, self.gc.realign_anchor_effort)
+            if not det:
+                continue
+            fc = self.advisor.anchor_check(det, [self.names[j] for j in cur], dict(ctx, pose="current"), self.gc.realign_anchor_effort)
+            fm = self.advisor.anchor_check(det, [self.names[j] for j in mov], dict(ctx, pose="moved"), self.gc.realign_anchor_effort)
+            if fc is None or fm is None:
+                continue
+            score += fm - fc
+            out.append({"image": self.names[i], "current": [self.names[j] for j in cur], "moved": [self.names[j] for j in mov],
+                        "found_current": fc, "found_moved": fm, "details": det})
+        return score, out
 
     @staticmethod
     def rot_deg(R: np.ndarray) -> float:
