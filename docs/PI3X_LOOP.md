@@ -1082,3 +1082,41 @@ Test set: every leftover-group placement with known GT, 19 images.
   - TrailerPark small PTZ folds: lookalike trailers; the tool ceiling is at chance with these photo groups.
   - A01: geometry never proposes the ~178° flip, because the outside matches support the fold.
   - The anchoring margin is thin (true folds score +1 to +7).
+
+### Step 42 (2026-11-08): full runs on v40 (p22)
+
+- **Whole sets:**
+
+  | Set | Score | p22 (v40) | p20 (v38) | p16 | Reference |
+  |---|---|---|---|---|---|
+  | WRIVA test (28) | auc@10 | 67.9 | 67.9 | 67.2 | COLMAP 70.6 |
+  | WRIVA test (28) | auc_all@10 | 60.6 | 59.7 | 60.0 | COLMAP 65.1 |
+  | WRIVA test (28) | auc@3 | 42.4 | 42.9 | 42.2 | COLMAP 42.6 |
+  | ETH3D (25) | colmap_auc@1 / @3 / @5 | 64.5 / 85.1 / 89.9 | 64.3 / 85.0 / 89.9 | 64.8 / 84.9 / 89.6 | scripted 68.5 / 88.1 / 92.7 |
+  | vlm_dev (6) | auc@10 | 62.4 | p19 62.0 | 62.1 | COLMAP 62.0 |
+
+  - Against COLMAP, auc@10: p22 wins 8 scenes, loses 11, ties 9 (±1).
+  - Without the three A01 fold scenes (VaryingAltitudes s00/s01, TwoZones), p22 leads 72.6 vs 70.6.
+- **Every live anchoring decision agrees with GT** (5 calls, GT from an offline harvest of the final models):
+
+  | Scene | Block | Turn | Score | Decision | GT |
+  |---|---|---|---|---|---|
+  | MultiZone s00 | 99 cams | 179.6° | +13 | moved (passed the v40 support gate at improved 0.37) | true fold; auc@10 78.9 (p21 with the fold unrepaired: 34.8) |
+  | old_computer | 13 cams | 179.6° | +9 | moved | true fold |
+  | old_computer, second half | 13 cams | 180° | −3 | vetoed (now passes worse at 0.15) | correct: the block is right (GT 0.1°) |
+  | courtyard | 8 cams | 90° | −8 | vetoed | correct (0.2° → 90.5° if moved) |
+  | TrailerPark s02 | 47 cams | 133.8° | −3 | vetoed (admitted by the v40 gate at improved 0.30) | correct: part of a right block (1.2° → 142° if moved) |
+
+- **Scene swings are still growth variance.**
+  - Down: TrailerPark s02 78.0 → 62.4, MultiZone s01 76.9 → 72.4, SmartCampus s03.
+  - Up: CameraModels A01_new s00 65.0 → 84.2, A06 71.4 → 78.4, TrailerPark s00/s01 +5/+6.
+  - TrailerPark s02 grew an 18-camera PTZ fold (GT 145° → 5° if moved). Geometry refused it (improved 0.17, agree 0.42), so anchoring never ran.
+- **Could anchoring alone judge weakly supported turns? Not yet.**
+  - Offline, the TrailerPark s02 fold scores +4 / +4 / +5 over three runs. This is the first TrailerPark fold anchoring gets right.
+  - The partial TrailerPark s01 fold (144° → 34°) scores −5 / −1 / −5.
+  - Dropping the support gate would also admit the MultiZone 22.3° wrong move (improved 0.29), which scores +3 / +1 / +4.
+  - No threshold separates the two, so the support gate stays at 0.3.
+- **Open:**
+  - The A01 fold and focal error account for the whole gap to COLMAP; geometry never proposes the flip.
+  - Unmerged sub-models (auc_all@10 on PTZ scenes).
+  - Small PTZ folds below the support gate.
