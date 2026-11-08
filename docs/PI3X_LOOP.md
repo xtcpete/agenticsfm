@@ -995,3 +995,33 @@ Test set: every leftover-group placement with known GT, 19 images.
 - **Open:**
   - A01: PnP agrees with the fold, and focal is off by up to 29% in the folded half.
   - Unmerged sub-models (TrailerPark, SmartCampus).
+
+### Step 40 (2026-11-07): full runs on v38 (p20)
+
+- **Whole sets (p20 = v38 with realign on, against p16 on the same sets):**
+
+  | Set | Score | p20 | p16 | Reference |
+  |---|---|---|---|---|
+  | WRIVA test (28) | auc@10 | 67.9 | 67.2 | COLMAP 70.6 |
+  | WRIVA test (28) | auc_all@10 | 59.7 | 60.0 | COLMAP 65.1 |
+  | WRIVA test (28) | auc@3 | 42.9 | 42.2 | COLMAP 42.6 |
+  | ETH3D (25) | colmap_auc@1 | 64.3 | 64.8 | incremental_v13 65.7, scripted 68.5 |
+  | ETH3D (25) | colmap_auc@3 | 85.0 | 84.9 | incremental_v13 85.6, scripted 88.1 |
+  | ETH3D (25) | colmap_auc@5 | 89.9 | 89.6 | incremental_v13 90.2, scripted 92.7 |
+
+- **Realign moved blocks in two scenes live:**
+  - old_computer: a 13-camera block turned 179.8° (explained share 0.159); colmap_auc@3 41.0 → 52.5. The second 13-camera half was refused again (worse 0.23 > 0.2), as in p19.
+  - TwoZones: 94 cameras by 3.8°; flat (37.8 vs 37.9).
+- **The rest of the scene-level change is run-to-run growth variance, not realign.** With no move, realign does not touch the model (`_rac_exclude` stays empty, no BA).
+  - MultiZone s00 41.2 → 78.0: the fold did not form this run (as in p19).
+  - Drops in scenes with no realign row (CameraModels A01_new s00 85.0 → 65.0, A06 78.1 → 71.4, botanical_garden 89.7 → 83.3, lecture_room, meadow) are variance.
+  - Without MultiZone s00, WRIVA auc@10 is 67.5 vs 68.2.
+- **GT check on the refused large turns (offline only):**
+  - TrailerPark s00, 15 cameras, proposed 151.3°: a real fold (GT error in the final model: median 146.6°, 15/15 > 90°). Refused: outside inliers 25 → 44, short of 2·old + 30.
+  - TrailerPark s01, 19 cameras, proposed 146.2°: a real fold (median 142.9°, 19/19 > 90°). Refused: 17 → 37. Explained share 0.041.
+  - TrailerPark s03, 39 cameras, proposed 177.8°: the block was right (median 1.2°). Correctly refused by the explained-share guard (0.041).
+  - The explained share does not separate these PTZ cases: a true fold and a wrong flip both score 0.041. Small PTZ blocks have too few outside correspondences for the pooled-inlier evidence to decide.
+- **Open:**
+  - Small folded PTZ blocks (TrailerPark s00/s01: 18 and 38 cameras > 90° off) need evidence beyond pooled outside inliers.
+  - old_computer's second half (worse 0.23).
+  - A01 fold and focal error; unmerged sub-models (TrailerPark, SmartCampus).
