@@ -189,6 +189,36 @@ focal and k1 recovered, 0.3 s.
     Tool check (`optimize_gpu`, v2) on p22 grown models: terrace 89.7 vs 66.7 (8 s vs 16 s), M07 43.0 vs 43.2 (14 s vs
     50 s), PTZ s02 18.2 vs 17.3 (28 s vs 58 s), tool time including the backend start.
 
+19. **In the pipeline** (commit 80e3fa5; full runs of the incremental controller, `--vlm decide --select vlm`, as p22):
+    - Growth (`grow_model ba=gpu`): the global refinement keeps COLMAP's structure (complete and merge tracks,
+      retriangulate; then adjust, normalise, complete and merge tracks, filter points until < 0.05% of observations
+      change) with the adjustment on the GPU: the model's tracks only, one intrinsics group per camera (focal + k1,
+      principal point fixed, as COLMAP's global BA), Cauchy 1 match px, 20 iterations. Images without 3D points
+      (held, unverified) stay fixed. Persistent worker (`backends/rayba.py serve`), so CUDA starts once per run.
+      Local BA and the 12-image seed refinement stay COLMAP.
+    - End: `optimize_gpu` replaces `optimize`, with the same keep rule (examine quality may not drop by > 0.01).
+    - Bug found on the way: `optimize_gpu` v2 wrote one camera per merged group with the first image's size and
+      centre; undistorted ETH3D crops of a few pixels' difference got the wrong centre (poses were right, so the
+      offline scores stand, but points were filtered against wrong cameras and examine's pair consistency dropped,
+      and the keep rule rejected the refinement on courtyard, electro, playground). v3: one camera per group and size.
+
+    | dev, all scenes (one run each) | ETH3D @1/3/5 | WRIVA auc@3/10, auc_all@3/10 |
+    |---|---|---|
+    | p22: COLMAP BA in growth + `optimize` | 63.7 / 84.9 / 90.1 | 24.7 / 62.4 / 22.5 / 58.4 |
+    | p22 grown + `optimize_gpu` offline (step 17) | 79.2 / 91.4 / 94.2 | 25.4 / 62.8 / 23.2 / 58.8 |
+    | **GPU BA in growth + `optimize_gpu`** | **78.6 / 91.4 / 94.3** | **26.1 / 64.5 / 23.5 / 60.1** |
+    | grown models only (no final BA): p22 / ours | 53.3 / 79.3 / 86.3 vs 60.3 / 83.4 / 89.1 | 20.9 / 60.2 / - / 56.3 vs 22.7 / 62.9 / - / 58.6 (auc@3/10, auc_all@10) |
+
+    - Per scene vs p22: ETH3D 13/13 ahead (+5 to +25 @1); WRIVA 5/6 ahead, M07 -0.9 auc@3 / -0.3 auc@10.
+    - Time (WRIVA dev): global BA in growth 1764 s -> 202 s; final BA 349 s -> 101 s; whole runs 7203 s -> 4974 s
+      (-31 %). ETH3D dev: global BA 464 s -> 83 s, runs 3165 s -> 2271 s. On PTZ s01, 40 s of in-growth global BA =
+      5 s build + 13 s solve + 6 s write-back + ~16 s of COLMAP track upkeep.
+    - The keep rule still rejects the final BA on A08 VaryingAltitudes (strong-inconsistent pairs 11.9% -> 12.8%;
+      GT: +1.4 auc@10 had it been kept). One scene: the rule is left as it is.
+    - Grown models are better with the GPU BA in growth (ETH3D +7 @1), but the final BA brings both to the same
+      level on ETH3D; on WRIVA the full runs end above the offline number (growth variance is large on WRIVA: BLH
+      +8.7 auc@10).
+
 ## Status (2026-11-23 morning)
 - `rayba.solve` defaults = step 17; `optimize_gpu` tool = it, on dev and held-out test more accurate than COLMAP's
   `optimize` at 4-7x less time (14-29x at 6.5k images). Not wired into a controller; nothing committed.
