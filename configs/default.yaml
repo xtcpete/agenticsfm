@@ -82,7 +82,7 @@ envs:
   gluemap: /home/gochen/miniconda3/envs/gluemap/bin/python         # GLUEMAP (torch 2.4), M3
   vggt: /home/gochen/miniconda3/envs/agentic-dg/bin/python         # VGGT via FastVGGT (torch 2.7); the vggt env has no vggt package
   pi3x: /home/gochen/miniconda3/envs/gluemap/bin/python            # Pi3X (pi3 package from GLUEMAP's checkout, weights yyfz233/Pi3X in the HF cache)
-  rayba: /home/gochen/miniconda3/envs/rayba/bin/python             # GPU bundle adjustment (solver/rayba.py; torch 2.10 cu126)
+  rayba: /home/gochen/miniconda3/envs/rayba/bin/python             # GPU bundle adjustment worker (third_party/rayba; torch 2.10 cu126)
 
 # External code the backends import.
 repos:

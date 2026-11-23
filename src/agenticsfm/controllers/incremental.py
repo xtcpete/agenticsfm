@@ -1,7 +1,7 @@
 """Incremental controller: the open solver end to end, no COLMAP mapper.
 
 graph -> match -> [covisibility filter] -> grow_model -> examine -> optimize_gpu (kept if the quality does
-not drop) -> submit. Bundle adjustment is the GPU one (solver/rayba.py) both during growth and at the end;
+not drop) -> submit. Bundle adjustment is the GPU one (third_party/rayba) both during growth and at the end;
 ``grow_ba`` / ``final_ba`` = "colmap" restore Ceres (growth) and ``optimize`` (end). The same tools and
 refinement policy as the scripted controller, with ``grow_model`` in place of ``reconstruct``.
 """

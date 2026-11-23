@@ -1,5 +1,5 @@
 """Export a ray-anchored BA problem from a finished run's grown model (agenticsfm env, pycolmap). Offline test of the
-GPU bundle adjustment (src/agenticsfm/solver/rayba.py) against COLMAP's `optimize`.
+GPU bundle adjustment (third_party/rayba) against COLMAP's `optimize`.
 
 Per scene (largest sub-model of the grow_model artifact):
   images     registered images: pose, SIMPLE_RADIAL intrinsics, size, intrinsics group (optimize's "cluster" grouping)

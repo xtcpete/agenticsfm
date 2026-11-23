@@ -365,6 +365,10 @@ model weights, and the reference repositories (GLUEMAP, COLMAP's benchmark, Flex
 absolute path is in `configs/default.yaml` (dataset roots, reference evaluators, baseline
 reconstructions, backend environments) and has to be edited for another machine.
 
+The GPU bundle adjustment is a separate repository, [rayba](https://github.com/xtcpete/rayba), checked out as a git
+submodule at `third_party/rayba`: clone with `git clone --recursive`, or run `git submodule update --init` after a plain
+clone. Nothing to install: `agenticsfm` puts the submodule on `sys.path`, and backends get it on `PYTHONPATH`.
+
 Conda environments (each backend is a CLI run under its own interpreter, see
 [backends/](src/agenticsfm/backends)):
 
@@ -374,6 +378,7 @@ Conda environments (each backend is a CLI run under its own interpreter, see
 | `pointglue` | retrieval (NetVLAD) and matching (ALIKED / SuperPoint + FlexGlue, DaD + LoMa) |
 | `xdg` | XDG pair scoring |
 | `agentic-dg` | VGGT-1B for `verify_poses` and `reconstruct(backend=vggt)`; VGGT-Omega |
+| `rayba` | the GPU bundle adjustment worker (`python -m rayba.worker`): torch 2.10 (cu126), numpy |
 | `vllm-q38` | the VLM server: `scripts/serve_vlm.sh`, Qwen3.8-27B on GPUs 0 to 3 ([docs/VLM_SERVICE.md](docs/VLM_SERVICE.md)) |
 
 GT is read by `scripts/evaluate.py` only. GT audits of the tools (benchmark layer):

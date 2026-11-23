@@ -3,7 +3,8 @@
 Goal (user, 2026-11-23): at least match COLMAP's bundle adjustment in accuracy, faster, so the final `optimize` and
 later the in-growth global BA can drop COLMAP; feedforward depth as an optional prior (MP-SfM, DMap).
 
-Code: `src/agenticsfm/solver/rayba.py` (torch). Offline test scripts in `scripts/analysis/`:
+Code: the `rayba` package, a git submodule at `third_party/rayba` (github.com/xtcpete/rayba; until step 19 it lived in
+`src/agenticsfm/solver/rayba.py`, `rayba_build.py` and `backends/rayba.py`). Offline test scripts in `scripts/analysis/`:
 `rayba_prep.py` (agenticsfm env: export a problem from a run's grown model), `rayba_run.py` (any torch env: run
 variants), `rayba_eval.py` (agenticsfm env: GT scoring next to the grown model and COLMAP `optimize`),
 `colmap_ba_ref.py` (COLMAP's BA with a chosen camera model / backend, same output format).

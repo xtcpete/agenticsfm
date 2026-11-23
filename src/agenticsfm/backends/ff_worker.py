@@ -58,7 +58,7 @@ def main() -> None:
             proto.write("ERR " + json.dumps(f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}") + "\n")
         finally:
             if device == "cuda":
-                torch.cuda.empty_cache()     # the GPU is shared with the bundle adjustment worker (backends/rayba.py)
+                torch.cuda.empty_cache()     # the GPU is shared with the bundle adjustment worker (rayba.worker)
         proto.flush()
 
 

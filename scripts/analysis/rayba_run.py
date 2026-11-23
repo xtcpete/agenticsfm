@@ -10,8 +10,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from agenticsfm.solver.rayba import Options, Problem, RayBA  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party" / "rayba"))
+from rayba.solver import Options, Problem, RayBA  # noqa: E402
 
 
 def load(f, dev, model="simple_radial"):

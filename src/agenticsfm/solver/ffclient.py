@@ -1,5 +1,5 @@
 """Client for the persistent workers: the feedforward worker (backends/ff_worker.py) and the GPU bundle adjustment
-(backends/rayba.py serve). One worker per (env, module, model, GPU) per process, started on first use and kept for the
+(`python -m rayba.worker serve`, third_party/rayba). One worker per (env, module, model, GPU) per process, started on first use and kept for the
 life of the process."""
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agenticsfm.backends import SRC_DIR, BackendError, env_python
+from agenticsfm.backends import BackendError, env_python, python_path
 from agenticsfm.config import REPO_ROOT
 
 _WORKERS: dict[tuple, "Worker"] = {}
@@ -27,7 +27,7 @@ class Worker:
         repos = workdir / "repos.json"
         repos.write_text(json.dumps(cfg.get("repos", {})))
         env_vars = dict(os.environ)
-        env_vars["PYTHONPATH"] = str(SRC_DIR) + (":" + env_vars["PYTHONPATH"] if env_vars.get("PYTHONPATH") else "")
+        env_vars["PYTHONPATH"] = python_path()
         env_vars["CUDA_VISIBLE_DEVICES"] = "" if gpu is None else str(gpu)
         env_vars.setdefault("OMP_NUM_THREADS", "8")
         self.log = open(workdir / f"{log_name}_{model}_{gpu}.log", "a")
@@ -84,7 +84,7 @@ def run_feedforward(cfg: dict[str, Any], env: str, model: str, spec: dict[str, A
 
 def run_rayba(cfg: dict[str, Any], spec: dict[str, Any], workdir: Path, gpu: int | None) -> dict[str, Any]:
     """Same contract as run_backend(cfg, "rayba", "rayba", spec, workdir, gpu), through a persistent worker."""
-    return _request(cfg, "rayba", "serve", spec, workdir, gpu, "agenticsfm.backends.rayba", "rayba_worker", "rayba")
+    return _request(cfg, "rayba", "serve", spec, workdir, gpu, "rayba.worker", "rayba_worker", "rayba")
 
 
 @atexit.register

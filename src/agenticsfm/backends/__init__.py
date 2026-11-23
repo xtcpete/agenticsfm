@@ -21,6 +21,12 @@ from typing import Any
 from agenticsfm.config import REPO_ROOT, load_config
 
 SRC_DIR = REPO_ROOT / "src"
+RAYBA_DIR = REPO_ROOT / "third_party" / "rayba"      # git submodule: the GPU bundle adjustment (package `rayba`)
+
+
+def python_path() -> str:
+    """PYTHONPATH of a backend process: the harness sources, the rayba submodule, then the caller's."""
+    return ":".join([str(SRC_DIR), str(RAYBA_DIR)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else []))
 
 
 class BackendError(RuntimeError):
@@ -46,7 +52,7 @@ def run_backend(cfg: dict[str, Any], name: str, env: str, spec: dict[str, Any], 
     result_path = Path(spec["result_path"])
     result_path.unlink(missing_ok=True)
     env_vars = dict(os.environ)
-    env_vars["PYTHONPATH"] = str(SRC_DIR) + (":" + env_vars["PYTHONPATH"] if env_vars.get("PYTHONPATH") else "")
+    env_vars["PYTHONPATH"] = python_path()
     env_vars["CUDA_VISIBLE_DEVICES"] = "" if gpu is None else str(gpu)
     env_vars.setdefault("OMP_NUM_THREADS", "8")
     log_path = workdir / f"{name}.log"
