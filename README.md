@@ -367,7 +367,8 @@ reconstructions, backend environments) and has to be edited for another machine.
 
 The GPU bundle adjustment is a separate repository, [rayba](https://github.com/xtcpete/rayba), checked out as a git
 submodule at `third_party/rayba`: clone with `git clone --recursive`, or run `git submodule update --init` after a plain
-clone. Nothing to install: `agenticsfm` puts the submodule on `sys.path`, and backends get it on `PYTHONPATH`.
+clone. Nothing to install: `agenticsfm` puts the submodule on `sys.path`, and backends get it on `PYTHONPATH`. Without a
+tool GPU, growth and `optimize_gpu` fall back to COLMAP's bundle adjustment on the CPU (rayba's fallback).
 
 Conda environments (each backend is a CLI run under its own interpreter, see
 [backends/](src/agenticsfm/backends)):

@@ -6,7 +6,8 @@ worker on a GPU (rayba.solver.solve: hybrid observations, OPENCV with a principa
 merged when their focal lengths agree; Cauchy 1 match px, then 0.25 in the last round; dense or
 block-sparse reduced camera system by size), and written back (rayba.colmap.write_back): refined poses, one OPENCV
 camera per intrinsics group and image size, 3D points moved to their solved positions, points with a mean reprojection
-error above 4 px removed. Offline comparison with
+error above 4 px removed. Without a GPU (no tool GPU in the workspace): rayba's CPU fallback, COLMAP's bundle adjustment
+as `optimize` runs it (rayba.colmap.refine_cpu). Offline comparison with
 COLMAP on the p22 grown models: docs/RAYBA.md.
 """
 from __future__ import annotations
@@ -42,12 +43,14 @@ def optimize_gpu(ws: Workspace, cfg: dict[str, Any], model_id: str, principal_po
 
     from rayba.build import build
     from rayba.client import save_problem
-    from rayba.colmap import write_back
+    from rayba.colmap import refine_cpu, write_back
 
     from agenticsfm.solver.ffclient import run_rayba
 
     started = time.time()
-    params = {"principal_point": bool(principal_point), "iters": int(iters), "v": 3}   # v3: one camera per group and image size
+    gpu = ws.gpus[0] if ws.gpus else None
+    params = {"principal_point": bool(principal_point), "iters": int(iters), "v": 3,   # v3: one camera per group and image size
+              **({"cpu": True} if gpu is None else {})}                            # CPU fallback: COLMAP's BA
     id = ws.artifact_id("optimize_gpu", params, {"model": model_id})
     if (r := cached_result(ws, id)) is not None:
         return r
@@ -59,11 +62,14 @@ def optimize_gpu(ws: Workspace, cfg: dict[str, Any], model_id: str, principal_po
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir()
     work = out / "_work"
-    gpu = ws.gpus[0] if ws.gpus else None
     details = {}
     for sub in sorted(p for p in src.iterdir() if p.is_dir() and p.name.isdigit()):
         rec = pycolmap.Reconstruction(str(sub))
-        if rec.num_reg_images() >= 3:
+        if rec.num_reg_images() >= 3 and gpu is None:
+            t0 = time.time()
+            rec, info = refine_cpu(rec)
+            details[sub.name] = {"backend": "colmap (cpu fallback)", "wall": round(time.time() - t0, 1), **info}
+        elif rec.num_reg_images() >= 3:
             z = build(rec, db)
             prob = work / f"{sub.name}.problem.npz"
             work.mkdir(parents=True, exist_ok=True)
@@ -74,13 +80,13 @@ def optimize_gpu(ws: Workspace, cfg: dict[str, Any], model_id: str, principal_po
             sol = dict(np.load(work / f"{sub.name}.out.npz"))
             before = rec.compute_mean_reprojection_error()
             rec = write_back(rec, z, sol)
-            details[sub.name] = {"build_s": round(z["t_build"], 1), "solve_s": round(res["wall"], 1), "backend_s": round(res["cost"]["wall"], 1),
+            details[sub.name] = {"backend": "rayba", "build_s": round(z["t_build"], 1), "solve_s": round(res["wall"], 1), "backend_s": round(res["cost"]["wall"], 1),
                                  "observations": res["observations"], "merged_groups": res["merged"], "stats": z["stats"],
                                  "reproj_before": round(before, 3), "reproj_after": round(rec.compute_mean_reprojection_error(), 3)}
             prob.unlink(missing_ok=True)
         (out / sub.name).mkdir()
         rec.write(str(out / sub.name))
-    summary = {"backend": "rayba", "num_images_in_db": ws.get(model_id).summary.get("num_images_in_db"), **model_summary(out),
+    summary = {"backend": "rayba" if gpu is not None else "colmap (cpu fallback)", "num_images_in_db": ws.get(model_id).summary.get("num_images_in_db"), **model_summary(out),
                "refinement": details}
     (out / "meta.json").write_text(json.dumps({"params": params, "model": model_id, "summary": summary}, indent=1, default=str))
     art = Artifact(id, "model", "optimize_gpu", params, {"model": model_id, "db": ws.ancestor(model_id, "db").id},

@@ -713,12 +713,14 @@ class Solver:
         tracks, filter points) until fewer than max_change of the observations change. The adjustment: the model's
         tracks, focal length and k1 per camera (principal point fixed, as COLMAP's global BA), Cauchy loss; images
         without 3D points (held, unverified) and the best-observed image stay fixed; COLMAP's adjustment when a camera
-        model is not SIMPLE_RADIAL / RADIAL."""
+        model is not SIMPLE_RADIAL / RADIAL. Without a GPU, COLMAP's own refinement (rayba's CPU fallback)."""
         from rayba.colmap import iterative_global_refinement
 
-        iterative_global_refinement(self.mapper, self.database, self.gpu_solve, self.mo, self.tri, max_refinements, max_change,
+        on_gpu = self.gpu is not None
+        iterative_global_refinement(self.mapper, self.database, self.mo, self.tri, max_refinements, max_change,
+                                    solve=self.gpu_solve if on_gpu else None, device=None if on_gpu else "cpu", ba_options=self.ba,
                                     kps=self.kp, config={"cauchy": self.gc.gpu_ba_cauchy, "iters": self.gc.gpu_ba_iters},
-                                    fallback_ba_options=self.ba, timer=self.timer, rec=self.rec)
+                                    timer=self.timer, rec=self.rec)
 
     def gpu_solve(self, z: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         """rayba's solver on this solver's GPU, through the persistent worker (solver/ffclient.py)."""
