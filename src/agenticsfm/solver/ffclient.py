@@ -1,5 +1,6 @@
-"""Client for the persistent feedforward worker (backends/ff_worker.py): one worker per (env, model, GPU)
-per process, started on first use and kept for the life of the process."""
+"""Client for the persistent workers: the feedforward worker (backends/ff_worker.py) and the GPU bundle adjustment
+(backends/rayba.py serve). One worker per (env, module, model, GPU) per process, started on first use and kept for the
+life of the process."""
 
 from __future__ import annotations
 
@@ -20,7 +21,8 @@ _LOCK = threading.Lock()
 
 
 class Worker:
-    def __init__(self, cfg: dict[str, Any], env: str, model: str, gpu: int | None, workdir: Path):
+    def __init__(self, cfg: dict[str, Any], env: str, model: str, gpu: int | None, workdir: Path,
+                 module: str = "agenticsfm.backends.ff_worker", log_name: str = "ff_worker"):
         workdir.mkdir(parents=True, exist_ok=True)
         repos = workdir / "repos.json"
         repos.write_text(json.dumps(cfg.get("repos", {})))
@@ -28,14 +30,14 @@ class Worker:
         env_vars["PYTHONPATH"] = str(SRC_DIR) + (":" + env_vars["PYTHONPATH"] if env_vars.get("PYTHONPATH") else "")
         env_vars["CUDA_VISIBLE_DEVICES"] = "" if gpu is None else str(gpu)
         env_vars.setdefault("OMP_NUM_THREADS", "8")
-        self.log = open(workdir / f"ff_worker_{model}_{gpu}.log", "a")
-        self.proc = subprocess.Popen([env_python(cfg, env), "-m", "agenticsfm.backends.ff_worker", model, str(repos)],
+        self.log = open(workdir / f"{log_name}_{model}_{gpu}.log", "a")
+        self.proc = subprocess.Popen([env_python(cfg, env), "-m", module, model, str(repos)],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1,
                                      env=env_vars, cwd=str(REPO_ROOT))
         self.lock = threading.Lock()
         line = self.proc.stdout.readline()
         if not line.startswith("READY"):
-            raise BackendError(f"feedforward worker did not start: {line!r}; log {self.log.name}")
+            raise BackendError(f"worker {module} did not start: {line!r}; log {self.log.name}")
         self.load_seconds = float(line.split()[1])
 
     def request(self, spec: dict[str, Any]) -> dict[str, Any]:
@@ -46,7 +48,7 @@ class Worker:
             self.proc.stdin.flush()
             line = self.proc.stdout.readline()
             if not line:
-                raise BackendError(f"feedforward worker died; log {self.log.name}")
+                raise BackendError(f"worker died; log {self.log.name}")
             if line.startswith("ERR"):
                 raise BackendError(json.loads(line[4:]))
             res = json.loads(Path(line.split(" ", 1)[1].strip()).read_text())
@@ -62,17 +64,27 @@ class Worker:
             self.proc.kill()
 
 
-def run_feedforward(cfg: dict[str, Any], env: str, model: str, spec: dict[str, Any], workdir: Path, gpu: int | None) -> dict[str, Any]:
-    """Same contract as run_backend(cfg, "feedforward", env, spec, workdir, gpu), through a persistent worker."""
-    key = (env, model, gpu)
+def _request(cfg: dict[str, Any], env: str, model: str, spec: dict[str, Any], workdir: Path, gpu: int | None, module: str,
+             log_name: str, name: str) -> dict[str, Any]:
+    key = (env, module, model, gpu)
     with _LOCK:
         w = _WORKERS.get(key)
         if w is None or w.proc.poll() is not None:
-            w = _WORKERS[key] = Worker(cfg, env, model, gpu, REPO_ROOT / "outputs" / "workers")
+            w = _WORKERS[key] = Worker(cfg, env, model, gpu, REPO_ROOT / "outputs" / "workers", module, log_name)
     workdir.mkdir(parents=True, exist_ok=True)
     spec = dict(spec)
-    spec.setdefault("result_path", str(workdir / "feedforward.result.json"))
+    spec.setdefault("result_path", str(workdir / f"{name}.result.json"))
     return w.request(spec)
+
+
+def run_feedforward(cfg: dict[str, Any], env: str, model: str, spec: dict[str, Any], workdir: Path, gpu: int | None) -> dict[str, Any]:
+    """Same contract as run_backend(cfg, "feedforward", env, spec, workdir, gpu), through a persistent worker."""
+    return _request(cfg, env, model, spec, workdir, gpu, "agenticsfm.backends.ff_worker", "ff_worker", "feedforward")
+
+
+def run_rayba(cfg: dict[str, Any], spec: dict[str, Any], workdir: Path, gpu: int | None) -> dict[str, Any]:
+    """Same contract as run_backend(cfg, "rayba", "rayba", spec, workdir, gpu), through a persistent worker."""
+    return _request(cfg, "rayba", "serve", spec, workdir, gpu, "agenticsfm.backends.rayba", "rayba_worker", "rayba")
 
 
 @atexit.register

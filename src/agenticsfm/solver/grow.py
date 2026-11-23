@@ -227,6 +227,10 @@ class GrowConfig:
     max_models: int = 4
     max_rounds: int = 2000
     num_threads: int = 8
+    global_ba: str = "colmap"        # global bundle adjustment during growth: "colmap" (Ceres) or "gpu" (solver/rayba.py:
+                                     # the model's tracks, one intrinsics group per camera; docs/RAYBA.md)
+    gpu_ba_cauchy: float = 1.0       # gpu: Cauchy scale, match pixels
+    gpu_ba_iters: int = 20           # gpu: Levenberg-Marquardt iterations per adjustment
 
 
 class Solver:
@@ -692,13 +696,82 @@ class Solver:
 
     def _global_refine(self, final: bool = False) -> None:
         held = {i: self.pose_of(i) for i in self.held if i in self.reg()}
-        self.mapper.iterative_global_refinement(5 if final else 3, 0.0005, self.mo, self.ba, self.tri, True)
+        if self.gc.global_ba == "gpu":
+            self.gpu_global_refinement(5 if final else 3, 0.0005)
+        else:
+            self.mapper.iterative_global_refinement(5 if final else 3, 0.0005, self.mo, self.ba, self.tri, True)
         self.mapper.filter_frames(self.mo)
         self.last_global = self.rec.num_reg_images()
         self.rac.invalidate()
         # normalisation moved the whole model: re-express held poses in the new frame via a registered reference
         if held:
             self.restore_held(held)
+
+    def gpu_global_refinement(self, max_refinements: int, max_change: float) -> None:
+        """COLMAP's iterative_global_refinement with the GPU bundle adjustment in place of Ceres: complete and merge
+        tracks, retriangulate, then up to max_refinements rounds of (adjust, normalise, complete and merge tracks, filter
+        points) until fewer than max_change of the observations change."""
+        self.mapper.complete_and_merge_tracks(self.tri)
+        self.mapper.retriangulate(self.tri)
+        for _ in range(max_refinements):
+            nobs = self.rec.compute_num_observations()
+            if not self.gpu_adjust():
+                self.mapper.adjust_global_bundle(self.mo, self.ba)
+            self.rec.normalize()
+            changed = self.mapper.complete_and_merge_tracks(self.tri) + self.mapper.filter_points(self.mo)
+            if nobs == 0 or changed / nobs < max_change:
+                break
+
+    GPU_BA_MODELS = ("SIMPLE_RADIAL", "RADIAL")
+
+    def gpu_adjust(self) -> bool:
+        """One global bundle adjustment of the registered images on the GPU (solver/rayba.py through its persistent
+        worker): every track's first registered observation anchors its depth, the other observations are residuals;
+        per camera the focal length and k1 are refined and the principal point is fixed, as COLMAP's global BA; Cauchy
+        loss. Images without 3D points (held, unverified) and the best-observed image (gauge) stay fixed. Written back
+        in place: poses, camera parameters, 3D points. False (nothing changed) when a camera model is not supported."""
+        from agenticsfm.solver.ffclient import run_rayba
+        from agenticsfm.solver.rayba_build import build
+
+        reg = sorted(self.reg())
+        if len(reg) < 3 or any(self.rec.cameras[self.rec.images[i].camera_id].model.name not in self.GPU_BA_MODELS for i in reg):
+            return False
+        self.mapper.observation_manager.filter_observations_with_negative_depth()
+        with self.timer("gpu_ba_build"):
+            z = build(self.rec, self.database, obs="tracks", grouping="camera", kps={i: self.kp(i) for i in reg})
+        if z["stats"]["observations"] == 0:
+            return True
+        work = self.workdir / "gpu_ba"
+        work.mkdir(parents=True, exist_ok=True)
+        prob, outp = work / "problem.npz", work / "out.npz"
+        np.savez(prob, **{k: v for k, v in z.items() if isinstance(v, np.ndarray)})
+        with self.timer("gpu_ba_solve"):
+            run_rayba(self.cfg, {"problem_path": str(prob), "output_path": str(outp),
+                                 "config": {"model": "simple_radial", "hybrid_px": 0, "rounds": 1, "merge_tol": 0,
+                                            "cauchy": self.gc.gpu_ba_cauchy, "iters": self.gc.gpu_ba_iters}}, work, self.gpu)
+        sol = dict(np.load(outp))
+        with self.timer("gpu_ba_write"):
+            ids = [int(i) for i in z["image_ids"]]
+            for n, i in enumerate(ids):
+                if not z["fixed"][n]:
+                    self.set_pose(i, np.c_[sol["R"][n], sol["t"][n]])
+            done = set()
+            for n, i in enumerate(ids):
+                cid = self.rec.images[i].camera_id
+                if cid in done:
+                    continue
+                done.add(cid)
+                g = int(sol["group"][n])
+                cam = self.rec.camera(cid)
+                p = np.array(cam.params, dtype=float)
+                p[0] = float(np.exp(sol["intr"][g, 0]))
+                p[3] = float(sol["intr"][g, 1])
+                cam.params = p
+            xyz = sol["pt_xyz"]
+            for k, pid in enumerate(z["pt_ids"]):
+                if np.isfinite(xyz[k]).all():
+                    self.rec.points3D[int(pid)].xyz = xyz[k]
+        return True
 
     def restore_held(self, before: dict[int, tuple[np.ndarray, np.ndarray]]) -> None:
         """Held images keep their placement relative to the rest of the model: after a refinement that may have

@@ -78,7 +78,10 @@ def _by(idx, N):
 
 
 def build(rec, database, obs: str = "hybrid", min_inliers: int = 15, epi_px: float = 4.0,
-          group_tol: float = 0.08) -> dict[str, Any]:
+          group_tol: float = 0.08, grouping: str = "cluster", kps: dict[int, np.ndarray] | None = None) -> dict[str, Any]:
+    """grouping: "cluster" (optimize's image size + focal clusters) or "camera" (one intrinsics group per camera of
+    the model, as COLMAP's bundle adjustment refines them). kps: keypoints by image id, read from the database when
+    missing (a caller that builds often passes its cache)."""
     from agenticsfm.tools.optimize import group_images
 
     t0 = time.time()
@@ -91,7 +94,13 @@ def build(rec, database, obs: str = "hybrid", min_inliers: int = 15, epi_px: flo
         R[n] = T.rotation.matrix(); t[n] = T.translation
         f, cx, cy, k = cam_params(cam); c[n] = (cx, cy); f0[n] = f; k0[n] = k; WH[n] = (cam.width, cam.height)
     sc = 1024.0 / WH.max(1)
-    groups = group_images(rec, "cluster", group_tol)
+    if grouping == "camera":
+        by_cam: dict[int, list[int]] = {}
+        for i in reg:
+            by_cam.setdefault(rec.images[i].camera_id, []).append(i)
+        groups = list(by_cam.values())
+    else:
+        groups = group_images(rec, "cluster", group_tol)
     group = np.zeros(N, dtype=np.int64)
     for g, members in enumerate(groups):
         for i in members:
@@ -99,7 +108,7 @@ def build(rec, database, obs: str = "hybrid", min_inliers: int = 15, epi_px: flo
     G = len(groups)
     logf = np.array([np.log(np.median(f0[group == g])) for g in range(G)])
     kk = np.array([np.median(k0[group == g]) for g in range(G)])
-    kps = {i: np.asarray(database.read_keypoints(i))[:, :2] for i in reg}
+    kps = {i: kps[i] if kps is not None and i in kps else np.asarray(database.read_keypoints(i))[:, :2] for i in reg}
     # tracks: model depth of every keypoint with a 3D point, and the track observations
     zmod = {i: np.full(len(kps[i]), np.nan) for i in reg}
     pid_a, xyz_a, lens, e_img, e_kp = track_arrays(rec)

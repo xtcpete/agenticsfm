@@ -39,6 +39,8 @@ PARAMS = {
         "ff_off": {"type": "string", "default": "", "description": "ff-loop features to switch off (ablations), comma separated: "
                    "evidence (inliers in the VLM selection prompt), fill (fill VLM picks up to the round size), points (point-based alignment), "
                    "settle (match support settles disagreements), sweep (final retry of unregistered images), anchors (matched anchors only), rotation, vlmplace, sky, coloc, rsrc, backface, cover, rgate (Phase 3b stability gate for VLM placements instead of the 3c render veto), ainl (no alignment-inlier requirement for 3c), retry (no re-placement with other anchors when the alignment is weak), extra (images of unmerged second models stay out of vlm_place), trusted (vlm_place references from all registered images, hard-stage ones included), vlmtemp (VLM at temperature 0.3 unseeded, as before cache v29), replace (a vlm_place group with half its members render-inconsistent is left out whole instead of re-placed without them), hardrender (the hard stage accepts agreeing placements the render calls inconsistent), moved (vlm_place survivors that move under re-placement are left out: accurate-only admissions), examine (no per-round re-check and re-placement of cameras that lost their match support), exvlm (examine without the VLM), racv2 (render-and-compare v1: sparse forward splat, perturbation margin, overlay figure), realign (no re-alignment of blocks across a seam or fold), anchor (a large realign turn is gated by the explained-share threshold instead of VLM landmark anchoring)"},
+        "ba": {"type": "string", "enum": ["gpu", "colmap"], "default": "gpu",
+               "description": "global bundle adjustment during growth: gpu (ray-anchored, solver/rayba.py) or colmap (Ceres)"},
         "scores_id": {"type": "string", "description": "FlexGlue covisibility scores of the database: the images are split into scenes first, "
                                                        "so feedforward calls never mix scenes; each scene gets its own solver run"},
     },
@@ -51,7 +53,8 @@ PARAMS = {
                         "against the matches and dropped when they disagree. Returns per-model statistics and the growth log.", PARAMS)
 def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str = "pi3x", seed_size: int = 12, group_size: int = 8,
                min_support: float = 0.5, hard: bool = True, vlm: str = "decide", multi_model: bool = True, scores_id: str | None = None,
-               support_pairs: int = 1000, support_norm: bool = True, loop: str = "ff", select: str = "graph", ff_off: str = "") -> ToolResult:
+               support_pairs: int = 1000, support_norm: bool = True, loop: str = "ff", select: str = "graph", ff_off: str = "",
+               ba: str = "gpu") -> ToolResult:
     from agenticsfm.solver.scenes import split_scenes
     from agenticsfm.tools.score_pairs import load_scores
 
@@ -59,7 +62,8 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
     params = {"feedforward": feedforward, "seed_size": int(seed_size), "group_size": int(group_size),
               "min_support": float(min_support), "hard": bool(hard), "vlm": vlm, "multi_model": bool(multi_model), "v": 40,
               "support_pairs": int(support_pairs), "support_norm": bool(support_norm), "loop": loop, "select": select,
-              "ff_off": ",".join(sorted(x for x in ff_off.split(",") if x.strip()))}
+              "ff_off": ",".join(sorted(x for x in ff_off.split(",") if x.strip())),
+              **({"ba": ba} if ba != "colmap" else {})}   # colmap keeps the artifact ids of earlier runs
     inputs = {"db": db_id, **({"scores": scores_id} if scores_id else {})}
     id = ws.artifact_id("grow_model", params, inputs)
     if (r := cached_result(ws, id)) is not None:
@@ -69,7 +73,7 @@ def grow_model(ws: Workspace, cfg: dict[str, Any], db_id: str, feedforward: str 
     out.mkdir(parents=True)
     gc = GrowConfig(feedforward=feedforward, seed_size=int(seed_size), group_size=int(group_size), min_support=float(min_support), hard=bool(hard),
                     vlm=vlm, multi_model=bool(multi_model), support_pairs=int(support_pairs),
-                    support_norm=bool(support_norm), loop=loop, select=select)
+                    support_norm=bool(support_norm), loop=loop, select=select, global_ba=ba)
     off = {x.strip() for x in ff_off.split(",") if x.strip()}
     unknown = off - {"evidence", "fill", "points", "settle", "sweep", "anchors", "rotation", "vlmplace", "sky", "coloc", "rsrc", "backface", "cover", "rgate", "ainl", "retry", "extra", "trusted", "vlmtemp", "replace", "hardrender", "moved", "examine", "exvlm", "racv2", "realign", "anchor"}
     if unknown:

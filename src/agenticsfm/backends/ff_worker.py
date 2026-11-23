@@ -56,6 +56,9 @@ def main() -> None:
             proto.write(f"OK {spec['result_path']}\n")
         except Exception as e:  # report and keep serving
             proto.write("ERR " + json.dumps(f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}") + "\n")
+        finally:
+            if device == "cuda":
+                torch.cuda.empty_cache()     # the GPU is shared with the bundle adjustment worker (backends/rayba.py)
         proto.flush()
 
 

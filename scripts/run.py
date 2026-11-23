@@ -52,7 +52,8 @@ def run_scene(args, cfg, run, scene, gpu, gt_dir):
                                        threshold=args.threshold, optimize=not args.no_optimize, seed_size=args.seed_size,
                                        group_size=args.group_size, min_support=args.min_support, hard=not args.no_hard, vlm=args.vlm, multi_model=not args.no_multi_model,
                                        support_pairs=args.support_pairs, support_norm=not args.raw_support,
-                                       loop=args.loop, select=args.select, ff_off=args.ff_off))
+                                       loop=args.loop, select=args.select, ff_off=args.ff_off, grow_ba=args.grow_ba,
+                                       final_ba=args.final_ba))
         elif args.controller == "agent":
             from agenticsfm.agent import Agent
 
@@ -87,6 +88,8 @@ def main() -> None:
     parser.add_argument("--feedforward", help="incremental: feedforward model for seed and joins (default: config feedforward.model)")
     parser.add_argument("--threshold", type=float, help="incremental: covisibility filter threshold before growing (default: none)")
     parser.add_argument("--no-optimize", action="store_true", help="incremental: submit the grown model without the shared-intrinsics refinement")
+    parser.add_argument("--grow-ba", default="gpu", choices=["gpu", "colmap"], help="incremental: global bundle adjustment during growth")
+    parser.add_argument("--final-ba", default="gpu", choices=["gpu", "colmap"], help="incremental: final refinement, optimize_gpu or optimize")
     parser.add_argument("--seed-size", type=int, default=12)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--min-support", type=float, default=0.5)

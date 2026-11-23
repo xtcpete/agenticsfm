@@ -1,9 +1,9 @@
 """Incremental controller: the open solver end to end, no COLMAP mapper.
 
-graph -> match -> [covisibility filter] -> grow_model -> examine -> optimize (kept if the quality does
-not drop) -> submit. The same tools and refinement policy as the scripted controller, with
-``grow_model`` in place of ``reconstruct``; the comparison between the two is the comparison of the
-mappers.
+graph -> match -> [covisibility filter] -> grow_model -> examine -> optimize_gpu (kept if the quality does
+not drop) -> submit. Bundle adjustment is the GPU one (solver/rayba.py) both during growth and at the end;
+``grow_ba`` / ``final_ba`` = "colmap" restore Ceres (growth) and ``optimize`` (end). The same tools and
+refinement policy as the scripted controller, with ``grow_model`` in place of ``reconstruct``.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from agenticsfm.workspace import Workspace
 def run_incremental(ws: Workspace, cfg: dict[str, Any], verbose: bool = True, dataset: str | None = None,
                     feedforward: str | None = None, threshold: float | None = None, optimize: bool = True,
                     seed_size: int = 12, group_size: int = 8, min_support: float = 0.5, hard: bool = True, vlm: str = "decide", multi_model: bool = True, support_pairs: int = 1000,
-                    support_norm: bool = True, loop: str = "ff", select: str = "graph", ff_off: str = "") -> dict[str, Any]:
+                    support_norm: bool = True, loop: str = "ff", select: str = "graph", ff_off: str = "", grow_ba: str = "gpu",
+                    final_ba: str = "gpu") -> dict[str, Any]:
     n = len(ws.image_names())
     step = make_step(ws, cfg, "incremental", verbose)
     rc = recipe_of(cfg, dataset)
@@ -30,7 +31,8 @@ def run_incremental(ws: Workspace, cfg: dict[str, Any], verbose: bool = True, da
         db = step("filter_edges", db_id=db, scores_id=scores, threshold=float(threshold)).artifact
         scores = step("score_pairs", db_id=db, method="flexglue_covis").artifact
     m = step("grow_model", db_id=db, feedforward=ff, seed_size=seed_size, group_size=group_size, min_support=min_support, hard=hard, vlm=vlm,
-             multi_model=multi_model, scores_id=scores, support_pairs=support_pairs, support_norm=support_norm, loop=loop, select=select, ff_off=ff_off)
+             multi_model=multi_model, scores_id=scores, support_pairs=support_pairs, support_norm=support_norm, loop=loop, select=select, ff_off=ff_off,
+             ba=grow_ba)
     e = step("examine", model_id=m.artifact).summary
     best = m.artifact
     grow = m.summary.get("grow", {})
@@ -40,7 +42,10 @@ def run_incremental(ws: Workspace, cfg: dict[str, Any], verbose: bool = True, da
                     "strong_inconsistent_frac": e.get("edges", {}).get("consistency", {}).get("strong_inconsistent_frac"),
                     "quality": quality(e, n)}}
     if optimize:
-        opt = step("optimize", model_id=best, camera_model="OPENCV", share_intrinsics="cluster")
+        if final_ba == "gpu":
+            opt = step("optimize_gpu", model_id=best)
+        else:
+            opt = step("optimize", model_id=best, camera_model="OPENCV", share_intrinsics="cluster")
         if not opt.error:
             e_opt = step("examine", model_id=opt.artifact).summary
             ok = quality(e_opt, n) >= quality(e, n) - 0.01

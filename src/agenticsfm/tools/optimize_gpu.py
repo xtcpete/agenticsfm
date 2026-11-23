@@ -35,8 +35,11 @@ PARAMS = {
 
 
 def write_back(rec, z, out):
-    """A copy of rec with the solved poses, one OPENCV camera per intrinsics group (through COLMAP's text format, as
-    optimize.reassign_cameras) and the solved 3D points; points with mean reprojection error > 4 px removed."""
+    """A copy of rec with the solved poses, OPENCV cameras (through COLMAP's text format, as optimize.reassign_cameras)
+    and the solved 3D points; points with mean reprojection error > 4 px removed. One camera per intrinsics group and
+    image size: a merged group can hold images whose sizes differ by a few pixels (undistorted crops), which share the
+    focal length and distortion but keep their own centre (the solver's per-image principal point plus the group's
+    offset)."""
     import pycolmap
 
     model = str(out["model"])
@@ -44,12 +47,14 @@ def write_back(rec, z, out):
     I = out["intr"]
     ids = [int(i) for i in z["image_ids"]]
     group = out["group"]
-    cams = {}
+    cams, key_of = {}, {}
     for n, iid in enumerate(ids):
         g = int(group[n])
-        if g in cams:
-            continue
         cam = rec.cameras[rec.images[iid].camera_id]
+        key = (g, int(cam.width), int(cam.height), round(float(z["c"][n][0]), 6), round(float(z["c"][n][1]), 6))
+        key_of[iid] = key
+        if key in cams:
+            continue
         cx, cy = float(z["c"][n][0]), float(z["c"][n][1])
         if pp:
             cx += float(I[g, -2]); cy += float(I[g, -1])
@@ -57,7 +62,7 @@ def write_back(rec, z, out):
             fx, fy, k1, k2, p1, p2 = np.exp(I[g, 0]), np.exp(I[g, 1]), I[g, 2], I[g, 3], I[g, 4], I[g, 5]
         else:
             fx = fy = np.exp(I[g, 0]); k1, k2, p1, p2 = I[g, 1], 0.0, 0.0, 0.0
-        cams[g] = (cam.width, cam.height, [fx, fy, cx, cy, k1, k2, p1, p2])
+        cams[key] = (cam.width, cam.height, [fx, fy, cx, cy, k1, k2, p1, p2])
     for n, iid in enumerate(ids):
         im = rec.images[iid]
         rec.frame(im.frame_id).rig_from_world = pycolmap.Rigid3d(pycolmap.Rotation3d(out["R"][n]), out["t"][n])
@@ -68,11 +73,11 @@ def write_back(rec, z, out):
     rec.write_text(str(d))
     for f in ("rigs.txt", "frames.txt"):
         (d / f).unlink(missing_ok=True)
-    gid = {g: k + 1 for k, g in enumerate(sorted(cams))}
+    gid = {key: k + 1 for k, key in enumerate(sorted(cams))}
     with open(d / "cameras.txt", "w") as f:
-        for g, (w, h, p) in cams.items():
-            f.write(f"{gid[g]} OPENCV {w} {h} " + " ".join(f"{float(v):.12g}" for v in p) + "\n")
-    image_cam = {iid: gid[int(group[n])] for n, iid in enumerate(ids)}
+        for key, (w, h, p) in cams.items():
+            f.write(f"{gid[key]} OPENCV {w} {h} " + " ".join(f"{float(v):.12g}" for v in p) + "\n")
+    image_cam = {iid: gid[key_of[iid]] for iid in ids}
     lines = (d / "images.txt").read_text().splitlines()
     outl, i = [], 0
     while i < len(lines):
@@ -99,11 +104,11 @@ def write_back(rec, z, out):
 def optimize_gpu(ws: Workspace, cfg: dict[str, Any], model_id: str, principal_point: bool = True, iters: int = 20) -> ToolResult:
     import pycolmap
 
-    from agenticsfm.backends import run_backend
+    from agenticsfm.solver.ffclient import run_rayba
     from agenticsfm.solver.rayba_build import build
 
     started = time.time()
-    params = {"principal_point": bool(principal_point), "iters": int(iters), "v": 2}   # v2: Cauchy schedule, sparse solver
+    params = {"principal_point": bool(principal_point), "iters": int(iters), "v": 3}   # v3: one camera per group and image size
     id = ws.artifact_id("optimize_gpu", params, {"model": model_id})
     if (r := cached_result(ws, id)) is not None:
         return r
@@ -124,9 +129,9 @@ def optimize_gpu(ws: Workspace, cfg: dict[str, Any], model_id: str, principal_po
             prob = work / f"{sub.name}.problem.npz"
             work.mkdir(parents=True, exist_ok=True)
             np.savez(prob, **{k: v for k, v in z.items() if isinstance(v, np.ndarray)})
-            res = run_backend(cfg, "rayba", "rayba", {"problem_path": str(prob), "output_path": str(work / f"{sub.name}.out.npz"),
-                                                      "config": {"model": "opencv_pp" if principal_point else "opencv", "iters": int(iters)}},
-                              work / sub.name, gpu=gpu)
+            res = run_rayba(cfg, {"problem_path": str(prob), "output_path": str(work / f"{sub.name}.out.npz"),
+                                  "config": {"model": "opencv_pp" if principal_point else "opencv", "iters": int(iters)}},
+                            work / sub.name, gpu)   # the persistent worker (the growth loop's, when it ran in this process)
             sol = dict(np.load(work / f"{sub.name}.out.npz"))
             before = rec.compute_mean_reprojection_error()
             rec = write_back(rec, z, sol)
