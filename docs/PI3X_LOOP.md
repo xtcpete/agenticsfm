@@ -1168,3 +1168,14 @@ better tools for the VLM; try everything, keep only what works.
 
   Per scene within the known run-to-run spread (PTZ s00 -2.2 auc@10; BLH -8.9 auc@10 but +6.0 auc_all@10). Runs use
   `--select graph` from now on; the VLM stays in its other roles (render choices, anchoring veto), now ~2x faster.
+- **Two-site question** ("which of two places do the new photos show?": earlier photos around the actual placement
+  vs around the GT placement for onsets, vs a look-alike decoy for clean rounds; 41 onsets with a reconstructed true
+  place (62 of 103 onsets have none yet), 38 clean rounds): Qwen low 41 % / 26 % right, medium 49 % / 32 %. A blind
+  check with Claude as the stronger model on 20 of these cases: 10/20 (Qwen 9/20 on the same cases). Both sites usually
+  show the same objects from different positions; appearance does not say where the camera stood. Not kept.
+- **VLM off vs on** (`g4` vs `g3`, dev, both GPU BA + `--select graph`; one run each): WRIVA auc@3 / auc@10 /
+  auc_all@10 25.3 / 63.3 / 59.5 (off) vs 25.1 / 62.8 / 60.9 (on), 2,491 s vs 2,798 s; ETH3D identical on every scene
+  (79.0 / 91.6 / 94.4), 1,520 s vs 1,609 s. The VLM made 45 calls on WRIVA dev (36 render checks) and 13 on ETH3D (12
+  anchoring checks, no effect). The only scene it changed is BLH: 38 vs 35 registered (6 vs 2 hard placements),
+  auc_all@10 63.3 vs 55.4 but auc@10 67.6 vs 69.9. Dev has few folds; the anchoring veto acted on test scenes (p22,
+  step 42), so its value needs a test-split pair (on / off).
