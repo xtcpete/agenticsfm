@@ -1157,4 +1157,14 @@ better tools for the VLM; try everything, keep only what works.
     built. The geometric contradiction share is the best signal found, but it was measured on final poses: it needs a
     test at round time before it can trigger anything.
 - Scripts (session scratchpad, `vlm/`): `replay_select.py`, `harvest_rounds.py`, `bev_bench.py`, `bev_bench2.py`.
-- Confirmation run `g3` (dev, GPU BA + `--select graph` + MTP) launched 19:31.
+- **Confirmation run `g3`** (dev, GPU BA + `--select graph` + MTP; one run, vs the GPU-BA runs with VLM selection):
+
+  | dev | VLM selection (g1 / g1b) | match ranking + MTP (g3) |
+  |---|---|---|
+  | WRIVA auc@3 / auc@10 / auc_all@10 | 26.1 / 64.5 / 60.1 | 25.1 / 62.8 / 60.9 |
+  | WRIVA time | 4,974 s | 2,798 s (-44 %) |
+  | ETH3D @1 / @3 / @5 | 78.6 / 91.4 / 94.3 | 79.0 / 91.6 / 94.4 |
+  | ETH3D time | 2,271 s | 1,609 s (-29 %) |
+
+  Per scene within the known run-to-run spread (PTZ s00 -2.2 auc@10; BLH -8.9 auc@10 but +6.0 auc_all@10). Runs use
+  `--select graph` from now on; the VLM stays in its other roles (render choices, anchoring veto), now ~2x faster.
