@@ -49,7 +49,7 @@ def optimize_gpu(ws: Workspace, cfg: dict[str, Any], model_id: str, principal_po
 
     started = time.time()
     gpu = ws.gpus[0] if ws.gpus else None
-    params = {"principal_point": bool(principal_point), "iters": int(iters), "v": 3,   # v3: one camera per group and image size
+    params = {"principal_point": bool(principal_point), "iters": int(iters), "v": 4,   # v3: one camera per group and image size; v4: rayba 0.3 (repeatable)
               **({"cpu": True} if gpu is None else {})}                            # CPU fallback: COLMAP's BA
     id = ws.artifact_id("optimize_gpu", params, {"model": model_id})
     if (r := cached_result(ws, id)) is not None:
