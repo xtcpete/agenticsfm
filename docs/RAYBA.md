@@ -220,6 +220,35 @@ focal and k1 recovered, 0.3 s.
       level on ETH3D; on WRIVA the full runs end above the offline number (growth variance is large on WRIVA: BLH
       +8.7 auc@10).
 
+20. **Held-out test of the pipeline** (g1b: GPU BA in growth + `optimize_gpu` v3; one run each, as p22):
+
+    | test (one run each) | WRIVA auc@3/10, auc_all@3/10 | time | ETH3D @1/3/5 | time |
+    |---|---|---|---|---|
+    | p22: COLMAP BA in growth + `optimize` | 42.4 / 67.9 / 37.4 / 60.6 | 69,594 s | 65.5 / 85.3 / 89.7 | 3,182 s |
+    | **g1b** | **44.2 / 68.5 / 38.8 / 60.6** | **48,669 s** | **75.5 / 87.9 / 90.7** | **2,649 s** |
+    | (offline: p22 grown + `optimize_gpu`, step 18) | 44.1 / 68.8 / 39.0 / 61.4 | - | 77.0 / 89.7 / 92.5 | - |
+    | (scripted COLMAP pipeline, reference) | 42.6 / 70.6 / - / 65.1 | - | - | - |
+
+    - Time: global BA in growth 19,743 s -> 2,303 s (8.6x), final BA 4,347 s -> 1,039 s (WRIVA); whole runs -30 %
+      (WRIVA), -17 % (ETH3D; tiny scenes pay ~15 s of worker start-up).
+    - Grown models (before the final BA, largest model): WRIVA auc@3/10/auc_all@10 37.8 / 65.6 / 58.6 -> 41.1 / 67.0 /
+      59.3; ETH3D 55.1 / 79.3 / 85.9 -> 59.9 / 80.7 / 86.1.
+    - Per scene, WRIVA auc@3: 18 ahead, 1 tied, 9 behind. Two large drops are growth outcomes, already in the grown
+      models: ReconstructedArea A06 (46.5 -> 33.2; strong-inconsistent pairs 27 % vs 22 %) and MultiZone s00 (48.5 ->
+      34.5; 2 models, 275/300 registered vs 299/300). Large gains likewise: MultiZone s01 +13.5, TrailerPark s02 +11.6.
+      Run-to-run swings of this size are known with COLMAP BA too (MultiZone s00 auc@10 34.8 in p21, 78.9 in p22);
+      a repeat is needed to tell whether the GPU BA in growth changes the fold rate. PTZ SingleZone -1.0 to -1.2 (as in
+      the offline test, step 14).
+    - ETH3D @1: 10 of 12 ahead (+4 to +24), observatory and botanical_garden flat; botanical_garden loses @3/@5
+      (87.5 -> 73.2) because growth left 4 of 30 images in a second model (p22: 30/30 in one).
+    - auc_all@10 flat (60.6): the two drops cancel the gains; the gap to the scripted COLMAP pipeline (65.1) is still
+      the A01 folds (step 42 of PI3X_LOOP.md).
+21. **Package**: the code moved to the `rayba` repository (github.com/xtcpete/rayba, submodule third_party/rayba,
+    v0.2): torch and pycolmap required; `rayba.refine` (final BA) and `rayba.iterative_global_refinement` (drop-in
+    for the mapper's) with COLMAP's own BA as the CPU fallback (no GPU: growth uses COLMAP's refinement,
+    `optimize_gpu` runs `optimize`'s BA; terrace 67.4 / 89.1 / 93.5 vs 91.3 on the GPU). Behaviour on GPU unchanged
+    (problems, solutions and written models identical to the in-tree code on terrace and electro).
+
 ## Status (2026-11-23 morning)
 - `rayba.solve` defaults = step 17; `optimize_gpu` tool = it, on dev and held-out test more accurate than COLMAP's
   `optimize` at 4-7x less time (14-29x at 6.5k images). Not wired into a controller; nothing committed.
