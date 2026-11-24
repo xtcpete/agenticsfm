@@ -1179,3 +1179,58 @@ better tools for the VLM; try everything, keep only what works.
   anchoring checks, no effect). The only scene it changed is BLH: 38 vs 35 registered (6 vs 2 hard placements),
   auc_all@10 63.3 vs 55.4 but auc@10 67.6 vs 69.9. Dev has few folds; the anchoring veto acted on test scenes (p22,
   step 42), so its value needs a test-split pair (on / off).
+
+### Step 44 (2026-11-24): VLM on vs off on the test splits
+
+`g5on_*_test` vs `g5off_*_test` (`outputs/logs/gpuba/test_g5.sh`): WRIVA test (28) + ETH3D test (12), GPU BA in growth +
+`optimize_gpu`, `--select graph`, MTP server; each scene ran on then off on the same GPU. One run each.
+
+| test | VLM on | VLM off |
+|---|---|---|
+| WRIVA auc@3 / auc@10 / auc_all@3 / auc_all@10 | 44.2 / 68.9 / 39.4 / 61.9 | 44.2 / 68.8 / 39.0 / 61.3 |
+| WRIVA time | 25,019 s (VLM 1,237 s) | 23,309 s |
+| ETH3D @1 / @3 / @5 | 75.4 / 87.8 / 90.6 | 75.3 / 87.6 / 90.4 |
+| ETH3D time | 1,877 s | 1,632 s |
+
+vs `g1b` (VLM selection, no MTP): WRIVA 44.2 / 68.5 / 38.8 / 60.6 in 48,669 s, ETH3D 75.5 / 87.9 / 90.7 in 2,649 s; match
+ranking + MTP keeps the accuracy at about half the WRIVA time.
+
+Where the on and off grow logs first diverge (script `vlm/onoff_diverge.py`, session scratchpad):
+
+| WRIVA scenes | n | off - on auc_all@10, mean | mean abs |
+|---|---|---|---|
+| identical runs | 5 | 0.0 | 0.0 |
+| diverge after a VLM decision | 6 | -6.3 | 6.3 |
+| diverge before any VLM call (run-to-run noise) | 17 | +1.2 | 2.8 |
+
+- **Run-to-run noise.** 17 WRIVA scenes diverge in rounds 2-6 before any VLM call, the 4 SingleZone scenes with no VLM
+  call at all: point counts differ by a few (10,643 vs 10,639 after round 2), then batch order and anchors differ.
+  Per-scene spread up to 19.6 auc_all@10 (FullTrailerPark s01: 52.3 on, 71.9 off). ETH3D is identical on every scene
+  without a VLM decision. The split means are inside this noise.
+- **Fold repair is the VLM's one large effect.** A 180 deg block turn found by realign is applied only when the
+  anchoring check confirms it; with the VLM off it is never applied ("no VLM to confirm the turn"). On test the turn
+  was proposed on 3 scenes:
+  - MultiZone s00 (87 cameras): confirmed and applied. auc_all@10 70.8 (on) vs 35.8 (off).
+  - exhibition_hall (20 cameras) and old_computer (13): declined, so the same result as off.
+- **VLM placement of hard images** (render checks, `vlm_place`): more images registered, less precise, auc_all
+  about flat. CameraModels A01_new s00: 25 vs 22 registered, auc@10 68.3 vs 87.0, auc_all@10 67.0 vs 66.5. Same
+  pattern as BLH on dev.
+- Without MultiZone s00 the VLM-off run is ahead on every WRIVA mean (auc_all@10 62.2 vs 61.6), inside the noise.
+- **Were the anchoring decisions right?** Offline GT check (script `vlm/turn_check.py`): for each proposed turn, are
+  the block's cameras misplaced in the final grown model (robust similarity to GT)? It covers every VLM-gated turn in
+  the GPU-BA and p22 runs, dev and test: 14 decisions.
+
+  | | turn was right (fold) | turn was wrong (block already correct) |
+  |---|---|---|
+  | VLM confirmed, turn applied | 4 (MultiZone s00 x2 runs, old_computer x2 runs) | 0 |
+  | VLM declined | 3 (old_computer in g5, MultiZone s00 in g1b x2 events) | 7 (exhibition_hall, facade, courtyard, FullTrailerPark x2, old_computer turned back x2) |
+
+  - Every confirmation was right. The misses are folds left in place: old_computer auc@1 38.1 (declined, g5) vs 47.1
+    (confirmed, g1b); MultiZone s00 auc_all@10 45.7 (g1b) vs 70.8 (g5on).
+  - Geometry alone does not separate the two columns. The wrong turns on exhibition_hall, facade and old_computer (turned
+    back) have agree 0.57-0.80 and 8-27x inlier gains, the same as the real folds (agree 0.46-0.85). These are
+    near-symmetric structures where both orientations fit the matches. A geometric rule that applies the real folds
+    would also apply these 4.
+  - Without the VLM no turn is applied: 7 of 14 right. With it: 11 of 14, with no wrongly applied turn. This is the
+    VLM's one measured contribution so far: one task, and few cases. The same fold was confirmed in one run and
+    declined in another (anchor score 10 vs 1), so the check's recall is the part to improve.
