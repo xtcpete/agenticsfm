@@ -46,15 +46,34 @@ def frame(rec) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def render(rec, out: str | Path, highlight: dict[str, list[int]] | None = None, labels: dict[int, str] | None = None,
            size: int = 1280, max_points: int = 300_000, cam_px: float | None = None, title: str | None = None,
-           dim_others: bool = False) -> dict[str, Any]:
+           dim_others: bool = False, edges: list[tuple[int, int, str, int]] | None = None,
+           poses: dict[int, tuple[np.ndarray, np.ndarray]] | None = None, point_images: set[int] | None = None) -> dict[str, Any]:
     """Draw the map to `out` (jpg/png). highlight: color name -> image ids drawn bold in that color (later entries on
-    top); labels: image id -> text drawn next to its camera. Returns the projection (for callers that annotate more)."""
+    top); labels: image id -> text drawn next to its camera; edges: (image id, image id, color name, width) lines between
+    cameras, drawn under them; poses: image id -> (R, t) cam_from_world overriding the model's (an alternative placement);
+    point_images: draw only points seen by at least two of these images. Returns the projection."""
     from PIL import Image, ImageDraw, ImageFont
 
     up, e1, e2 = frame(rec)
     ims = {i: im for i, im in rec.images.items() if im.has_pose}
-    C = np.array([im.projection_center() for im in ims.values()])
-    X = np.array([p.xyz for p in rec.points3D.values()]) if rec.num_points3D() else np.zeros((0, 3))
+    poses = poses or {}
+
+    def pose(i):
+        if i in poses:
+            return poses[i]
+        T = ims[i].cam_from_world()
+        return T.rotation.matrix(), np.asarray(T.translation)
+
+    def centre(i):
+        R, t = pose(i)
+        return -R.T @ t
+
+    C = np.array([centre(i) for i in ims])
+    if point_images is not None:
+        X = np.array([p.xyz for p in rec.points3D.values() if sum(e.image_id in point_images for e in p.track.elements) >= 2] or np.zeros((0, 3)))
+    else:
+        X = np.array([p.xyz for p in rec.points3D.values()]) if rec.num_points3D() else np.zeros((0, 3))
+    X = X.reshape(-1, 3)
     if len(X) > max_points:
         X = X[np.random.default_rng(0).choice(len(X), max_points, replace=False)]
     cu, cv = C @ e1, C @ e2
@@ -92,13 +111,21 @@ def render(rec, out: str | Path, highlight: dict[str, list[int]] | None = None, 
         for i in ids:
             colour_of[i] = name
 
+    def xy(i):
+        c = centre(i)
+        x, y = to_px(np.array(c @ e1), np.array(c @ e2))
+        return float(x), float(y)
+
+    for a_, b_, colname, width in edges or []:
+        if a_ in ims and b_ in ims:
+            draw.line([xy(a_), xy(b_)], fill=COLORS.get(colname, COLORS["grey"]), width=int(width))
+
     def tri(i, col, width):
-        im = ims[i]
-        R = im.cam_from_world().rotation.matrix()
+        R = pose(i)[0]
         z = R[2]                                             # viewing direction in world
         du, dv = z @ e1, z @ e2
         n = np.hypot(du, dv)
-        x, y = to_px(np.array(im.projection_center() @ e1), np.array(im.projection_center() @ e2))
+        x, y = xy(i)
         x, y = float(x), float(y)
         if n < 0.25:                                         # looking (nearly) straight down: a square
             draw.rectangle([x - r * 0.7, y - r * 0.7, x + r * 0.7, y + r * 0.7], outline=col, width=width)
@@ -120,9 +147,9 @@ def render(rec, out: str | Path, highlight: dict[str, list[int]] | None = None, 
                 tri(i, COLORS.get(name, COLORS["blue"]), 4)
     for i, text in (labels or {}).items():
         if i in ims:
-            x, y = to_px(np.array(ims[i].projection_center() @ e1), np.array(ims[i].projection_center() @ e2))
+            x, y = xy(i)
             col = COLORS.get(colour_of.get(i, "red"), COLORS["red"])
-            draw.text((float(x) + r * 1.2, float(y) - r * 1.6), str(text), fill=col, font=font, stroke_width=2, stroke_fill=(255, 255, 255))
+            draw.text((x + r * 1.2, y - r * 1.6), str(text), fill=col, font=font, stroke_width=2, stroke_fill=(255, 255, 255))
     if title:
         draw.text((8, 6), title, fill=(0, 0, 0), font=font, stroke_width=2, stroke_fill=(255, 255, 255))
     out = Path(out)

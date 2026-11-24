@@ -1120,3 +1120,41 @@ Test set: every leftover-group placement with known GT, 19 images.
   - The A01 fold and focal error account for the whole gap to COLMAP; geometry never proposes the flip.
   - Unmerged sub-models (auc_all@10 on PTZ scenes).
   - Small PTZ folds below the support gate.
+
+### Step 43 (2026-11-23): VLM speed, and can the VLM review growth on a bird's-eye map?
+
+User request: optimise VLM speed, use the VLM as scheduler with a bird's-eye (BEV) render after growth to avoid folds,
+better tools for the VLM; try everything, keep only what works.
+
+- **Where VLM time goes** (GPU-BA runs: WRIVA test, ETH3D test, WRIVA dev): `select_next` 988 calls x 24 s = 23,970 s,
+  44 % of all growth time. A call is ~3.2k prompt tokens and ~1,460 thinking tokens; decoding is the time.
+- **MTP speculative decoding** (`scripts/serve_vlm.sh`, the vLLM recipe's `{"method": "mtp", "num_speculative_tokens": 3}`;
+  acceptance 73 %): 69 -> 132 tok/s, a thinking call 21.1 -> 11.2 s, same picks on 17/20 (replay noise: 54/59). **Kept.**
+- **`select_next` does what match ranking does.** Thinking picks = the top by inliers on 78 % of 985 calls (99 % on dev
+  replays); with thinking off a call takes 0.9 s but agrees with the thinking picks only 26/59 (noise, not judgement).
+  GT outcome of the 559 top-ranked candidates the VLM skipped: 10.6 % ended misplaced vs 12.8 % of those it picked. The
+  veto buys nothing measurable: **use `--select graph`** (match ranking, the CLI default).
+- **BEV map** (`src/agenticsfm/solver/bev.py`): points as grey density, cameras as triangles along their viewing
+  direction, highlighted / numbered sets, optional lines between cameras, alternative poses. Kept as a tool.
+- **BEV review benchmark** (offline; GT from the p22 / g1 / g1b WRIVA runs, 2,071 growth rounds harvested with GT
+  rotation and position errors; a camera is misplaced at > 20 deg or > 10 % of the scene radius). Cases: 103 fold
+  onsets (a round's cameras mostly misplaced while their nearest earlier cameras are mostly right) and 40-41 clean
+  rounds (all < 5 deg and < 3 %). The map is the state after the round (earlier cameras and their points).
+
+  | Variant (low effort unless noted) | Onsets flagged | False alarms |
+  |---|---|---|
+  | map + photos of the new and nearest earlier cameras | 29 % | 10 % |
+  | + lines of strong match pairs (red: contradict the placement, green: agree) | 52 % | 28 % |
+  | map + photos, medium effort | 27 % | 15 % |
+  | geometry only, no VLM: >= 50 % of the round's strong pairs contradict | **39 %** | **7 %** |
+  | geometry only: >= 25 % contradict | 77 % | 28 % |
+  | two maps (actual vs GT placement for onsets, actual vs block turned 180 deg for clean rounds), which is right? | right 29 % (onsets), 47 % (clean) | |
+
+  - Rounds that extend an already misplaced block look locally consistent and are flagged 35 % of the time; the onset
+    is the only point a review can act on.
+  - The VLM cannot tell from the map and photos whether a block is in the right place; offered the GT placement it
+    prefers the current one (68/103). None of the VLM variants is kept, and the scheduler built on such reviews is not
+    built. The geometric contradiction share is the best signal found, but it was measured on final poses: it needs a
+    test at round time before it can trigger anything.
+- Scripts (session scratchpad, `vlm/`): `replay_select.py`, `harvest_rounds.py`, `bev_bench.py`, `bev_bench2.py`.
+- Confirmation run `g3` (dev, GPU BA + `--select graph` + MTP) launched 19:31.
