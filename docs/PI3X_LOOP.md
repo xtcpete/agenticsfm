@@ -1234,3 +1234,43 @@ Where the on and off grow logs first diverge (script `vlm/onoff_diverge.py`, ses
   - Without the VLM no turn is applied: 7 of 14 right. With it: 11 of 14, with no wrongly applied turn. This is the
     VLM's one measured contribution so far: one task, and few cases. The same fold was confirmed in one run and
     declined in another (anchor score 10 vs 1), so the check's recall is the part to improve.
+
+### Step 45 (2026-11-24): repeatable runs; a benchmark of the turn decisions
+
+**Repeatable GPU BA (rayba 0.3, `third_party/rayba` ac946c1; grow_model v41, optimize_gpu v4).**
+
+- The same saved problem (MultiZone s00, 282 images, 533k observations), solved three times, gave three answers.
+  They differ in the last bits (1e-14). Cause: `index_add_` on CUDA sums in whatever order its atomics land. These
+  differences change which points pass a filter (10,643 vs 10,639 points after round 2 of SingleZone s01). After that
+  the rounds pick different images.
+- The fix: every scatter-add (37 sites) is a segment sum over an index sorted once per solve, then one add into
+  distinct rows (`RayBA._add`, `Options.deterministic`, default on).
+  - Bitwise repeatable on the dense, sparse and implicit paths and the default schedule.
+  - Same solution as before to 1e-10.
+  - Cost: dense solve +21 %, final schedule +7 %. Torch's global deterministic mode costs 2.1x.
+  - New GPU test in rayba (the old code fails it).
+- Pi3X and the end-to-end check are pending: GPUs 4-7 were taken by another user's job. The test setup
+  (`outputs/logs/gpuba/repeat_r1.sh`): two scenes, run twice with independent caches on two GPUs, VLM off.
+
+**Turn benchmark** (session scratchpad `vlm/harvest_turns.py`, `vlm/replay_turns.py`).
+
+- Every VLM-gated block turn in every run since anchoring (p21, p22, g1, g1b, g3, g5), one per grow artifact.
+- Label: is the block misplaced in the final grown model (GT, offline)? One 13.5 deg proposal on a block 89 deg off
+  is left out. That leaves 16 decisions: 8 turns that were right, 8 that were wrong.
+- Replays reuse the logged photos and details (stage 2 of the check).
+
+| score = sum over cameras of (details found at the turned pose - at the current pose) | right turns (8) | wrong turns (8) |
+|---|---|---|
+| logged in the runs | 4, 1, 1, -1, 10, 4, 9, 13 | -3, -4, -1, -3, -4, -8, -3, -3 |
+| replay, same question (greedy, medium effort) | 4, 1, 3, 1, 10, 5, 9, 13 | -5, -5, -1, -3, -1, -10, -2, -3 |
+| xhigh effort | 2, 1, 2, 2, 7, 3, 2, 9 | -7, -5, 1, 0, -5, -9, -1, -2 |
+| 5 sampled answers (T = 1), mean | 3.4, 1.6, -0.2, 2.0, 8.6, 3.6, 6.8, 14.6 | -5, -2, 0.4, -3.4, -2, -9, -1.6, -2.2 |
+| block photo shown next to its details | | broken: the VLM marks details as found in the reference photo |
+
+- None of the variants separates the two columns better than the question as it is. The threshold (moved - current
+  >= 2) applies no wrong turn in any variant.
+- The misses (MultiZone s00 in g1b, old_computer in g5) score -1 to 1 everywhere. At both poses the supporting
+  photos show few of the listed details (0/0, 0/1 per camera). That is a problem of which photos are shown, not of
+  the question. A replay moves scores by 1-3, so a case near the threshold flips between runs.
+- Not changed. The next lever would be the photo choice (more cameras when the score is near 0). It can only be
+  tested in full runs, and those are only meaningful once runs repeat.
