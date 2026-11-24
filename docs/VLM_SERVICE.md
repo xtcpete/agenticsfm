@@ -12,6 +12,7 @@ OpenAI-compatible API. Anyone on the server, or on the lab network, can use it: 
 | Context | 131,072 tokens per request |
 | Images | up to 24 per request (base64 data URLs or http URLs the server can fetch) |
 | GPUs | 0, 1, 2, 3 (tensor parallel 4, bf16); shared with the agenticsfm experiments |
+| Decoding | MTP speculative decoding, 3 draft tokens (since 2026-11-23): about 130 tok/s for one request instead of 69, same outputs up to numerics; `SPEC= scripts/serve_vlm.sh` turns it off |
 | Server | vLLM 0.19.0, run by gochen in a tmux session |
 
 ## Is it up?

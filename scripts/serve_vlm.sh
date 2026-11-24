@@ -8,7 +8,14 @@ set -euo pipefail
 MODEL=${MODEL:-Qwen/Qwen3.8-27B}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 TP=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
+# Speculative decoding with the model's own MTP layer (the recipe's setting): lossless, faster decoding, which is most of
+# a thinking request. SPEC= (empty) turns it off.
+DEFAULT_SPEC='{"method":"mtp","num_speculative_tokens":3}'
+SPEC=${SPEC-$DEFAULT_SPEC}
+EXTRA=()
+if [[ -n "$SPEC" ]]; then EXTRA+=(--speculative-config "$SPEC"); fi
 exec /home/gochen/miniconda3/envs/vllm-q38/bin/vllm serve "$MODEL" \
+  "${EXTRA[@]}" \
   --tensor-parallel-size "$TP" \
   --max-model-len 131072 \
   --limit-mm-per-prompt '{"image": 24}' \
