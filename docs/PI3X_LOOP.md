@@ -1235,7 +1235,7 @@ Where the on and off grow logs first diverge (script `vlm/onoff_diverge.py`, ses
     VLM's one measured contribution so far: one task, and few cases. The same fold was confirmed in one run and
     declined in another (anchor score 10 vs 1), so the check's recall is the part to improve.
 
-### Step 45 (2026-11-24): repeatable runs; a benchmark of the turn decisions
+### Step 45 (2026-11-24/25): repeatable runs; a benchmark of the turn decisions
 
 **Repeatable GPU BA (rayba 0.3, `third_party/rayba` ac946c1; grow_model v41, optimize_gpu v4).**
 
@@ -1249,8 +1249,24 @@ Where the on and off grow logs first diverge (script `vlm/onoff_diverge.py`, ses
   - Same solution as before to 1e-10.
   - Cost: dense solve +21 %, final schedule +7 %. Torch's global deterministic mode costs 2.1x.
   - New GPU test in rayba (the old code fails it).
-- Pi3X and the end-to-end check are pending: GPUs 4-7 were taken by another user's job. The test setup
-  (`outputs/logs/gpuba/repeat_r1.sh`): two scenes, run twice with independent caches on two GPUs, VLM off.
+- The end-to-end check (`outputs/logs/gpuba/repeat_r{1,2,3}.sh`): SingleZone s01 and FullTrailerPark s01, each run
+  twice with independent caches, VLM off. The two copies run at the same time, one on GPU 4 and one on GPU 5.
+
+**Repeatable growth (grow_model v42: Ceres local BA on one thread).**
+
+- r1 (rayba 0.3 only), SingleZone s01: both copies match in every logged field through round 4. In round 5 the
+  same 8 images get the same poses but 29,096 vs 29,111 points; from round 7 the batches differ. Final: 80.18 vs
+  80.19 AUC@10, poses up to 7e-3 apart. FullTrailerPark ran out of GPU memory when the other user's job came back.
+- Cause: COLMAP's local BA (Ceres). The same BA on the same model, run twice: with 8 threads the results differ by
+  1e-13 (poses) and 1e-9 (points); with 1 thread they are bitwise equal. Ceres only goes multithreaded above
+  50,000 residuals, which this model reaches around round 5. `GrowConfig.ba_threads = 1` sets the local BA to one
+  thread (it was all cores).
+- r2, SingleZone s01, grown model: the two copies (GPU 4 and GPU 5) match in all 25 log events and in every field.
+  All 175 poses and all 105,338 points are bitwise equal. So Pi3X is repeatable too, at least across these two
+  GPUs. Local BA took 182 s vs 217 s with all cores (the machine is shared, so this is noise, not a speed-up); the
+  grow took 576 s vs 600 s.
+- Not yet checked end to end: the final refinement (bitwise repeatable offline) and FullTrailerPark. Both ran out
+  of GPU memory in r2 when the other user's job came back. r3 reruns them.
 
 **Turn benchmark** (session scratchpad `vlm/harvest_turns.py`, `vlm/replay_turns.py`).
 

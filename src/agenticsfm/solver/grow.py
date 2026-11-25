@@ -227,6 +227,8 @@ class GrowConfig:
     max_models: int = 4
     max_rounds: int = 2000
     num_threads: int = 8
+    ba_threads: int = 1              # Ceres threads for local BA: Ceres sums in thread order above 50k residuals, so more
+                                     # than one thread makes a run unrepeatable (last-bit changes flip point filters)
     global_ba: str = "colmap"        # global bundle adjustment during growth: "colmap" (Ceres) or "gpu" (third_party/rayba:
                                      # the model's tracks, one intrinsics group per camera; docs/RAYBA.md)
     gpu_ba_cauchy: float = 1.0       # gpu: Cauchy scale, match pixels
@@ -286,6 +288,7 @@ class Solver:
         self.tri = pycolmap.IncrementalTriangulatorOptions()
         self.ba = pycolmap.BundleAdjustmentOptions()
         self.ba.print_summary = False
+        self.ba.ceres.solver_options.num_threads = gc.ba_threads
         self.last_global = 0
         self.ff_calls = 0
         self.ff_seconds = 0.0
